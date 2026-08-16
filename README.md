@@ -7,11 +7,10 @@ cycle collector. C ABI at every boundary.
 Everything buildable — compiler pipeline, runtime, examples, tests, and the full design-decision
 record — lives under [`core/`](core/README.md). Start there.
 
-## The three numbers that define the project
+## The two numbers that define the project
 
 1. **ARC overhead vs. C.** Target ≤10% geometric mean. Gated at M3.
-2. **Top-100 pub.dev packages passing their own test suites under DCDart.** Target ≥80% at M5.
-3. **Undefined symbols in a `@bare` object file.** Target: zero, checked mechanically on every change.
+2. **Undefined symbols in a `@bare` object file.** Target: zero, checked mechanically on every change.
 
 ## Status
 
