@@ -276,6 +276,21 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
       _emitArith('sub', instruction.dest, instruction.lhs, instruction.rhs, instruction.overflow, e, context);
     case IMul():
       _emitArith('mul', instruction.dest, instruction.lhs, instruction.rhs, instruction.overflow, e, context);
+    case IAnd():
+      _emitBitwise('and', instruction.dest, instruction.lhs, instruction.rhs, e, context);
+    case IOr():
+      _emitBitwise('or', instruction.dest, instruction.lhs, instruction.rhs, e, context);
+    case IXor():
+      _emitBitwise('xor', instruction.dest, instruction.lhs, instruction.rhs, e, context);
+    case IShl():
+      _emitBitwise('shl', instruction.dest, instruction.lhs, instruction.rhs, e, context);
+    case IShr():
+      // lhs.type's signedness picks lshr (unsigned) vs ashr (arithmetic,
+      // sign-extending) -- see IShr's own doc comment (core/dc-ir/
+      // instructions.dart) for why this isn't a separate instruction.
+      final lhsType = instruction.lhs.type;
+      final op = (lhsType is DCInt && lhsType.signed) ? 'ashr' : 'lshr';
+      _emitBitwise(op, instruction.dest, instruction.lhs, instruction.rhs, e, context);
     case ICmp():
       final type = _llvmType(instruction.lhs.type, context: context);
       final pred = instruction.predicate.name; // enum names match LLVM's icmp condition codes exactly
@@ -367,6 +382,28 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
         'label %${_labelFor(instruction.falseTarget)}',
       );
   }
+}
+
+/// `and`/`or`/`xor`/`shl`/`lshr`/`ashr` -- all plain, single-instruction,
+/// never-trapping LLVM ops (spec §4.1's overflow-trap semantics apply to
+/// `+`/`-`/`*` only, not bit manipulation), so unlike `_emitArith` this
+/// never needs the overflow-intrinsic expansion.
+void _emitBitwise(
+  String op,
+  DCValue dest,
+  DCValue lhs,
+  DCValue rhs,
+  _FunctionEmitter e,
+  String context,
+) {
+  final destType = dest.type;
+  if (destType is! DCInt) {
+    throw BackendError(
+      '"$context": bitwise op on non-DCInt dest $destType (${destType.runtimeType})',
+    );
+  }
+  final type = _llvmType(destType, context: context);
+  e.line('%v${dest.id.index} = $op $type %v${lhs.id.index}, %v${rhs.id.index}');
 }
 
 void _emitArith(

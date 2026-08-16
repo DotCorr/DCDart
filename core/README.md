@@ -8,13 +8,13 @@ Layout follows the compiler pipeline's own stages (frontend → lowering → IR 
 | Path | Maps to spec §1 stage | Status |
 |---|---|---|
 | `frontend/` | DCDart CFE (fork of `pkg/front_end`) | vendored at `vendor/dart-sdk/`, pinned at the `3.12.2` tag, `pub get` resolves cleanly (docs/decisions/0005, 0007). Not invoked directly — shells to `dart compile kernel` instead (ADR-0008); the vendored copy is ready for when a real fork is needed |
-| `dcc-lower/` | Kernel IR → DC-IR | **implemented, working, fully verified** for M0/M1 (all clauses) and M2's thirteen ARC/elision/recursion/mutability/control-flow/port-io slices, ADR-0016 through ADR-0029 (real heap objects, alias retain, calls, heap-typed signatures, heap-typed fields, `@owned` parameters, destructor cascade, weak references, redundant-pair elision, verified recursion, scalar reassignment, real `while`-loop control flow, x86 port I/O) |
+| `dcc-lower/` | Kernel IR → DC-IR | **implemented, working, fully verified** for M0/M1 (all clauses) and M2's fourteen ARC/elision/recursion/mutability/control-flow/port-io/bitwise slices, ADR-0016 through ADR-0030 (real heap objects, alias retain, calls, heap-typed signatures, heap-typed fields, `@owned` parameters, destructor cascade, weak references, redundant-pair elision, verified recursion, scalar reassignment, real `while`-loop control flow, x86 port I/O) |
 | `dc-ir/` | DC-IR: typed SSA, explicit retain/release | real pub package (`dc_ir`), plain hosted Dart per ADR-0006. Arithmetic, `Load`/`Store`/`IntToPtr`/`PtrOffset`, `ICmp`, `Branch`/`CondBranch`, `MakeStruct`/`ExtractField`, `Alloc`/`Retain`/`Release`, `Call`, `MakeWeak`/`WeakLoad`/`DropWeak`, `PortOut`/`PortIn` (M2, ADR-0018/0022/0023/0029). Consumed for real by `dcc-lower` and `backend` — `while`-loop back edges (ADR-0028) needed no new instructions, just real use of the block-parameter merge points already there |
 | `dc-elide/` | Elision passes (spec §3.2) | **`elideRedundantRetainReleasePairs` implemented and verified** (ADR-0025, spec §3.2 pass 3) — a separate small package (only depends on `dc_ir`) purely so its own test suite can use `package:test`, which `dcc_lower`'s vendored-`kernel` dependency can't reconcile. 4 isolated unit tests (2 positive, 2 negative/safety) plus real end-to-end firing verified via `dc-objdump --arc` |
 | `backend/` | DC-IR → LLVM IR → object file | **implemented, working, fully verified** for M0/M1, plus M2's real ARC codegen (`Alloc`/`Retain`/`Release` against a fixed arena, ADR-0015), real function-call codegen (`Call`, ADR-0018), a real destructor-dispatch call through the object header's `cls` field (ADR-0022), real weak-reference codegen with zombie-slot semantics (ADR-0023), correct `phi`-predecessor tracking across internally-split blocks (ADR-0028, a real latent bug fixed), and real x86 port-I/O codegen via fixed inline asm (ADR-0029, verified against a real disassembly) — compiled via `clang -c` |
-| `dcc/` | the `dcc` CLI driver | **`dcc build --mode bare` produces real object files** for all fifteen example targets below, all passing their conformance harnesses. `--mode hosted` still throws (no backend target designed for it) |
+| `dcc/` | the `dcc` CLI driver | **`dcc build --mode bare` produces real object files** for all sixteen example targets below, all passing their conformance harnesses. `--mode hosted` still throws (no backend target designed for it) |
 | `dc-objdump/` | ARC instruction counter (`CLAUDE.md`'s testing rules) | **`dc-objdump --arc <source.dart>` implemented and verified** (ADR-0024) — counts `Alloc`/`Retain`/`Release`/`MakeWeak`/`WeakLoad`/`DropWeak` per function at the DC-IR level (the only place these are countable at all — they're inlined, not symbols, by the time `backend` is done). Every count cross-checked exactly against every M2 ADR's own hand-derived trace, zero mismatches. Now also what proves ADR-0025's elision pass actually fires |
-| `runtime/dc-core-bare/` | `dc:core.bare` — zero-dependency freestanding subset | `prelude.dart`: `bare`, `u64` (`+`, `-`, `<`), `u32`, `u16`, `u8`, `Pointer<T>`, `@packed`/`Struct`, `Result` (`.ok`/`.err`/`.propagate()`), `HeapObject`, `@owned`, `Weak<T>`, `Port` (`.outb`/`.inb`) — see ADR-0008, 0010, 0011, 0014, 0016–0023, 0029 |
+| `runtime/dc-core-bare/` | `dc:core.bare` — zero-dependency freestanding subset | `prelude.dart`: `bare`, `u64` (`+`, `-`, `<`, `&`, `|`, `^`, `<<`, `>>`), `u32`/`u16`/`u8` (`&`, `|`, `^`, `<<`, `>>`), `Pointer<T>`, `@packed`/`Struct`, `Result` (`.ok`/`.err`/`.propagate()`), `HeapObject`, `@owned`, `Weak<T>`, `Port` (`.outb`/`.inb`) — see ADR-0008, 0010, 0011, 0014, 0016–0023, 0029, 0030 |
 | `runtime/dc-core/` | `dc:core` — hosted stdlib | empty |
 | `examples/m0-seam/` | M0 target (`add.dart`, `main.c`) | **`tests/conformance/m0/run.sh`: unqualified PASS** |
 | `examples/m1-pointer/` | M1 target (`mmio.dart`, `main.c`) | **`tests/conformance/m1-pointer/run.sh`: unqualified PASS** |
@@ -31,10 +31,11 @@ Layout follows the compiler pipeline's own stages (frontend → lowering → IR 
 | `examples/m2-mutable/` | M2 target (`mutable.dart`, `main.c`) | **`tests/conformance/m2-mutable/run.sh`: unqualified PASS** — 400 scalar reassignment checks (straight-line + branch-scoped), proves `VariableSet` lowering (ADR-0027) and the `_values` branch-scoping fix it required |
 | `examples/m2-loop/` | M2 target (`loop.dart`, `main.c`) | **`tests/conformance/m2-loop/run.sh`: unqualified PASS** — real `while`-loop control flow: loop-carried scalar variables (`sumTo`, 50 checks) and a nested early-return inside a loop body (`firstAtLeast`, 19×15 checks), proves `_lowerWhile` (ADR-0028) and the backend `phi`-predecessor-label fix it required |
 | `examples/m2-port/` | M2 target (`port_io.dart`) | **`tests/conformance/m2-port/run.sh`: unqualified PASS** — a real 16550 UART init sequence, verified STRUCTURALLY (disassembly shows exactly 7 `outb` + 1 `inb`, correct opcodes) since `outb`/`inb` are privileged instructions that can't run in a normal Linux process; proves `Port.outb`/`Port.inb` (ADR-0029) — the first DCDart feature built for a downstream project (`oscortex_core`) |
-| `tests/conformance/`, `tests/leak/` | per `SKILL.md` §4 | **all fifteen `run.sh` harnesses report an unqualified PASS**, verified under WSL2/Ubuntu (real freestanding link + real run on the actual `x86_64-unknown-none-elf` target, except `m2-port` which verifies structurally — see above). `tests/leak/` empty — the `m2-*` harnesses are the de facto leak tests; a dedicated `dc-test --leakcheck` harness is future work |
-| `scripts/verify-freestanding.sh` | the spine check (`CLAUDE.md` rule 1) | **`FREESTANDING: pass`** against real `dcc` output, all fifteen targets, confirmed on both Windows and Linux |
-| `tools/bare-symbol-allowlist.txt` | consumed by the check above | still empty/draft — none of the fifteen targets needed anything allowlisted |
-| `docs/` | compat-matrix, known-gaps, decisions, escalations | 29 ADRs, 2 escalations, 10 gaps (8 resolved or resolved-for-current-scope — `unowned`/real vtable dispatch/elision passes 1,2,4,5/cycles/heap-in-loop remain within GAP-0003/0017, correctly deferred; GAP-0006 `@volatile` still fully open; GAP-0019 general asm/`@naked`/extern-FFI open, narrow port I/O resolved) |
+| `examples/m2-bitwise/` | M2 target (`bitwise.dart`, `main.c`) | **`tests/conformance/m2-bitwise/run.sh`: unqualified PASS** — real execution (unlike `m2-port`, these are unprivileged instructions): `&`/`|`/`^` exhaustive over a value range at `u64`, `<<`/`>>` over a range, `&` at `u32`/`u16`/`u8` too, proves ADR-0030 |
+| `tests/conformance/`, `tests/leak/` | per `SKILL.md` §4 | **all sixteen `run.sh` harnesses report an unqualified PASS**, verified under WSL2/Ubuntu (real freestanding link + real run on the actual `x86_64-unknown-none-elf` target, except `m2-port` which verifies structurally — see above). `tests/leak/` empty — the `m2-*` harnesses are the de facto leak tests; a dedicated `dc-test --leakcheck` harness is future work |
+| `scripts/verify-freestanding.sh` | the spine check (`CLAUDE.md` rule 1) | **`FREESTANDING: pass`** against real `dcc` output, all sixteen targets, confirmed on both Windows and Linux |
+| `tools/bare-symbol-allowlist.txt` | consumed by the check above | still empty/draft — none of the sixteen targets needed anything allowlisted |
+| `docs/` | compat-matrix, known-gaps, decisions, escalations | 30 ADRs, 2 escalations, 10 gaps (8 resolved or resolved-for-current-scope — `unowned`/real vtable dispatch/elision passes 1,2,4,5/cycles/heap-in-loop remain within GAP-0003/0017, correctly deferred; GAP-0006 `@volatile` still fully open; GAP-0019 general asm/`@naked`/extern-FFI open, narrow port I/O resolved) |
 
 ## Current milestone: M1 done, M2's naive ARC insertion done, M2 overall in progress
 
@@ -56,7 +57,7 @@ linked and run for real.
 criterion is "allocation-heavy programs run leak-free... `weak` references nil out correctly...
 elision firing" — the FULL criterion needs later work too (see below), but every ownership-transfer,
 object-death, AND weak-reference shape `DCDART_SPEC.md` §3.1/§3.2/§3.3-layer-1 describes now has real,
-verified codegen, across twelve ADRs:
+verified codegen, across thirteen ADRs:
 
 1. **(ADR-0015/0016)** The core mechanism: `Alloc`/`Retain`/`Release` codegen against a fixed internal
    arena (explicitly NOT the real `Allocator` — spec §12's open decision 2, `escalations/0002`), real
@@ -142,7 +143,19 @@ verified codegen, across twelve ADRs:
     instructions that can't run as a normal Linux process — the LLVM inline-asm syntax itself was
     test-compiled and disassembled standalone before being wired into the backend, not assumed correct.
 
-Every slice was verified against the FULL conformance suite (all fifteen targets) after landing, zero
+13. **(ADR-0030)** Bitwise operators (`&`, `|`, `^`, `<<`, `>>`) — the second DCDart feature built for
+    `oscortex_core` (its interrupts milestone needs IDT/PIC/UART register-flag manipulation). New
+    `IAnd`/`IOr`/`IXor`/`IShl`/`IShr` DC-IR instructions (no `Overflow` field — bitwise ops don't trap);
+    `IShr`'s logical-vs-arithmetic choice reads the operand's own signedness at the backend rather than
+    needing a second instruction. Added to all four sized-int widths (`u8`/`u16`/`u32`/`u64`) at once,
+    unlike earlier operators added one at a time — the real motivating uses span multiple widths in the
+    same milestone. `dcc-lower` recognition generalized to one block (parsing `target.name.text` via
+    `indexOf('|')`, not `String.split('|')` — the OR operator's own name is literally `|`, which split
+    would mis-parse) instead of twenty near-identical ones. `examples/m2-bitwise/bitwise.dart`: real
+    execution (not just structural — these are unprivileged instructions), `&`/`|`/`^` exhaustive over a
+    range at `u64`, `<<`/`>>` over a range, `&` at `u32`/`u16`/`u8`, all correct.
+
+Every slice was verified against the FULL conformance suite (all sixteen targets) after landing, zero
 regressions at any step — see `docs/known-gaps.md` GAP-0017/GAP-0003/GAP-0019 for the itemized history.
 
 **What M2 still needs** (elision's remaining passes — escape analysis, borrow inference proper, move

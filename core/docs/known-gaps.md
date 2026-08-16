@@ -8,7 +8,9 @@ Work queue, not a confession log (`CLAUDE.md`). Every entry: what was worked aro
 
 **Domain:** dc-ir, backend, dcc-lower (M2, downstream: `oscortex_core`)
 **Status:** OPEN — `Port.outb`/`Port.inb` RESOLVED for the one narrow case that motivated them
-(`docs/decisions/0029-port-io.md`); general `asm`, `@naked`, and extern-FFI (spec §6/§9) remain
+(`docs/decisions/0029-port-io.md`); bitwise operators (`&`/`|`/`^`/`<<`/`>>`) ALSO RESOLVED
+(`docs/decisions/0030-bitwise-operators.md`) — both were real prerequisites `oscortex_core`'s
+interrupts milestone surfaced, not the same gap as the asm/`@naked`/FFI items below, which remain
 unimplemented, correctly deferred.
 
 `oscortex_core` (a from-scratch OS being developed alongside DCDart, its own project) needed x86 port

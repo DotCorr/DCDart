@@ -75,23 +75,60 @@ extension type u64(int _value) {
   /// start, per that file's own "arithmetic is inseparable as a
   /// vocabulary" note) but no source-level operator wired to it until now.
   u64 operator -(u64 other) => u64(_value - other._value);
+
+  /// Added for oscortex_core's interrupts milestone (IDT entry field
+  /// packing, PIC remap bit manipulation, UART status-register polling --
+  /// `docs/known-gaps.md`'s former GAP-0006/GAP-0002 notes). Lowers to
+  /// `IAnd`/`IOr`/`IXor`/`IShl`/`IShr` (`core/dc-ir/instructions.dart`) --
+  /// no overflow-trap semantics apply to bit manipulation (spec §4.1's
+  /// traps are for `+`/`-`/`*` only). `>>` only, not the Dart-specific
+  /// `>>>` triple-shift operator: every DCDart sized-int type today is
+  /// unsigned (see this file), so arithmetic vs. logical right-shift are
+  /// the same operation and there's nothing for `>>>` to distinguish yet
+  /// -- add it if/when a signed sized-int type gets real prelude support.
+  u64 operator &(u64 other) => u64(_value & other._value);
+  u64 operator |(u64 other) => u64(_value | other._value);
+  u64 operator ^(u64 other) => u64(_value ^ other._value);
+  u64 operator <<(u64 other) => u64(_value << other._value);
+  u64 operator >>(u64 other) => u64(_value >> other._value);
 }
 
 /// u32 (DCDART_SPEC.md §4.1). Added for M1's `Pointer<u32>` exit criterion
-/// (ADR-0010) -- construction only so far, no operators (nothing needs them
-/// yet; add per the same discipline as u64 above when something does).
-extension type u32(int _value) {}
+/// (ADR-0010). `&`/`|`/`^`/`<<`/`>>` added alongside u64's (same reasons,
+/// see u64's own doc comment) -- IDT/GDT entry fields are commonly u32.
+extension type u32(int _value) {
+  u32 operator &(u32 other) => u32(_value & other._value);
+  u32 operator |(u32 other) => u32(_value | other._value);
+  u32 operator ^(u32 other) => u32(_value ^ other._value);
+  u32 operator <<(u32 other) => u32(_value << other._value);
+  u32 operator >>(u32 other) => u32(_value >> other._value);
+}
 
 /// u8 (DCDART_SPEC.md §4.1). Added for M1's `@packed` struct exit criterion
-/// (ADR-0011) -- construction only, same discipline as u32 above.
-extension type u8(int _value) {}
+/// (ADR-0011). `&`/`|`/`^`/`<<`/`>>` added alongside u64's (same reasons)
+/// -- UART/PIC register values are u8.
+extension type u8(int _value) {
+  u8 operator &(u8 other) => u8(_value & other._value);
+  u8 operator |(u8 other) => u8(_value | other._value);
+  u8 operator ^(u8 other) => u8(_value ^ other._value);
+  u8 operator <<(u8 other) => u8(_value << other._value);
+  u8 operator >>(u8 other) => u8(_value >> other._value);
+}
 
 /// u16 (DCDART_SPEC.md §4.1). Added for `Port.outb`/`Port.inb` below
 /// (oscortex_core's M0 escalation, docs/decisions/0029-port-io.md) -- x86's
 /// port address space is 16 bits, so a port number genuinely needs this
 /// width, not u8 (too narrow, ports go up to 0xFFFF) or u32 (wider than the
-/// real hardware operand). Construction only, same discipline as u8/u32.
-extension type u16(int _value) {}
+/// real hardware operand). `&`/`|`/`^`/`<<`/`>>` added alongside u64's
+/// (same reasons) -- some IDT/GDT fields are u16 (segment selectors,
+/// GDTR/IDTR limits).
+extension type u16(int _value) {
+  u16 operator &(u16 other) => u16(_value & other._value);
+  u16 operator |(u16 other) => u16(_value | other._value);
+  u16 operator ^(u16 other) => u16(_value ^ other._value);
+  u16 operator <<(u16 other) => u16(_value << other._value);
+  u16 operator >>(u16 other) => u16(_value >> other._value);
+}
 
 /// x86 port I/O (DCDART_SPEC.md §6, oscortex_core's M0 escalation --
 /// docs/decisions/0029-port-io.md). `outb`/`inb` only (byte-width) --

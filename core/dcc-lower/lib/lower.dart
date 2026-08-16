@@ -1141,6 +1141,43 @@ class _BareFunctionLowerer {
         }, DCInt.u64);
       }
 
+      // Bitwise ops (`&`/`|`/`^`/`<<`/`>>`) for u8/u16/u32/u64 -- added for
+      // oscortex_core's interrupts milestone (IDT/PIC/UART register
+      // manipulation). One generalized check rather than 20 near-identical
+      // blocks (4 widths x 5 ops): `target.name.text` follows the same
+      // "<width>|<op>" shape the u64|+/u64|</u64|- checks above already
+      // rely on, so this parses the width and op out of it and dispatches
+      // through a lookup -- same generalization the sized-int-literal
+      // check below already applied to u64(...)/u8(...)/u16(...)/u32(...).
+      // Uses `indexOf`/`substring` on the FIRST `|`, not `String.split`:
+      // the OR operator's own name IS the character `|`, so
+      // `"u64|｜".split('|')` would wrongly produce three empty-ish
+      // parts instead of `["u64", "|"]`.
+      if (target.isExtensionTypeMember && target.enclosingLibrary.importUri == preludeUri) {
+        final sep = target.name.text.indexOf('|');
+        if (sep > 0) {
+          final widthType = switch (target.name.text.substring(0, sep)) {
+            'u8' => DCInt.u8,
+            'u16' => DCInt.u16,
+            'u32' => DCInt.u32,
+            'u64' => DCInt.u64,
+            _ => null,
+          };
+          final op = target.name.text.substring(sep + 1);
+          final emit = switch (op) {
+            '&' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IAnd(dest: dest, lhs: lhs, rhs: rhs)),
+            '|' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IOr(dest: dest, lhs: lhs, rhs: rhs)),
+            '^' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IXor(dest: dest, lhs: lhs, rhs: rhs)),
+            '<<' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IShl(dest: dest, lhs: lhs, rhs: rhs)),
+            '>>' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IShr(dest: dest, lhs: lhs, rhs: rhs)),
+            _ => null,
+          };
+          if (widthType != null && emit != null) {
+            return _lowerU64Binary(expr, emit, widthType);
+          }
+        }
+      }
+
       if (target.isFactory &&
           target.enclosingClass?.name == 'Result' &&
           target.enclosingLibrary.importUri == preludeUri) {

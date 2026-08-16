@@ -143,6 +143,81 @@ final class IMul extends DCInstruction {
   DCValue? get result => dest;
 }
 
+/// Bitwise AND. `lhs`, `rhs`, `dest` must share the same `DCInt` type (no
+/// implicit widening, same rule as arithmetic, spec §4.1). No `Overflow`
+/// field -- bitwise ops don't have DCDart's arithmetic overflow-trap
+/// semantics (spec §4.1's traps apply to `+`/`-`/`*`, not to bit
+/// manipulation). Added for oscortex_core's interrupts milestone (IDT
+/// entry field packing, PIC remap bit manipulation, UART status-register
+/// polling -- see docs/known-gaps.md's former GAP-0006/GAP-0002 notes,
+/// this closes the "no bitwise operators" half of both).
+final class IAnd extends DCInstruction {
+  final DCValue dest;
+  final DCValue lhs;
+  final DCValue rhs;
+  const IAnd({required this.dest, required this.lhs, required this.rhs});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Bitwise OR. Identical shape and contract to `IAnd`.
+final class IOr extends DCInstruction {
+  final DCValue dest;
+  final DCValue lhs;
+  final DCValue rhs;
+  const IOr({required this.dest, required this.lhs, required this.rhs});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Bitwise XOR. Identical shape and contract to `IAnd`.
+final class IXor extends DCInstruction {
+  final DCValue dest;
+  final DCValue lhs;
+  final DCValue rhs;
+  const IXor({required this.dest, required this.lhs, required this.rhs});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Left shift. `rhs` (the shift amount) must carry the same `DCInt` type
+/// as `lhs`/`dest` -- DCDart has no implicit widening (spec §4.1), same
+/// rule as every other binary op in this file, even though a narrower
+/// shift-amount operand would be a reasonable thing to want later.
+final class IShl extends DCInstruction {
+  final DCValue dest;
+  final DCValue lhs;
+  final DCValue rhs;
+  const IShl({required this.dest, required this.lhs, required this.rhs});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Right shift. Logical (`lshr`) vs. arithmetic (`ashr`) is decided by
+/// `lhs.type`'s signedness at the BACKEND (core/backend/lib/llvm_emit.dart),
+/// not encoded as a separate instruction or predicate here -- unlike
+/// `ICmp`'s ordering predicates (where `ult` vs `slt` are both
+/// meaningful choices on either signedness), shift-right's behavior is
+/// fully determined by the shifted value's own type, so a single
+/// instruction reading the operand's signedness is simpler and cannot go
+/// out of sync with it. Every current DCDart sized-int type (u8/u16/u32/
+/// u64, see prelude.dart) is unsigned, so this always lowers to `lshr`
+/// today -- the `ashr` path exists for when signed sized-int types get
+/// real prelude support, which hasn't happened yet.
+final class IShr extends DCInstruction {
+  final DCValue dest;
+  final DCValue lhs;
+  final DCValue rhs;
+  const IShr({required this.dest, required this.lhs, required this.rhs});
+
+  @override
+  DCValue? get result => dest;
+}
+
 /// Which comparison `ICmp` performs. Named after LLVM's own `icmp`
 /// predicates (`eq`/`ne`/`ult`/`slt`/...) rather than inventing a DCDart-
 /// specific set, since there is no DCDart-level distinction to invent here
