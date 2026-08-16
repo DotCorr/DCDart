@@ -1,19 +1,18 @@
 # core/ — the project
 
-Everything buildable lives here. The repo root holds only the six guide docs (`CLAUDE.md`,
-`AGENTS.md`, `DCDART_SPEC.md`, `ROADMAP.md`, `README.md`, `SKILL.md`) — read those first, they are
-not repeated here. See `docs/decisions/0001-directory-layout.md` for why.
+Everything buildable lives here — compiler pipeline, runtime, examples, tests, and the full
+design-decision record (`docs/`). See the repo root `README.md` for the project overview.
 
-Layout follows the compiler pipeline in `DCDART_SPEC.md` §1:
+Layout follows the compiler pipeline's own stages (frontend → lowering → IR → backend):
 
 | Path | Maps to spec §1 stage | Status |
 |---|---|---|
 | `frontend/` | DCDart CFE (fork of `pkg/front_end`) | vendored at `vendor/dart-sdk/`, pinned at the `3.12.2` tag, `pub get` resolves cleanly (docs/decisions/0005, 0007). Not invoked directly — shells to `dart compile kernel` instead (ADR-0008); the vendored copy is ready for when a real fork is needed |
-| `dcc-lower/` | Kernel IR → DC-IR | **implemented, working, fully verified** for M0/M1 (all clauses) and M2's eleven ARC/elision/recursion/mutability slices, ADR-0016 through ADR-0027 (real heap objects, alias retain, calls, heap-typed signatures, heap-typed fields, `@owned` parameters, destructor cascade, weak references, redundant-pair elision, verified recursion, scalar reassignment) |
-| `dc-ir/` | DC-IR: typed SSA, explicit retain/release | real pub package (`dc_ir`), plain hosted Dart per ADR-0006. Arithmetic, `Load`/`Store`/`IntToPtr`/`PtrOffset`, `ICmp`, `Branch`/`CondBranch`, `MakeStruct`/`ExtractField`, `Alloc`/`Retain`/`Release`, `Call`, `MakeWeak`/`WeakLoad`/`DropWeak` (M2, ADR-0018/0022/0023). Consumed for real by `dcc-lower` and `backend` |
+| `dcc-lower/` | Kernel IR → DC-IR | **implemented, working, fully verified** for M0/M1 (all clauses) and M2's twelve ARC/elision/recursion/mutability/control-flow slices, ADR-0016 through ADR-0028 (real heap objects, alias retain, calls, heap-typed signatures, heap-typed fields, `@owned` parameters, destructor cascade, weak references, redundant-pair elision, verified recursion, scalar reassignment, real `while`-loop control flow) |
+| `dc-ir/` | DC-IR: typed SSA, explicit retain/release | real pub package (`dc_ir`), plain hosted Dart per ADR-0006. Arithmetic, `Load`/`Store`/`IntToPtr`/`PtrOffset`, `ICmp`, `Branch`/`CondBranch`, `MakeStruct`/`ExtractField`, `Alloc`/`Retain`/`Release`, `Call`, `MakeWeak`/`WeakLoad`/`DropWeak` (M2, ADR-0018/0022/0023). Consumed for real by `dcc-lower` and `backend` — `while`-loop back edges (ADR-0028) needed no new instructions, just real use of the block-parameter merge points already there |
 | `dc-elide/` | Elision passes (spec §3.2) | **`elideRedundantRetainReleasePairs` implemented and verified** (ADR-0025, spec §3.2 pass 3) — a separate small package (only depends on `dc_ir`) purely so its own test suite can use `package:test`, which `dcc_lower`'s vendored-`kernel` dependency can't reconcile. 4 isolated unit tests (2 positive, 2 negative/safety) plus real end-to-end firing verified via `dc-objdump --arc` |
-| `backend/` | DC-IR → LLVM IR → object file | **implemented, working, fully verified** for M0/M1, plus M2's real ARC codegen (`Alloc`/`Retain`/`Release` against a fixed arena, ADR-0015), real function-call codegen (`Call`, ADR-0018), a real destructor-dispatch call through the object header's `cls` field (ADR-0022), and real weak-reference codegen with zombie-slot semantics (ADR-0023) — compiled via `clang -c` |
-| `dcc/` | the `dcc` CLI driver | **`dcc build --mode bare` produces real object files** for all thirteen example targets below, all passing their conformance harnesses. `--mode hosted` still throws (no backend target designed for it) |
+| `backend/` | DC-IR → LLVM IR → object file | **implemented, working, fully verified** for M0/M1, plus M2's real ARC codegen (`Alloc`/`Retain`/`Release` against a fixed arena, ADR-0015), real function-call codegen (`Call`, ADR-0018), a real destructor-dispatch call through the object header's `cls` field (ADR-0022), real weak-reference codegen with zombie-slot semantics (ADR-0023), and correct `phi`-predecessor tracking across internally-split blocks (ADR-0028, a real latent bug fixed) — compiled via `clang -c` |
+| `dcc/` | the `dcc` CLI driver | **`dcc build --mode bare` produces real object files** for all fourteen example targets below, all passing their conformance harnesses. `--mode hosted` still throws (no backend target designed for it) |
 | `dc-objdump/` | ARC instruction counter (`CLAUDE.md`'s testing rules) | **`dc-objdump --arc <source.dart>` implemented and verified** (ADR-0024) — counts `Alloc`/`Retain`/`Release`/`MakeWeak`/`WeakLoad`/`DropWeak` per function at the DC-IR level (the only place these are countable at all — they're inlined, not symbols, by the time `backend` is done). Every count cross-checked exactly against every M2 ADR's own hand-derived trace, zero mismatches. Now also what proves ADR-0025's elision pass actually fires |
 | `runtime/dc-core-bare/` | `dc:core.bare` — zero-dependency freestanding subset | `prelude.dart`: `bare`, `u64` (`+`, `<`), `u32`, `u8`, `Pointer<T>`, `@packed`/`Struct`, `Result` (`.ok`/`.err`/`.propagate()`), `HeapObject`, `@owned`, `Weak<T>` — see ADR-0008, 0010, 0011, 0014, 0016–0023 |
 | `runtime/dc-core/` | `dc:core` — hosted stdlib | empty |
@@ -30,10 +29,11 @@ Layout follows the compiler pipeline in `DCDART_SPEC.md` §1:
 | `examples/m2-weak/` | M2 target (`weak.dart`, `main.c`) | **`tests/conformance/m2-weak/run.sh`: unqualified PASS** — 1000 real weak-reference cycles (dangling + alive paths), exact zombie-slot arena counts, genuinely leak-free and UNBOUNDED, proves `Weak<T>` (ADR-0023) |
 | `examples/m2-recursion/` | M2 target (`recursion.dart`, `main.c`) | **`tests/conformance/m2-recursion/run.sh`: unqualified PASS** — self-recursive calls, depths 0-60, a heap object per stack frame, all correct and leak-free, proves recursion (ADR-0026, closing ADR-0018's own "untested" flag) and the new `u64 operator -` |
 | `examples/m2-mutable/` | M2 target (`mutable.dart`, `main.c`) | **`tests/conformance/m2-mutable/run.sh`: unqualified PASS** — 400 scalar reassignment checks (straight-line + branch-scoped), proves `VariableSet` lowering (ADR-0027) and the `_values` branch-scoping fix it required |
-| `tests/conformance/`, `tests/leak/` | per `SKILL.md` §4 | **all thirteen `run.sh` harnesses report an unqualified PASS**, verified under WSL2/Ubuntu (real freestanding link + real run on the actual `x86_64-unknown-none-elf` target). `tests/leak/` empty — the `m2-*` harnesses are the de facto leak tests; a dedicated `dc-test --leakcheck` harness is future work |
-| `scripts/verify-freestanding.sh` | the spine check (`CLAUDE.md` rule 1) | **`FREESTANDING: pass`** against real `dcc` output, all thirteen targets, confirmed on both Windows and Linux |
-| `tools/bare-symbol-allowlist.txt` | consumed by the check above | still empty/draft — none of the thirteen targets needed anything allowlisted |
-| `docs/` | compat-matrix, known-gaps, decisions, escalations | 27 ADRs, 2 escalations, 9 gaps (8 resolved or resolved-for-current-scope — `unowned`/real vtable dispatch/elision passes 1,2,4,5/cycles/real loop control-flow remain within GAP-0003/0017, correctly deferred; GAP-0006 `@volatile` still fully open) |
+| `examples/m2-loop/` | M2 target (`loop.dart`, `main.c`) | **`tests/conformance/m2-loop/run.sh`: unqualified PASS** — real `while`-loop control flow: loop-carried scalar variables (`sumTo`, 50 checks) and a nested early-return inside a loop body (`firstAtLeast`, 19×15 checks), proves `_lowerWhile` (ADR-0028) and the backend `phi`-predecessor-label fix it required |
+| `tests/conformance/`, `tests/leak/` | per `SKILL.md` §4 | **all fourteen `run.sh` harnesses report an unqualified PASS**, verified under WSL2/Ubuntu (real freestanding link + real run on the actual `x86_64-unknown-none-elf` target). `tests/leak/` empty — the `m2-*` harnesses are the de facto leak tests; a dedicated `dc-test --leakcheck` harness is future work |
+| `scripts/verify-freestanding.sh` | the spine check (`CLAUDE.md` rule 1) | **`FREESTANDING: pass`** against real `dcc` output, all fourteen targets, confirmed on both Windows and Linux |
+| `tools/bare-symbol-allowlist.txt` | consumed by the check above | still empty/draft — none of the fourteen targets needed anything allowlisted |
+| `docs/` | compat-matrix, known-gaps, decisions, escalations | 28 ADRs, 2 escalations, 9 gaps (8 resolved or resolved-for-current-scope — `unowned`/real vtable dispatch/elision passes 1,2,4,5/cycles/heap-in-loop remain within GAP-0003/0017, correctly deferred; GAP-0006 `@volatile` still fully open) |
 
 ## Current milestone: M1 done, M2's naive ARC insertion done, M2 overall in progress
 
@@ -55,7 +55,7 @@ linked and run for real.
 criterion is "allocation-heavy programs run leak-free... `weak` references nil out correctly...
 elision firing" — the FULL criterion needs later work too (see below), but every ownership-transfer,
 object-death, AND weak-reference shape `DCDART_SPEC.md` §3.1/§3.2/§3.3-layer-1 describes now has real,
-verified codegen, across ten ADRs:
+verified codegen, across eleven ADRs:
 
 1. **(ADR-0015/0016)** The core mechanism: `Alloc`/`Retain`/`Release` codegen against a fixed internal
    arena (explicitly NOT the real `Allocator` — spec §12's open decision 2, `escalations/0002`), real
@@ -114,8 +114,22 @@ verified codegen, across ten ADRs:
     `_weakLocals` already had, so a reassignment inside an `if`-branch leaked into a sibling branch or
     the fallthrough continuation. `examples/m2-mutable/mutable.dart`: 400 checks (straight-line +
     branch-scoped), all correct after the fix.
+11. **(ADR-0028)** Real `while`-loop control flow — the second, remaining prerequisite for a general
+    loop. Needed zero new DC-IR instructions: a loop header is just an ordinary block-parameter merge
+    point, which `core/backend`'s phi-emission logic already handled generically for ANY predecessor,
+    not just `if`/`else`. `_lowerWhile` threads loop-carried scalar locals through the header, composes
+    for free with nested `if` (including its guard-clause early-`return` pattern). Found and fixed a
+    real BACKEND bug along the way, latent since M0: `phi`-predecessor labels were computed from a DC-IR
+    block's nominal label, not the real final LLVM label after internal sub-block splitting (arithmetic
+    overflow trapping, `Alloc`'s OOM check, `Release`'s destructor path, `WeakLoad`'s dead/alive split
+    all split one DC-IR block into several real LLVM blocks) — invisible until a loop's back edge became
+    the first non-empty-args branch to follow a block containing arithmetic. Fixed via a two-pass
+    emission restructure in `llvm_emit.dart`. `examples/m2-loop/loop.dart`: loop-carried-variable
+    threading (`sumTo`, 50 checks) plus a nested early-return inside a loop body (`firstAtLeast`,
+    19×15 checks), all correct. Heap/weak locals inside a loop body remain explicitly unsupported (no
+    ARC-across-back-edge policy designed yet).
 
-Every slice was verified against the FULL conformance suite (all thirteen targets) after landing, zero
+Every slice was verified against the FULL conformance suite (all fourteen targets) after landing, zero
 regressions at any step — see `docs/known-gaps.md` GAP-0017/GAP-0003 for the itemized history.
 
 **What M2 still needs** (elision's remaining passes — escape analysis, borrow inference proper, move

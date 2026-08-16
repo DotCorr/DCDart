@@ -707,6 +707,11 @@ class _BareFunctionLowerer {
       return;
     }
 
+    if (stmt is WhileStatement) {
+      _lowerWhile(stmt);
+      return;
+    }
+
     throw DccLowerError(
       '"$context": unsupported statement ${stmt.runtimeType} — see '
       'core/dcc-lower/README.md for exactly what is handled',
@@ -824,6 +829,162 @@ class _BareFunctionLowerer {
       );
     }
     _finishBlock();
+  }
+
+  /// `while (cond) { body }` (M2, ADR-0028). DC-IR already represents merge
+  /// points via block PARAMETERS (ssa.dart's own design, no separate phi
+  /// instruction) — a loop header is just an ordinary block with two
+  /// predecessors (the pre-loop entry edge and the body's back edge), which
+  /// `core/backend`'s `_emitPhiNodes` already handles generically (it scans
+  /// EVERY predecessor of every block in the whole function via
+  /// `_collectPredecessors`, not just `if`/`else` merges — confirmed by
+  /// reading it, not assumed). So the real work here is entirely
+  /// dcc-lower's: figure out which locals are "loop-carried" (reassigned
+  /// somewhere in the body) and thread them through the header block's
+  /// params, mirroring how a function's own parameters are just
+  /// `blocks[0].params` (function.dart's own doc comment).
+  ///
+  /// SCOPE CUT, on purpose, matching this project's whole-session discipline
+  /// of building exactly what a real conformance target needs, not
+  /// speculatively:
+  ///   - `while` only, not `for`/`do-while` (different Kernel AST shapes,
+  ///     no target needs them yet).
+  ///   - No `break`/`continue` (no BreakStatement lowering exists).
+  ///   - No nested loops — `_collectLoopCarriedCandidates` throws explicitly
+  ///     rather than silently scoping the carried-variable analysis to the
+  ///     wrong loop.
+  ///   - No heap- or weak-typed local may be declared anywhere in the loop
+  ///     body. The naive release policy (ADR-0016/0017) releases tracked
+  ///     locals before each `return` — a loop's back edge is NOT a
+  ///     `return`, so nothing would ever release a heap local declared
+  ///     inside the body on any iteration that isn't the function's last.
+  ///     Getting this right needs real design (release before the back
+  ///     edge? every iteration? what about a heap local escaping via a
+  ///     loop-carried reassignment, which isn't even supported for scalars
+  ///     let alone heap types?) that hasn't happened yet — see
+  ///     docs/known-gaps.md. Enforced by checking `_heapLocals`/
+  ///     `_weakLocals` didn't grow across the body, rather than guessing a
+  ///     policy no one has decided.
+  void _lowerWhile(WhileStatement stmt) {
+    final candidates = <VariableDeclaration>{};
+    _collectLoopCarriedCandidates(stmt.body, candidates);
+
+    // Only variables already tracked BEFORE the loop starts are genuinely
+    // "carried" across iterations — a variable declared (and possibly
+    // reassigned) fresh inside the body every iteration isn't in `_values`
+    // yet at this point, so it's naturally excluded here rather than
+    // needing a separate "declared inside vs outside the loop" AST check.
+    final loopVars = <VariableDeclaration>[
+      for (final v in candidates)
+        if (_values.containsKey(v)) v,
+    ];
+    for (final v in loopVars) {
+      final current = _values[v]!;
+      if (current.type is! DCInt) {
+        throw DccLowerError(
+          '"$context": loop-carried variable "${v.name}" has type '
+          '${current.type} — only scalar (u8/u32/u64) locals can be '
+          'reassigned inside a loop body, same rule as ADR-0027\'s '
+          'straight-line reassignment',
+        );
+      }
+    }
+
+    final condBlockId = _allocBlockId();
+    final bodyBlockId = _allocBlockId();
+    final exitBlockId = _allocBlockId();
+
+    final entryArgs = [for (final v in loopVars) _values[v]!];
+    _addInstr(Branch(target: condBlockId, args: entryArgs));
+    _finishBlock();
+
+    final condParams = [
+      for (final v in loopVars) DCValue(_allocId(), _values[v]!.type),
+    ];
+    _startBlock(condBlockId, condParams);
+    for (var i = 0; i < loopVars.length; i++) {
+      _values[loopVars[i]] = condParams[i];
+    }
+    final cond = _lowerExpression(stmt.condition);
+    if (cond.type is! DCBool) {
+      throw DccLowerError(
+        '"$context": while-condition has non-DCBool type ${cond.type} — '
+        'dcc-lower bug, front_end should have required a real bool here',
+      );
+    }
+    _addInstr(
+      CondBranch(cond: cond, trueTarget: bodyBlockId, trueArgs: const [], falseTarget: exitBlockId, falseArgs: const []),
+    );
+    _finishBlock();
+
+    _startBlock(bodyBlockId, const []);
+    final heapLocalsBeforeBody = _heapLocals.length;
+    final weakLocalsBeforeBody = _weakLocals.length;
+    _lowerBranchBody(stmt.body);
+    if (_heapLocals.length != heapLocalsBeforeBody || _weakLocals.length != weakLocalsBeforeBody) {
+      throw DccLowerError(
+        '"$context": a heap- or weak-typed local was declared inside a '
+        'while-loop body — not supported yet, see docs/known-gaps.md '
+        '(naive ARC has no release policy for a loop back edge yet)',
+      );
+    }
+    // Only wire the back edge if some path through the body still falls
+    // through (_blockOpen) — a body where every path returns has no
+    // reachable back edge at all, which is a legal (if degenerate) program:
+    // the loop's condition is checked once, and if the body is entered it
+    // always returns before completing a second iteration.
+    if (_blockOpen) {
+      final backArgs = [for (final v in loopVars) _values[v]!];
+      _addInstr(Branch(target: condBlockId, args: backArgs));
+      _finishBlock();
+    }
+
+    // What's live at the exit block is the header's OWN phi params — not
+    // whatever the body last computed, which does not dominate the exit
+    // (the exit is only reachable via the header's false edge, never
+    // through the body). Same restore-after-branch reasoning as
+    // `_lowerIf`'s `_values` handling (ADR-0027), specialized to a loop
+    // header instead of an if/else merge.
+    for (var i = 0; i < loopVars.length; i++) {
+      _values[loopVars[i]] = condParams[i];
+    }
+    _startBlock(exitBlockId, const []);
+  }
+
+  /// Pure Kernel-IR-AST walk collecting every `VariableSet` target
+  /// reachable inside `stmt` (recursing into `Block` and `IfStatement`'s
+  /// arms) — used by `_lowerWhile` to find candidate loop-carried variables
+  /// BEFORE actually lowering the body (the header block's phi params must
+  /// exist before the body that reads/writes them does). Throws on a
+  /// nested loop rather than silently scoping the analysis to the wrong
+  /// loop — nested loops are real, separate, unimplemented work.
+  void _collectLoopCarriedCandidates(Statement stmt, Set<VariableDeclaration> out) {
+    if (stmt is Block) {
+      for (final s in stmt.statements) {
+        _collectLoopCarriedCandidates(s, out);
+      }
+      return;
+    }
+    if (stmt is ExpressionStatement && stmt.expression is VariableSet) {
+      out.add((stmt.expression as VariableSet).variable);
+      return;
+    }
+    if (stmt is IfStatement) {
+      _collectLoopCarriedCandidates(stmt.then, out);
+      final otherwise = stmt.otherwise;
+      if (otherwise != null) {
+        _collectLoopCarriedCandidates(otherwise, out);
+      }
+      return;
+    }
+    if (stmt is WhileStatement) {
+      throw DccLowerError('"$context": nested while-loops are not supported yet');
+    }
+    // Anything else (VariableDeclaration, ReturnStatement, a non-VariableSet
+    // ExpressionStatement) can't itself carry a VariableSet target this
+    // project's lowering recognizes — ignored, not an error, since
+    // `_lowerBranchBody` will report a real problem with it on its own if
+    // it's genuinely unsupported.
   }
 
   void _lowerReturn(ReturnStatement stmt) {

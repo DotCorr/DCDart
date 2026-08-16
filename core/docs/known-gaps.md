@@ -32,13 +32,13 @@ should prevent it.
 
 ---
 
-## GAP-0017 — M2's naive Retain/Release insertion + weak references + first elision pass (RESOLVED); passes 1/2/4/5 + unowned/cycles/real-loop remain
+## GAP-0017 — M2's naive Retain/Release insertion + weak references + first elision pass (RESOLVED); passes 1/2/4/5 + unowned/cycles/heap-in-loop remain
 
 **Domain:** dcc-lower, backend (M2, M3+)
-**Status:** items 1, 2 (pass 3 only), 3 (weak only), 5, AND item 6's mutable-scalar-locals half
-RESOLVED (2026-08-14/15/16, ADR-0017/0019/0020/0021/0022/0023/0025/0027) — items 4/6's remaining
-loop-control-flow half (plus `unowned` within item 3, passes 1/2/4/5 within item 2) remain, correctly
-later-milestone/optional/sequenced-after-the-first-pass.
+**Status:** items 1, 2 (pass 3 only), 3 (weak only), 5, AND item 6 (scalar-only `while` loops)
+RESOLVED (2026-08-14/15/16, ADR-0017/0019/0020/0021/0022/0023/0025/0027/0028) — item 4 (plus
+`unowned` within item 3, passes 1/2/4/5 within item 2, and heap/weak locals inside a loop body within
+item 6) remain, correctly later-milestone/optional/sequenced-after-the-first-pass.
 
 `core/tests/conformance/m2-heap/run.sh` proves the *core mechanism* (real `Alloc`/`Retain`/`Release`
 codegen, real heap object construction/field access from source, a real leak test passing 1000 real
@@ -118,31 +118,37 @@ cycles under Linux) — genuinely the highest-risk part of M2 per `AGENTS.md`. W
    §4.3, M5+) — see GAP-0003 (retitled) and ADR-0022's "Rejected alternative" for why a full vtable
    would be premature complexity while every heap object's concrete class is still always statically
    known.
-6. **No loop construct exists in `dcc-lower` AT ALL — one of its two prerequisites is now RESOLVED
-   (mutable scalar locals, ADR-0027); the other (loop control flow) remains.** This item used to say
-   "loops with heap locals — unverified," implying loops exist and only the heap-local interaction was
-   untested. Checked directly against `_lowerStatement`'s dispatch while scoping further work: there is
-   no `WhileStatement`/`ForStatement`/`DoStatement` case anywhere — `@bare` DCDart currently cannot
-   express a loop at all. A real loop needs two independent things: mutable local variables (so a loop
-   body can change its own state) and new DC-IR control flow for back-edges. **Mutable scalar locals
-   are now real** (ADR-0027): `_lowerStatement` recognizes `VariableSet` (`x = <expr>;`) for
-   same-width scalar (`u8`/`u32`/`u64`) reassignment; `core/examples/m2-mutable/mutable.dart` verifies
-   both straight-line and branch-scoped reassignment, 400 checks, all correct. Heap/weak-typed
-   reassignment is still explicitly rejected (needs the same ownership-policy decision item 2's move
-   semantics discussion raises — release the old value? require it already null? undecided). Any
-   loop-bodied program still throws `DccLowerError` at the same "unsupported statement" fallback every
-   other unrecognized shape does — loop control flow itself (new DC-IR back-edge instructions, backend
-   codegen, and — once heap locals CAN appear in a loop body — real interaction with the naive release
-   policy's block-scoped tracking, never yet exercised for an actual loop) remains unimplemented.
-   **What IS now proven, closing ADR-0018's own "recursion is untested" flag**: a self-recursive
-   `@bare` function works with ZERO new lowering logic (`Call`'s design, ADR-0018, already handled it
-   correctly the first time) — `core/examples/m2-recursion/recursion.dart` verifies both recursive
-   calls AND a heap object allocated fresh at every recursion level, releasing correctly in LIFO order
-   as the recursion unwinds, at depths 0-60. Recursion covers "iterate toward a base case," which is
-   real and useful, but is NOT a general loop (no iterating over a collection, no arbitrary mutable
-   loop state, native stack-depth limits apply).
+6. **`while` loops over scalar-only bodies — RESOLVED (ADR-0028); heap/weak locals inside a loop body
+   remain unsupported, plus `for`/`do-while`/`break`/`continue`/nested loops.** This item used to say
+   "loops with heap locals — unverified," implying loops existed and only the heap-local interaction
+   was untested; that was corrected once, then resolved for real here. A real loop needed two
+   independent things: mutable local variables (ADR-0027) and new DC-IR control flow for back-edges
+   (this ADR) — both now exist. `_lowerStatement` recognizes `WhileStatement`, threading every
+   loop-carried scalar local through a block-parameter loop header (DC-IR already represents merge
+   points via block params, per `ssa.dart`'s own design — no new DC-IR instruction was needed).
+   `core/examples/m2-loop/loop.dart` verifies both a straight-line loop body (`sumTo`, loop-carried
+   variable threading) and a nested early-`return` inside a loop body (`firstAtLeast`, composing the
+   loop with `_lowerIf`'s existing guard-clause pattern) — 50 + 19×15 checks, all correct. **A real
+   backend bug was found and fixed along the way** (ADR-0028's own "bug found along the way" section):
+   `phi`-node predecessor labels were computed from a DC-IR block's nominal label, not the REAL final
+   LLVM label after internal sub-block splitting (arithmetic overflow trapping, `Alloc`'s OOM check,
+   `Release`'s destructor path, `WeakLoad`'s dead/alive split all do this) — latent since M0, invisible
+   until a loop's back edge became the first non-empty-args branch to follow a block containing
+   arithmetic. Fixed via a two-pass emission restructure in `core/backend/lib/llvm_emit.dart`; zero
+   regressions across the full 14-target suite. **Still explicitly unsupported, enforced by a real
+   check (not silently mishandled):** heap- or weak-typed locals declared inside a loop body (the
+   naive release policy has no policy for a back edge that isn't a `return` — see item 2's move
+   semantics note for the shape of the ownership-policy question this raises), `for`/`do-while`
+   (different Kernel AST shapes), `break`/`continue`, and nested loops. Each throws a clear
+   `DccLowerError` rather than mis-scoping. **What was already proven before this ADR, closing
+   ADR-0018's own "recursion is untested" flag**: a self-recursive `@bare` function works with ZERO new
+   lowering logic (`Call`'s design, ADR-0018, already handled it correctly) —
+   `core/examples/m2-recursion/recursion.dart` verifies recursive calls plus a heap object allocated
+   fresh at every recursion level, releasing correctly in LIFO order, depths 0-60. Recursion remains a
+   real alternative for "iterate toward a base case" but is not a substitute for the general loop this
+   item now provides (no iterating over a collection, no `for`, no `break`).
 
-**Cost of the workaround:** none for items 1/2(pass 3)/3(weak)/5 (resolved for real, not worked
+**Cost of the workaround:** none for items 1/2(pass 3)/3(weak)/5/6 (resolved for real, not worked
 around). Item 4 (cycle collection/ORC) is correctly M3+/later: `ROADMAP.md`'s own M2 work list
 ("Retain/release insertion, destructors, weak/unowned, escape analysis, borrow inference,
 redundant-pair removal, move semantics, uniqueness/reuse") never mentions cycle collection at all —

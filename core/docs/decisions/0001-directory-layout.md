@@ -1,6 +1,11 @@
 # ADR-0001: core/ holds the project, repo root holds only the guide docs
 
-**Status:** decided
+**Status:** decided — **UPDATE (2026-08-16):** the six guide docs are now kept locally but not
+published to the public GitHub repo (`.gitignore`'d at root) — the project owner didn't want the
+internal agent-operating docs (`CLAUDE.md`, `AGENTS.md`, `SKILL.md`) or planning docs (`ROADMAP.md`,
+`DCDART_SPEC.md`) publicly exposed. They still exist on disk and still govern how work in this repo is
+done; only their public visibility changed. The public repo root is now just `README.md` + `core/`.
+The rest of this ADR's reasoning (why `core/` holds everything buildable) is unaffected.
 
 ## Context
 

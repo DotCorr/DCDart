@@ -1,24 +1,30 @@
 # dcc-lower — Kernel IR → DC-IR
 
 Maps to `DCDART_SPEC.md` §1's `dcc-lower` stage. **Implemented and working, fully verified** for all
-thirteen conformance targets — M0's `add`, M1's `Pointer<u32>` MMIO round-trip/`@packed` struct/
-`Result<T,E>`/`.propagate()`, and M2's eleven ARC/elision/recursion/mutability slices (ADR-0016
-through ADR-0027 — real heap objects, alias retain, function calls, heap-typed signatures, heap-typed
-fields, `@owned` parameters, destructor cascade, weak references, redundant-pair elision, verified
-recursion, scalar reassignment). Every one reports an unqualified PASS under WSL/Ubuntu — not a stub,
-not "probably works." **GAP-0017's Retain-insertion item (incl. `weak`), its elision item (pass 3),
-GAP-0003's destructor-cascade item, AND its mutable-scalar-locals item are now resolved**: every
-ownership-transfer, object-death, and weak-reference shape spec §3.1/§3.2/§3.3-layer-1 describes has
-real, verified codegen, and the first elision pass demonstrably fires (`dc-objdump --arc`, ADR-0024).
-**ADR-0026:** a self-recursive `@bare` call needed ZERO new lowering logic — `_lowerBareCall`'s
-existing design (ADR-0018) never distinguished "a different function" from "the function currently
-being lowered." `u64` gained `operator -` (`ISub` already had real backend codegen since M0; only the
-source-level operator and its `u64|-` recognition were missing) so a natural countdown recursion could
-be written at all. **ADR-0027:** `x = <expr>;` for same-width scalar locals — found and fixed a real
-SSA-dominance bug along the way (`_values`, the variable-binding table, lacked the per-`if`-branch
-snapshot/restore `_heapLocals`/`_weakLocals` already had, so a reassignment inside a branch leaked into
-a sibling branch or the fallthrough continuation — a genuine `clang`/LLVM "does not dominate all uses"
-failure, not a hypothetical).
+fourteen conformance targets — M0's `add`, M1's `Pointer<u32>` MMIO round-trip/`@packed` struct/
+`Result<T,E>`/`.propagate()`, and M2's twelve ARC/elision/recursion/mutability/control-flow slices
+(ADR-0016 through ADR-0028 — real heap objects, alias retain, function calls, heap-typed signatures,
+heap-typed fields, `@owned` parameters, destructor cascade, weak references, redundant-pair elision,
+verified recursion, scalar reassignment, real `while`-loop control flow). Every one reports an
+unqualified PASS under WSL/Ubuntu — not a stub, not "probably works." **GAP-0017's Retain-insertion
+item (incl. `weak`), its elision item (pass 3), GAP-0003's destructor-cascade item, its
+mutable-scalar-locals item, AND its scalar-loop item are now resolved**: every ownership-transfer,
+object-death, and weak-reference shape spec §3.1/§3.2/§3.3-layer-1 describes has real, verified
+codegen, and the first elision pass demonstrably fires (`dc-objdump --arc`, ADR-0024). **ADR-0026:** a
+self-recursive `@bare` call needed ZERO new lowering logic — `_lowerBareCall`'s existing design
+(ADR-0018) never distinguished "a different function" from "the function currently being lowered."
+`u64` gained `operator -` (`ISub` already had real backend codegen since M0; only the source-level
+operator and its `u64|-` recognition were missing) so a natural countdown recursion could be written at
+all. **ADR-0027:** `x = <expr>;` for same-width scalar locals — found and fixed a real SSA-dominance
+bug along the way (`_values`, the variable-binding table, lacked the per-`if`-branch snapshot/restore
+`_heapLocals`/`_weakLocals` already had, so a reassignment inside a branch leaked into a sibling branch
+or the fallthrough continuation — a genuine `clang`/LLVM "does not dominate all uses" failure, not a
+hypothetical). **ADR-0028:** `while (cond) { body }` — needed zero new DC-IR instructions (a loop
+header is just an ordinary block-parameter merge point, same mechanism `if`/`else` already uses, just
+with real args for the first time); the real work was `_lowerWhile`'s loop-carried-variable analysis.
+Found and fixed a real BACKEND bug (`core/backend`'s own README covers it) that predates this session
+entirely — latent since M0's overflow-trapping arithmetic, invisible until a loop's back edge became
+the first `phi`-bearing branch to follow a block containing arithmetic.
 
 **M2 addition (ADR-0025):** `lowerToDCModule` now runs `elideRedundantRetainReleasePairs`
 (`package:dc_elide`, a separate small package — see its own README/ADR for why: `dcc_lower`'s
@@ -124,6 +130,20 @@ branch** (`Map.from(_values)` before, `_values..clear()..addAll(snapshot)` after
 pre-existing `_heapLocals`/`_weakLocals` pattern exactly — added because reassignment, unlike plain
 reads, mutates an existing binding in place, and without scoping that mutation leaked across branches.
 
+**M2 addition (ADR-0028):** `while (cond) { body }` — `_lowerWhile`. A pure Kernel-AST pre-scan
+(`_collectLoopCarriedCandidates`) finds every `VariableSet` target reachable in the body (recursing
+into `Block`/`IfStatement`, throwing on a nested loop), filtered to only variables already tracked in
+`_values` before the loop starts (a fresh loop-body-local variable is naturally excluded — it isn't in
+`_values` yet at scan time). Those become the loop header block's params; the header is entered both
+by an initial `Branch` (current values) and, if the body doesn't return on every path, a back-`Branch`
+from wherever the body's lowering left off (reusing `_lowerBranchBody`, so a nested `if` inside the
+body composes for free). After the body closes, `_values` for loop-carried variables is restored to
+the header's own params — the exit block is only reachable via the header's false edge, never through
+the body, so what's live there is the header's phi params, not whatever the body last computed (same
+restore-after-branch reasoning ADR-0027 established for `_lowerIf`, specialized to a loop header).
+Heap/weak locals inside the body are explicitly rejected (checked via `_heapLocals`/`_weakLocals`
+length before/after) — the naive release policy has no policy for a back edge that isn't a `return`.
+
 ## File map
 
 | File | Contents |
@@ -223,6 +243,10 @@ re-derivable by rerunning it):
   recognized inside `_lowerStatement`'s `ExpressionStatement` handling → rebinds `_values[x]` to the
   lowered RHS after a same-width check. Heap/weak-typed reassignment throws (no ownership policy
   decided yet).
+- (M2, ADR-0028) `while (cond) { body }`: Kernel's `WhileStatement` → a block-parameter loop header
+  (entry `Branch` + conditional back-`Branch`), loop-carried scalar locals found by a pre-scan of the
+  body for `VariableSet` targets already tracked before the loop starts. `for`/`do-while`,
+  `break`/`continue`, nested loops, and heap/weak locals inside the body all throw explicitly.
 
 Anything else — a different operator, a non-`u8`/`u32`/`u64`/`Result` type, a second `Pointer<T>`
 instantiation, natural-alignment (non-packed) struct layout, merging control flow back together after

@@ -6,9 +6,12 @@ stage between `dcc-lower` (monomorphize, ARC insert, elide, unbox) and
 
 **Status:** real pub package (`dc_ir`), consumed for real by `core/dcc-lower` (builds `DCFunction`
 values from Kernel IR) and `core/backend` (emits LLVM IR from them) — confirmed end to end: `dcc
-build --mode bare` produces a real object file that passes `verify-freestanding.sh`, for all thirteen
-conformance targets (M0 through M2's scalar-reassignment slice, `docs/decisions/0027-scalar-
-reassignment.md`).
+build --mode bare` produces a real object file that passes `verify-freestanding.sh`, for all fourteen
+conformance targets (M0 through M2's real `while`-loop slice, `docs/decisions/0028-while-loop.md`).
+The loop slice needed zero new DC-IR instructions — a loop header is just an ordinary block-parameter
+merge point (this file's own "why block-parameter SSA, not phi nodes" design), which `core/backend`
+already handled generically once its predecessor-label tracking was fixed (ADR-0028's own "bug found
+along the way").
 `Alloc` (`instructions.dart`) gained an optional `destructorName` for the destructor-cascade slice
 (ADR-0022) — `Release` itself needed no shape change at all. A new `DCWeakPointer` type (`types.dart`)
 and `MakeWeak`/`WeakLoad`/`DropWeak` instructions were added for weak references (ADR-0023). Grown

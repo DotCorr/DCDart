@@ -123,12 +123,30 @@ class _PredEdge {
 /// target `BlockId`, every edge that reaches it. Needed because LLVM `phi`
 /// nodes must list every incoming edge up front — unlike DC-IR's block
 /// params, which are declared without reference to their sources.
-Map<int, List<_PredEdge>> _collectPredecessors(DCFunction function) {
+///
+/// `finalLabelForBlock` maps each DC-IR block's index to the REAL LLVM
+/// label its terminator ends up being emitted from — NOT necessarily
+/// `_labelFor(block.id)`. Several instructions (`IAdd`/`ISub` overflow
+/// trapping, `Alloc`'s OOM check, `Release`'s destructor/free-slot path,
+/// `WeakLoad`'s dead/alive split — anything calling `e.startBlock` more
+/// than once) internally split ONE DC-IR block into several real LLVM
+/// blocks; whichever one is current when the DC-IR terminator is emitted is
+/// the true predecessor label a `phi` in a successor block must reference.
+/// Using the DC-IR block's own nominal entry label instead is wrong
+/// whenever such an instruction precedes the terminator — a real bug this
+/// project's own LLVM-verifier check caught building `while`-loop support
+/// (ADR-0028): a loop back edge is the first place a non-empty
+/// `Branch`/`CondBranch` arg list ever followed a DC-IR block containing
+/// arithmetic (`if`/`else` never used the args before this, see `_lowerIf`).
+Map<int, List<_PredEdge>> _collectPredecessors(
+  DCFunction function,
+  Map<int, String> finalLabelForBlock,
+) {
   final preds = <int, List<_PredEdge>>{};
   for (final block in function.blocks) {
     if (block.body.isEmpty) continue; // malformed; caught later per-block
     final terminator = block.body.last;
-    final fromLabel = _labelFor(block.id);
+    final fromLabel = finalLabelForBlock[block.id.index] ?? _labelFor(block.id);
     switch (terminator) {
       case Branch():
         preds.putIfAbsent(terminator.target.index, () => []).add(_PredEdge(fromLabel, terminator.args));
@@ -153,16 +171,16 @@ String _emitFunction(DCFunction function, Set<String> declaredIntrinsics) {
       .map((v) => '${_llvmType(v.type, context: function.linkName)} %v${v.id.index}')
       .join(', ');
 
-  final predecessors = _collectPredecessors(function);
   final emitter = _FunctionEmitter(function.linkName, declaredIntrinsics);
 
+  // Pass 1: emit every block's real instructions (NOT phi lines yet — see
+  // `_collectPredecessors`'s doc comment for why the real predecessor label
+  // isn't knowable until after this pass). Record each DC-IR block's TRUE
+  // final internal LLVM label as we go.
+  final finalLabelForBlock = <int, String>{};
   for (final block in function.blocks) {
     final label = _labelFor(block.id);
     emitter.startBlock(label);
-
-    if (block.id.index != 0) {
-      _emitPhiNodes(block, predecessors[block.id.index] ?? const [], emitter, function.linkName);
-    }
 
     if (block.body.isEmpty) {
       throw BackendError(
@@ -173,6 +191,20 @@ String _emitFunction(DCFunction function, Set<String> declaredIntrinsics) {
     for (final instruction in block.body) {
       _emitInstruction(instruction, emitter, context: function.linkName);
     }
+    finalLabelForBlock[block.id.index] = emitter.lastFinishedLabel;
+  }
+
+  // Pass 2: now that every block's real final label is known (including
+  // back edges emitted AFTER their target in source order, e.g. a loop
+  // header's own body), compute real predecessor edges and prepend each
+  // block's phi lines to its OWN nominal entry label — which is always
+  // where its params live, regardless of how many internal sub-blocks its
+  // body went on to create.
+  final predecessors = _collectPredecessors(function, finalLabelForBlock);
+  for (final block in function.blocks) {
+    if (block.id.index == 0 || block.params.isEmpty) continue;
+    final lines = _phiLines(block, predecessors[block.id.index] ?? const [], function.linkName);
+    emitter.prependToLabel(_labelFor(block.id), lines);
   }
 
   final buffer = StringBuffer();
@@ -187,16 +219,18 @@ String _emitFunction(DCFunction function, Set<String> declaredIntrinsics) {
   return buffer.toString();
 }
 
-/// Emits one `phi` instruction per block parameter. LLVM requires every
-/// `phi` to precede any non-phi instruction in its block, so this runs
-/// before the block's body is emitted.
-void _emitPhiNodes(
+/// Builds one `phi` instruction line per block parameter. LLVM requires
+/// every `phi` to precede any non-phi instruction in its block — the
+/// caller (`_emitFunction`, pass 2) prepends these to the block's own
+/// nominal entry label AFTER real emission has determined every real
+/// predecessor label (see `_collectPredecessors`'s doc comment for why this
+/// can't happen during the same pass that emits the block's own body).
+List<String> _phiLines(
   DCBasicBlock block,
   List<_PredEdge> preds,
-  _FunctionEmitter e,
   String context,
 ) {
-  if (block.params.isEmpty) return;
+  if (block.params.isEmpty) return const [];
   if (preds.isEmpty) {
     throw BackendError(
       '"$context": block "${_labelFor(block.id)}" has parameters but no '
@@ -204,6 +238,7 @@ void _emitPhiNodes(
       'a legal DC-IR function (or dcc-lower produced something unexpected)',
     );
   }
+  final lines = <String>[];
   for (var i = 0; i < block.params.length; i++) {
     final param = block.params[i];
     final type = _llvmType(param.type, context: context);
@@ -225,8 +260,9 @@ void _emitPhiNodes(
       }
       return '[ %v${arg.id.index}, %${p.fromLabel} ]';
     }).join(', ');
-    e.line('%v${param.id.index} = phi $type $incoming');
+    lines.add('%v${param.id.index} = phi $type $incoming');
   }
+  return lines;
 }
 
 void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required String context}) {
@@ -660,7 +696,7 @@ void _emitMakeWeak(MakeWeak instruction, _FunctionEmitter e, String context) {
 /// no retain; alive (nonzero) -> retains (increments `strong`) and `dest`
 /// is the live address. Both paths converge via a real `phi` (this
 /// instruction's internal block expansion needs one explicitly -- unlike
-/// the DC-IR block-parameter phis `_emitPhiNodes` handles, this is purely
+/// the DC-IR block-parameter phis `_phiLines` handles, this is purely
 /// an artifact of ONE instruction needing two different values on two
 /// paths, with no DC-IR-level block boundary involved).
 void _emitWeakLoad(WeakLoad instruction, _FunctionEmitter e, String context) {
@@ -824,6 +860,31 @@ class _FunctionEmitter {
     line(text);
     _finished.add(_current!);
     _current = null;
+  }
+
+  /// The real LLVM label of the block most recently finished via
+  /// `terminate()` — used to find the TRUE final internal label of a DC-IR
+  /// block's body (which may have called `startBlock` more than once
+  /// internally, e.g. arithmetic overflow trapping), for real predecessor
+  /// tracking. See `_collectPredecessors`'s doc comment.
+  String get lastFinishedLabel {
+    if (_finished.isEmpty) {
+      throw BackendError('"$context": no block has been finished yet');
+    }
+    return _finished.last.label;
+  }
+
+  /// Inserts `lines` at the very TOP of the already-finished block named
+  /// `label` — used to place `phi` instructions after real emission has
+  /// determined every real predecessor label (LLVM requires `phi`s to
+  /// precede every other instruction in their block).
+  void prependToLabel(String label, List<String> lines) {
+    if (lines.isEmpty) return;
+    final block = _finished.firstWhere(
+      (b) => b.label == label,
+      orElse: () => throw BackendError('"$context": no finished block named "$label" to prepend phi lines to'),
+    );
+    block.lines.insertAll(0, lines);
   }
 
   String render() {
