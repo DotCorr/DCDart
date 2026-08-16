@@ -294,6 +294,38 @@ final class PtrOffset extends DCInstruction {
   DCValue? get result => dest;
 }
 
+/// Writes a byte to an x86 I/O port (the `outb` instruction) — oscortex_core's
+/// M0 escalation, docs/decisions/0029-port-io.md. `port.type` must be
+/// `DCInt.u16` (x86's port address space is 16 bits), `value.type` must be
+/// `DCInt.u8`. **Privileged (ring-0-only)**: executing this in a normal
+/// Linux userspace process traps (SIGSEGV) — unlike every other instruction
+/// in this file, this one cannot be verified by running compiled code on the
+/// dev host, only by inspecting the emitted codegen shape (structurally) or
+/// by actually running as kernel code under full-system emulation (QEMU).
+/// Byte-width only (`outb`) — word/dword port I/O (`outw`/`outl`) not added,
+/// nothing needs them yet, same "build exactly what's needed" discipline as
+/// everywhere else in this file.
+final class PortOut extends DCInstruction {
+  final DCValue port;
+  final DCValue value;
+  const PortOut({required this.port, required this.value});
+
+  @override
+  DCValue? get result => null;
+}
+
+/// Reads a byte from an x86 I/O port (the `inb` instruction). `dest.type`
+/// must be `DCInt.u8`, `port.type` must be `DCInt.u16`. Same
+/// privileged-instruction verification caveat as `PortOut` above.
+final class PortIn extends DCInstruction {
+  final DCValue dest;
+  final DCValue port;
+  const PortIn({required this.dest, required this.port});
+
+  @override
+  DCValue? get result => dest;
+}
+
 /// Allocates a heap object (spec §3.1's `DCObject` header + payload) and
 /// returns a pointer to its payload (the header sits at a fixed negative
 /// offset — see docs/decisions/0015-m2-minimal-arc-arena.md). `dest.type`

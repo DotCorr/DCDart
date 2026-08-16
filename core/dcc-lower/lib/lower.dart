@@ -332,6 +332,8 @@ DCType _lowerFieldType(
           return DCInt.u64;
         case 'u32':
           return DCInt.u32;
+        case 'u16':
+          return DCInt.u16;
         case 'u8':
           return DCInt.u8;
       }
@@ -689,11 +691,41 @@ class _BareFunctionLowerer {
         _values[variable] = newValue;
         return;
       }
+      // (Port I/O escalation, docs/decisions/0029-port-io.md) `Port.outb
+      // (port, value);` as a bare statement -- the first void-returning
+      // call this project has needed to lower as a statement rather than
+      // an expression (dcc-lower/README.md already flagged this as
+      // unimplemented, "no target has needed it" -- this is that target).
+      if (expr is StaticInvocation) {
+        final target = expr.target;
+        if (target.isStatic &&
+            target.enclosingClass?.name == 'Port' &&
+            target.name.text == 'outb' &&
+            target.enclosingLibrary.importUri == preludeUri) {
+          final args = expr.arguments.positional;
+          final port = _lowerExpression(args[0]);
+          final value = _lowerExpression(args[1]);
+          if (port.type != DCInt.u16) {
+            throw DccLowerError(
+              '"$context": Port.outb\'s port argument has type ${port.type}, '
+              'expected u16',
+            );
+          }
+          if (value.type != DCInt.u8) {
+            throw DccLowerError(
+              '"$context": Port.outb\'s value argument has type '
+              '${value.type}, expected u8',
+            );
+          }
+          _addInstr(PortOut(port: port, value: value));
+          return;
+        }
+      }
       throw DccLowerError(
         '"$context": unsupported expression statement $expr '
         '(${expr.runtimeType}) — M1 only understands `pointer.value = x;`, '
-        '`structInstance.field = x;`, and scalar local reassignment '
-        '(`x = <expr>;`)',
+        '`structInstance.field = x;`, scalar local reassignment '
+        '(`x = <expr>;`), and `Port.outb(port, value);`',
       );
     }
 
@@ -1115,27 +1147,68 @@ class _BareFunctionLowerer {
         return _lowerResultFactory(expr, target.name.text);
       }
 
-      // `u64(1)` -- constructing a sized-int literal. Synthesized by
-      // front_end as a StaticInvocation of the extension type's implicit
-      // constructor (verified empirically: target.name.text ==
-      // "u64|constructor#"), not a ConstructorInvocation. Only literal
-      // arguments are handled -- `u64(someRuntimeInt)` would need a real
-      // int-to-u64 conversion instruction this project hasn't needed yet
-      // (DCDart's real design has no implicit int/sized-int conversion
-      // anyway, spec §4.1: "No implicit widening or narrowing").
-      if (target.isExtensionTypeMember &&
-          target.name.text == 'u64|constructor#' &&
+      // `u64(1)`/`u32(1)`/`u16(1)`/`u8(1)` -- constructing a sized-int
+      // literal. Synthesized by front_end as a StaticInvocation of the
+      // extension type's implicit constructor (verified empirically for
+      // u64: target.name.text == "u64|constructor#"; the other three
+      // widths follow the identical "<width>|constructor#" shape). Only
+      // literal arguments are handled -- `u64(someRuntimeInt)` would need a
+      // real int-to-sized-int conversion instruction this project hasn't
+      // needed yet (DCDart's real design has no implicit int/sized-int
+      // conversion anyway, spec §4.1: "No implicit widening or narrowing").
+      // (Port I/O escalation, docs/decisions/0029-port-io.md, is what
+      // first needed u8/u16/u32 literals -- u64 was the only width with
+      // this recognized until now, since nothing else had constructed a
+      // narrower literal from source.)
+      if (target.isExtensionTypeMember && target.enclosingLibrary.importUri == preludeUri) {
+        final sizedIntType = switch (target.name.text) {
+          'u8|constructor#' => DCInt.u8,
+          'u16|constructor#' => DCInt.u16,
+          'u32|constructor#' => DCInt.u32,
+          'u64|constructor#' => DCInt.u64,
+          _ => null,
+        };
+        if (sizedIntType != null) {
+          final arg = expr.arguments.positional.single;
+          if (arg is! IntLiteral) {
+            throw DccLowerError(
+              '"$context": a $sizedIntType literal constructed from a '
+              'non-literal expression $arg (${arg.runtimeType}) — only '
+              'integer-literal arguments are handled',
+            );
+          }
+          final dest = DCValue(_allocId(), sizedIntType);
+          _addInstr(ConstInt(dest: dest, bits: arg.value));
+          return dest;
+        }
+      }
+
+      // (Port I/O escalation, docs/decisions/0029-port-io.md) `Port.inb
+      // (port)` -- a plain static method call (not an extension-type
+      // member, not a factory constructor), recognized directly by
+      // `target.isStatic` + enclosing class name + library URI, mirroring
+      // how `Result.ok`/`Result.err` are recognized by `target.isFactory`
+      // above, just for a static method instead of a factory constructor.
+      // `Port.outb` (void-returning) is recognized separately, in
+      // `_lowerStatement`'s `ExpressionStatement` handling -- it has no
+      // result value, so it cannot be lowered through this
+      // value-producing dispatch (`_lowerExpression` always returns a
+      // `DCValue`; dcc-lower/README.md already notes void-returning calls
+      // need statement-context handling, which this is the first target to
+      // actually need).
+      if (target.isStatic &&
+          target.enclosingClass?.name == 'Port' &&
+          target.name.text == 'inb' &&
           target.enclosingLibrary.importUri == preludeUri) {
-        final arg = expr.arguments.positional.single;
-        if (arg is! IntLiteral) {
+        final port = _lowerExpression(expr.arguments.positional.single);
+        if (port.type != DCInt.u16) {
           throw DccLowerError(
-            '"$context": u64(...) constructed from a non-literal expression '
-            '$arg (${arg.runtimeType}) — only integer-literal arguments are '
-            'handled at M1',
+            '"$context": Port.inb\'s port argument has type ${port.type}, '
+            'expected u16',
           );
         }
-        final dest = DCValue(_allocId(), DCInt.u64);
-        _addInstr(ConstInt(dest: dest, bits: arg.value));
+        final dest = DCValue(_allocId(), DCInt.u8);
+        _addInstr(PortIn(dest: dest, port: port));
         return dest;
       }
 
@@ -1652,6 +1725,8 @@ class _BareFunctionLowerer {
             return DCInt.u64;
           case 'u32':
             return DCInt.u32;
+          case 'u16':
+            return DCInt.u16;
           case 'u8':
             return DCInt.u8;
         }

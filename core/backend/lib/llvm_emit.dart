@@ -311,6 +311,23 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
     case Store():
       final type = _llvmType(instruction.value.type, context: context);
       e.line('store $type %v${instruction.value.id.index}, ptr %v${instruction.pointer.id.index}');
+    case PortOut():
+      // AT&T `outb %al, %dx` -- verified against a real disassembly (not
+      // guessed) before wiring this in: value into {al} ($0), port into
+      // {dx} ($1), matching the asm string's operand order exactly.
+      e.line(
+        'call void asm sideeffect "outb \$0, \$1", "{al},{dx}"'
+        '(i8 %v${instruction.value.id.index}, i16 %v${instruction.port.id.index})',
+      );
+    case PortIn():
+      // AT&T `inb %dx, %al` -- one output ({al}, numbered $0 per LLVM's
+      // "outputs numbered first" rule) and one input ({dx}, $1), so the
+      // asm string reads "inb $1, $0" to put the source (port) first and
+      // the destination (result) second, matching real AT&T syntax.
+      e.line(
+        '%v${instruction.dest.id.index} = call i8 asm sideeffect "inb \$1, \$0", "={al},{dx}"'
+        '(i16 %v${instruction.port.id.index})',
+      );
     case Call():
       _emitCall(instruction, e, context);
     case Alloc():

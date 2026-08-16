@@ -86,6 +86,36 @@ extension type u32(int _value) {}
 /// (ADR-0011) -- construction only, same discipline as u32 above.
 extension type u8(int _value) {}
 
+/// u16 (DCDART_SPEC.md §4.1). Added for `Port.outb`/`Port.inb` below
+/// (oscortex_core's M0 escalation, docs/decisions/0029-port-io.md) -- x86's
+/// port address space is 16 bits, so a port number genuinely needs this
+/// width, not u8 (too narrow, ports go up to 0xFFFF) or u32 (wider than the
+/// real hardware operand). Construction only, same discipline as u8/u32.
+extension type u16(int _value) {}
+
+/// x86 port I/O (DCDART_SPEC.md §6, oscortex_core's M0 escalation --
+/// docs/decisions/0029-port-io.md). `outb`/`inb` only (byte-width) --
+/// word/dword port I/O (`outw`/`outl`) not added, nothing needs them yet.
+///
+/// **Privileged (ring-0-only).** Unlike every other prelude member, calling
+/// these from a normal Linux userspace process traps (SIGSEGV) -- so
+/// dcc-lower's own conformance suite can only verify the emitted codegen
+/// SHAPE (structurally), never by actually running the compiled code on the
+/// dev host the way every other target's conformance test does. The real
+/// end-to-end proof this works happens in oscortex_core's own kernel code,
+/// running as real ring-0 code under full-system QEMU emulation.
+///
+/// Static methods, not an extension type -- there's no natural "port
+/// number" value these should be instance methods ON; `Port.outb(port,
+/// value)` reads the same way the real x86 mnemonics do (`outb` writes,
+/// `inb` reads), and dcc-lower recognizes the static-method-call shape
+/// directly (mirrors `Result.ok(...)`'s factory-constructor recognition,
+/// just for a plain static method instead).
+class Port {
+  static void outb(u16 port, u8 value) => throw UnimplementedError('dcc-lower substitutes real codegen for this');
+  static u8 inb(u16 port) => throw UnimplementedError('dcc-lower substitutes real codegen for this');
+}
+
 /// Pointer<T> (DCDART_SPEC.md §6). M1 minimal surface: `.fromAddress` and
 /// `.value` get/set, for `T = u32` only -- dcc-lower recognizes exactly that
 /// instantiation (a real generic monomorphizer is bigger M1+ work this one

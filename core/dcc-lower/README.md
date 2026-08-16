@@ -1,9 +1,9 @@
 # dcc-lower — Kernel IR → DC-IR
 
 Maps to `DCDART_SPEC.md` §1's `dcc-lower` stage. **Implemented and working, fully verified** for all
-fourteen conformance targets — M0's `add`, M1's `Pointer<u32>` MMIO round-trip/`@packed` struct/
-`Result<T,E>`/`.propagate()`, and M2's twelve ARC/elision/recursion/mutability/control-flow slices
-(ADR-0016 through ADR-0028 — real heap objects, alias retain, function calls, heap-typed signatures,
+fifteen conformance targets — M0's `add`, M1's `Pointer<u32>` MMIO round-trip/`@packed` struct/
+`Result<T,E>`/`.propagate()`, and M2's thirteen ARC/elision/recursion/mutability/control-flow/port-io
+slices (ADR-0016 through ADR-0029 — real heap objects, alias retain, function calls, heap-typed signatures,
 heap-typed fields, `@owned` parameters, destructor cascade, weak references, redundant-pair elision,
 verified recursion, scalar reassignment, real `while`-loop control flow). Every one reports an
 unqualified PASS under WSL/Ubuntu — not a stub, not "probably works." **GAP-0017's Retain-insertion
@@ -243,6 +243,12 @@ re-derivable by rerunning it):
   recognized inside `_lowerStatement`'s `ExpressionStatement` handling → rebinds `_values[x]` to the
   lowered RHS after a same-width check. Heap/weak-typed reassignment throws (no ownership policy
   decided yet).
+- (M2, ADR-0029) `Port.outb(port, value)` / `Port.inb(port)`: plain static-method calls on `Port`,
+  recognized directly (not extension-type members, not factory constructors) → `PortOut`/`PortIn`.
+  `outb` is void-returning — recognized in `_lowerStatement`'s `ExpressionStatement` handling as a
+  bare statement, the first void-returning call this project has needed to lower that way. `u8(1)` /
+  `u16(1)` / `u32(1)` literal construction (previously only `u64(1)` was recognized) generalized
+  alongside this, since a UART init sequence needs literal byte/port values constantly.
 - (M2, ADR-0028) `while (cond) { body }`: Kernel's `WhileStatement` → a block-parameter loop header
   (entry `Branch` + conditional back-`Branch`), loop-carried scalar locals found by a pre-scan of the
   body for `VariableSet` targets already tracked before the loop starts. `for`/`do-while`,

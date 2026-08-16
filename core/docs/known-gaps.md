@@ -4,6 +4,46 @@ Work queue, not a confession log (`CLAUDE.md`). Every entry: what was worked aro
 
 ---
 
+## GAP-0019 — No general inline asm / `@naked` / extern-to-external-symbol FFI; only the narrow `Port.outb`/`Port.inb` primitive exists
+
+**Domain:** dc-ir, backend, dcc-lower (M2, downstream: `oscortex_core`)
+**Status:** OPEN — `Port.outb`/`Port.inb` RESOLVED for the one narrow case that motivated them
+(`docs/decisions/0029-port-io.md`); general `asm`, `@naked`, and extern-FFI (spec §6/§9) remain
+unimplemented, correctly deferred.
+
+`oscortex_core` (a from-scratch OS being developed alongside DCDart, its own project) needed x86 port
+I/O (`outb`/`inb`) for its first milestone's UART driver. Rather than build the general primitives spec
+§6 ("dangerous five": `asm`, `@naked`, `Pointer.fromAddress`, `unowned`, `@noarc`) and §9 (reverse FFI —
+DCDart code calling an external, non-DCDart symbol by name) describes, a single narrow DC-IR
+instruction pair (`PortOut`/`PortIn`) with a FIXED LLVM inline-asm shape was added instead — real,
+immediately motivated, verified against a real disassembly, but deliberately not a general mechanism.
+
+**What's still missing, for real, when the next OS milestone needs it:**
+- General inline asm (arbitrary instruction sequences from DCDart source) — needed for things like
+  `cli`/`sti`, `lgdt`/`lidt`, `cpuid`, control-register reads/writes. None of these have a narrow,
+  single-purpose escape hatch the way port I/O did; each would need its own case-by-case decision
+  about whether a dedicated instruction (like `PortOut`/`PortIn`) or a real general `asm` mechanism is
+  the right call, the same way this gap was resolved.
+- `@naked` functions (no prologue/epilogue, needed for real interrupt/exception handler entry points).
+- Extern-to-external-symbol FFI — DCDart code calling a symbol not defined in its own Kernel IR
+  compilation unit (e.g. a hand-written assembly helper in a companion `.S` file). `dcc` today only
+  ever emits one self-contained relocatable object per compilation unit; resolving an external symbol
+  by name is a new architectural concept it doesn't have. `oscortex_core`'s own boot stub currently
+  avoids this entirely by calling INTO `@bare` DCDart code from assembly (the proven, already-working
+  direction — a plain C-ABI call, same as every M0-era conformance harness), never the reverse.
+- `@interrupt` function safety enforcement (no allocation inside an interrupt handler, compiler-
+  enforced) — mentioned in `CLAUDE.md`'s coding rules as a real requirement, not yet built at all.
+- `@volatile` (GAP-0006, pre-existing) — whoever builds it needs to cover `PortOut`/`PortIn` too, not
+  just `Load`/`Store`: both are genuine side effects that must never be reordered or elided once an
+  optimizer exists.
+
+**Cost of the workaround:** none for the narrow `Port.outb`/`Port.inb` addition itself (resolved for
+real, verified against a real disassembly, not routed around). The cost is scope: `oscortex_core`'s
+next real milestone (interrupts) will likely need at least `@naked` and `@interrupt` enforcement, which
+don't exist yet — expect this gap to grow real sub-items as that work starts, not shrink.
+
+---
+
 ## GAP-0018 — No function-call instruction in DC-IR at all; every conformance target is a single leaf function
 
 **Domain:** dc-ir, dcc-lower, backend (all milestones so far)
