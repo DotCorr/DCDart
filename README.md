@@ -1,8 +1,8 @@
-# DCDart / DCOS
+# DCDart
 
-A systems language with Dart's syntax and type system, compiled AOT to native code — no VM, no
-interpreter, no JIT, no tracing GC. Memory is managed by ARC with compile-time elision and a local
-cycle collector. C ABI at every boundary. DCOS is the operating system built in it.
+A native systems language with Dart's syntax and type system, compiled AOT to native code — no VM,
+no interpreter, no JIT, no tracing GC. Memory is managed by ARC with compile-time elision and a local
+cycle collector. C ABI at every boundary.
 
 Everything buildable — compiler pipeline, runtime, examples, tests, and the full design-decision
 record — lives under [`core/`](core/README.md). Start there.
