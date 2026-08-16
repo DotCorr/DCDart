@@ -1,0 +1,16 @@
+name: dcc_lower
+description: >
+  Kernel IR -> DC-IR lowering (DCDART_SPEC.md §1). Plain hosted Dart, see
+  core/docs/decisions/0006-toolchain-bootstrap-language.md.
+publish_to: none
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  dc_ir:
+    path: ../dc-ir
+  dc_elide:
+    path: ../dc-elide
+  kernel:
+    path: ../frontend/vendor/dart-sdk/pkg/kernel

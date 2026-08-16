@@ -1,0 +1,19 @@
+# DRAFT — owned by E4 (kernel & drivers). Not yet reviewed.
+# Consumed by core/scripts/verify-freestanding.sh. Entries are exact symbol
+# names or shell globs, one per line. Comments and blank lines are ignored.
+#
+# This file did not exist before the core/ scaffold; it is seeded empty-ish
+# on purpose. Do not grow it to make a failing check pass — every addition
+# here is a claim that the symbol is genuinely part of the freestanding
+# baseline (compiler-inserted intrinsics), not runtime creep.
+
+# Common LLVM-inserted freestanding intrinsics for struct copy/compare.
+# Uncomment only the ones actually emitted once codegen exists, and only
+# after E4 confirms they're intrinsics rather than libc calls in disguise.
+# memcpy
+# memmove
+# memset
+# memcmp
+
+# ARM soft integer/float routines, if/when an ARM target is added.
+# __aeabi_*

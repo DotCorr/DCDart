@@ -1,0 +1,12 @@
+name: dc_ir
+description: >
+  DC-IR type/SSA/instruction/function definitions (DCDART_SPEC.md §1). Plain
+  hosted Dart per core/docs/decisions/0006-toolchain-bootstrap-language.md.
+publish_to: none
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+# No dependencies -- this package is pure data-shape definitions (see
+# types.dart, ssa.dart, instructions.dart, function.dart), no external
+# packages needed to define them.

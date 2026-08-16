@@ -1,0 +1,19 @@
+name: dc_objdump
+description: >
+  dc-objdump --arc (CLAUDE.md's testing rules: "dc-objdump --arc prints the
+  counts" of dc_retain/dc_release/weak-op instructions in the emitted DC-IR
+  -- the tool this project's own elision-test discipline has needed since
+  M2's first ARC slice). Plain hosted Dart, same bootstrap-language
+  reasoning as dcc (docs/decisions/0002-dcc-bootstrap-language.md,
+  0006-toolchain-bootstrap-language.md) -- this inspects DCDart's compiler
+  output, it is not compiled by that compiler.
+publish_to: none
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  dc_ir:
+    path: ../dc-ir
+  dcc_lower:
+    path: ../dcc-lower

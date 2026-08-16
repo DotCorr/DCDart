@@ -1,0 +1,18 @@
+name: dc_elide
+description: >
+  Spec §3.2 elision passes (docs/decisions/0025-redundant-pair-removal.md).
+  A separate package from dcc_lower purely for dependency hygiene -- see
+  lib/elide.dart's header for why: it lets this package's own test suite
+  depend on package:test, which dcc_lower's pubspec (path-dependent on the
+  vendored kernel package) cannot.
+publish_to: none
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  dc_ir:
+    path: ../dc-ir
+
+dev_dependencies:
+  test: ^1.24.0
