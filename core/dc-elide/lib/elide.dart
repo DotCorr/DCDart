@@ -35,13 +35,17 @@
 //      boundary means the value might flow into a path this pass can't
 //      see all of (DC-IR block params, ADR-0012), so a retain that
 //      hasn't been matched by the time a block ends is left alone.
-//   2. A `Call` instruction invalidates every pending retain. A call is
-//      opaque to this pass -- the callee could retain, release, or store
-//      the same object anywhere, and nothing here does interprocedural
-//      analysis to rule that out (see docs/decisions/0025's worked
-//      example of exactly this: m2-owned's makeAndDropViaCall has a
-//      retain/call/release sequence that looks superficially cancelable
-//      and is NOT -- the callee's own release is load-bearing).
+//   2. A `Call` instruction invalidates every pending retain, EXCEPT one
+//      matching an argument the call fully consumes (`Call.argOwnership`,
+//      docs/decisions/0031-move-semantics.md, spec §3.2 pass 4) -- see
+//      that ADR for why this specific case is provably safe and every
+//      other `Call` argument still isn't (the callee could retain,
+//      release, or store a BORROWED reference anywhere; nothing here does
+//      interprocedural analysis to rule that out -- ADR-0025's own worked
+//      example of exactly this ambiguity, m2-owned's makeAndDropViaCall,
+//      is what motivated adding the ownership tag rather than assuming).
+//      A pending retain that survives this way is tracked more strictly
+//      than an ordinary one, below.
 //   3. `MakeWeak`/`WeakLoad`/`DropWeak` ALSO invalidate every pending
 //      retain, even though they operate on a DIFFERENT DCValue (a
 //      DCWeakPointer, not the DCHeapPointer a pending retain tracks).
@@ -54,12 +58,14 @@
 //      choice.
 //   4. Everything else (arithmetic, Load/Store/PtrOffset/IntToPtr,
 //      ConstInt, Alloc/Retain/Release on OTHER values, terminators) is
-//      safe to skip over without invalidating anything: Alloc always
-//      allocates a fresh, previously-unused header (can't alias a
-//      pending retain's object); PtrOffset/Load/Store only ever touch a
-//      PAYLOAD offset (non-negative, ADR-0016), never the header, which
-//      sits at a fixed NEGATIVE offset -- so no plain memory op can
-//      corrupt a refcount.
+//      safe to skip over without invalidating an ORDINARY pending
+//      retain: Alloc always allocates a fresh, previously-unused header
+//      (can't alias a pending retain's object); PtrOffset/Load/Store
+//      only ever touch a PAYLOAD offset (non-negative, ADR-0016), never
+//      the header, which sits at a fixed NEGATIVE offset -- so no plain
+//      memory op can corrupt a refcount. This does NOT extend to a
+//      call-consumed candidate from rule 2 -- see its own note below for
+//      why that one needs a strictly stronger rule.
 
 import 'package:dc_ir/dc_ir.dart';
 
@@ -80,9 +86,40 @@ DCBasicBlock _elideBlock(DCBasicBlock block) {
   // pendingRetain[valueId] = index into `kept` of an as-yet-unmatched
   // Retain on that value (or absent if none is currently pending).
   final pendingRetain = <int, int>{};
+
+  // Subset of pendingRetain.keys that survived a Call specifically
+  // because they matched one of ITS `argOwnership`-true arguments
+  // (docs/decisions/0031-move-semantics.md). Unlike an ordinary pending
+  // retain (rule 4 above), a call-consumed candidate is invalidated by
+  // ANY subsequent reference to it, not just an opaque op -- because
+  // once its pair is cancelled, the object's LAST reference is what gets
+  // handed directly to the callee. An ordinary pair's object stays alive
+  // via some OTHER reference throughout (safe to skip over ordinary
+  // uses); this one's does not, so a later read (e.g. `return b.value;`
+  // after passing `b` to an @owned param) would become a genuine
+  // use-after-free if not caught here.
+  final callConsumed = <int>{};
+
   final kept = <DCInstruction?>[]; // null marks a removed slot
 
   for (final instruction in block.body) {
+    if (callConsumed.isNotEmpty) {
+      final isOwnMatchingRelease = instruction is Release && callConsumed.contains(instruction.object.id.index);
+      if (!isOwnMatchingRelease) {
+        for (final id in referencedValueIds(instruction)) {
+          if (callConsumed.remove(id)) {
+            // Fully invalidate, not just downgrade to "ordinary" -- the
+            // whole reason this candidate was tracked at all was the
+            // owned-consuming Call it survived; once it's known unsafe to
+            // cancel that specific pair, there's no more specific
+            // reasoning left to fall back on. Worst case this misses an
+            // optimization; it never miscompiles.
+            pendingRetain.remove(id);
+          }
+        }
+      }
+    }
+
     switch (instruction) {
       case Retain():
         // A second Retain on the same value before it's matched simply
@@ -92,9 +129,12 @@ DCBasicBlock _elideBlock(DCBasicBlock block) {
         // cancelling exactly one pair and leaving the other net-zero
         // change is exactly as correct as cancelling any other pairing).
         pendingRetain[instruction.object.id.index] = kept.length;
+        callConsumed.remove(instruction.object.id.index); // fresh, not yet call-consumed
         kept.add(instruction);
       case Release():
-        final pendingIndex = pendingRetain.remove(instruction.object.id.index);
+        final id = instruction.object.id.index;
+        final pendingIndex = pendingRetain.remove(id);
+        callConsumed.remove(id);
         if (pendingIndex != null) {
           kept[pendingIndex] = null; // drop the matched Retain
           kept.add(null); // drop this Release too
@@ -102,13 +142,27 @@ DCBasicBlock _elideBlock(DCBasicBlock block) {
           kept.add(instruction);
         }
       case Call():
+        final ownedIds = <int>{
+          for (var i = 0; i < instruction.args.length; i++)
+            if (instruction.argOwnership[i]) instruction.args[i].id.index,
+        };
+        pendingRetain.removeWhere((id, _) {
+          if (ownedIds.contains(id)) {
+            callConsumed.add(id); // survives THIS call, now under the strict rule above
+            return false;
+          }
+          return true; // ordinary conservative invalidation, unchanged from before
+        });
+        kept.add(instruction);
       case MakeWeak():
       case WeakLoad():
       case DropWeak():
         // Opaque w.r.t. this pass's per-ValueId tracking -- see the file
         // header for why each of these specifically can't be skipped
-        // over safely.
+        // over safely. No argOwnership-style exception exists for these
+        // (spec's weak-count elision is a separate, unstarted question).
         pendingRetain.clear();
+        callConsumed.clear();
         kept.add(instruction);
       default:
         kept.add(instruction);
@@ -120,4 +174,76 @@ DCBasicBlock _elideBlock(DCBasicBlock block) {
     params: block.params,
     body: kept.whereType<DCInstruction>().toList(),
   );
+}
+
+/// Every `ValueId.index` [instruction] reads as an operand -- everything
+/// EXCEPT its own `result`/`dest` (a freshly-defined value can't already
+/// be "in use" by the instruction that creates it). Exhaustive over every
+/// `DCInstruction` subtype on purpose: the sealed hierarchy in
+/// `core/dc-ir/lib/instructions.dart` means the analyzer refuses to
+/// compile this if a new instruction is ever added without updating it
+/// here too, which is exactly the safety net a generic "does X reference
+/// value V" helper needs for something this correctness-sensitive
+/// (docs/decisions/0031-move-semantics.md's own "critical correctness
+/// subtlety" section is what this helper exists to make provable, not
+/// just assumed).
+Set<int> referencedValueIds(DCInstruction instruction) {
+  final ids = <int>{};
+  void ref(DCValue v) => ids.add(v.id.index);
+
+  switch (instruction) {
+    case ConstInt():
+      break; // no operands, only a dest
+    case IAdd(:final lhs, :final rhs):
+    case ISub(:final lhs, :final rhs):
+    case IMul(:final lhs, :final rhs):
+    case IAnd(:final lhs, :final rhs):
+    case IOr(:final lhs, :final rhs):
+    case IXor(:final lhs, :final rhs):
+    case IShl(:final lhs, :final rhs):
+    case IShr(:final lhs, :final rhs):
+    case ICmp(:final lhs, :final rhs):
+      ref(lhs);
+      ref(rhs);
+    case MakeStruct(:final fields):
+      fields.forEach(ref);
+    case ExtractField(:final struct):
+      ref(struct);
+    case Load(:final pointer):
+      ref(pointer);
+    case Store(:final pointer, :final value):
+      ref(pointer);
+      ref(value);
+    case IntToPtr(:final address):
+      ref(address);
+    case PtrOffset(:final base):
+      ref(base);
+    case PortOut(:final port, :final value):
+      ref(port);
+      ref(value);
+    case PortIn(:final port):
+      ref(port);
+    case Alloc():
+      break; // always a fresh header; no operands
+    case Call(:final args):
+      args.forEach(ref);
+    case Retain(:final object):
+    case Release(:final object):
+    case DropWeak(:final object):
+      ref(object);
+    case MakeWeak(:final object):
+      ref(object);
+    case WeakLoad(:final weak):
+      ref(weak);
+    case Return(:final value):
+      if (value != null) ref(value);
+    case Branch(:final args):
+      args.forEach(ref);
+    case CondBranch(:final cond, :final trueArgs, :final falseArgs):
+      ref(cond);
+      trueArgs.forEach(ref);
+      falseArgs.forEach(ref);
+  }
+
+  return ids;
 }

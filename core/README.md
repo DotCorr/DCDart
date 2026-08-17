@@ -8,9 +8,9 @@ Layout follows the compiler pipeline's own stages (frontend → lowering → IR 
 | Path | Maps to spec §1 stage | Status |
 |---|---|---|
 | `frontend/` | DCDart CFE (fork of `pkg/front_end`) | vendored at `vendor/dart-sdk/`, pinned at the `3.12.2` tag, `pub get` resolves cleanly (docs/decisions/0005, 0007). Not invoked directly — shells to `dart compile kernel` instead (ADR-0008); the vendored copy is ready for when a real fork is needed |
-| `dcc-lower/` | Kernel IR → DC-IR | **implemented, working, fully verified** for M0/M1 (all clauses) and M2's fourteen ARC/elision/recursion/mutability/control-flow/port-io/bitwise slices, ADR-0016 through ADR-0030 (real heap objects, alias retain, calls, heap-typed signatures, heap-typed fields, `@owned` parameters, destructor cascade, weak references, redundant-pair elision, verified recursion, scalar reassignment, real `while`-loop control flow, x86 port I/O) |
-| `dc-ir/` | DC-IR: typed SSA, explicit retain/release | real pub package (`dc_ir`), plain hosted Dart per ADR-0006. Arithmetic, `Load`/`Store`/`IntToPtr`/`PtrOffset`, `ICmp`, `Branch`/`CondBranch`, `MakeStruct`/`ExtractField`, `Alloc`/`Retain`/`Release`, `Call`, `MakeWeak`/`WeakLoad`/`DropWeak`, `PortOut`/`PortIn` (M2, ADR-0018/0022/0023/0029). Consumed for real by `dcc-lower` and `backend` — `while`-loop back edges (ADR-0028) needed no new instructions, just real use of the block-parameter merge points already there |
-| `dc-elide/` | Elision passes (spec §3.2) | **`elideRedundantRetainReleasePairs` implemented and verified** (ADR-0025, spec §3.2 pass 3) — a separate small package (only depends on `dc_ir`) purely so its own test suite can use `package:test`, which `dcc_lower`'s vendored-`kernel` dependency can't reconcile. 4 isolated unit tests (2 positive, 2 negative/safety) plus real end-to-end firing verified via `dc-objdump --arc` |
+| `dcc-lower/` | Kernel IR → DC-IR | **implemented, working, fully verified** for M0/M1 (all clauses) and M2's fifteen ARC/elision/recursion/mutability/control-flow/port-io/bitwise/move-semantics slices, ADR-0016 through ADR-0031 (real heap objects, alias retain, calls, heap-typed signatures, heap-typed fields, `@owned` parameters, destructor cascade, weak references, redundant-pair elision, verified recursion, scalar reassignment, real `while`-loop control flow, x86 port I/O, move semantics) |
+| `dc-ir/` | DC-IR: typed SSA, explicit retain/release | real pub package (`dc_ir`), plain hosted Dart per ADR-0006. Arithmetic, `Load`/`Store`/`IntToPtr`/`PtrOffset`, `ICmp`, `Branch`/`CondBranch`, `MakeStruct`/`ExtractField`, `Alloc`/`Retain`/`Release`, `Call` (now carrying `argOwnership`, ADR-0031), `MakeWeak`/`WeakLoad`/`DropWeak`, `PortOut`/`PortIn` (M2, ADR-0018/0022/0023/0029). Consumed for real by `dcc-lower` and `backend` — `while`-loop back edges (ADR-0028) needed no new instructions, just real use of the block-parameter merge points already there |
+| `dc-elide/` | Elision passes (spec §3.2) | **`elideRedundantRetainReleasePairs` implemented and verified** for pass 3 (ADR-0025) and pass 4's call-consumed case (ADR-0031) — a separate small package (only depends on `dc_ir`) purely so its own test suite can use `package:test`, which `dcc_lower`'s vendored-`kernel` dependency can't reconcile. 6 unit tests (3 positive, 3 negative/safety, including the critical "used again after an owned call" case) plus real end-to-end firing verified via `dc-objdump --arc` |
 | `backend/` | DC-IR → LLVM IR → object file | **implemented, working, fully verified** for M0/M1, plus M2's real ARC codegen (`Alloc`/`Retain`/`Release` against a fixed arena, ADR-0015), real function-call codegen (`Call`, ADR-0018), a real destructor-dispatch call through the object header's `cls` field (ADR-0022), real weak-reference codegen with zombie-slot semantics (ADR-0023), correct `phi`-predecessor tracking across internally-split blocks (ADR-0028, a real latent bug fixed), and real x86 port-I/O codegen via fixed inline asm (ADR-0029, verified against a real disassembly) — compiled via `clang -c` |
 | `dcc/` | the `dcc` CLI driver | **`dcc build --mode bare` produces real object files** for all sixteen example targets below, all passing their conformance harnesses. `--mode hosted` still throws (no backend target designed for it) |
 | `dc-objdump/` | ARC instruction counter (`CLAUDE.md`'s testing rules) | **`dc-objdump --arc <source.dart>` implemented and verified** (ADR-0024) — counts `Alloc`/`Retain`/`Release`/`MakeWeak`/`WeakLoad`/`DropWeak` per function at the DC-IR level (the only place these are countable at all — they're inlined, not symbols, by the time `backend` is done). Every count cross-checked exactly against every M2 ADR's own hand-derived trace, zero mismatches. Now also what proves ADR-0025's elision pass actually fires |
@@ -35,7 +35,7 @@ Layout follows the compiler pipeline's own stages (frontend → lowering → IR 
 | `tests/conformance/`, `tests/leak/` | per `SKILL.md` §4 | **all sixteen `run.sh` harnesses report an unqualified PASS**, verified under WSL2/Ubuntu (real freestanding link + real run on the actual `x86_64-unknown-none-elf` target, except `m2-port` which verifies structurally — see above). `tests/leak/` empty — the `m2-*` harnesses are the de facto leak tests; a dedicated `dc-test --leakcheck` harness is future work |
 | `scripts/verify-freestanding.sh` | the spine check (`CLAUDE.md` rule 1) | **`FREESTANDING: pass`** against real `dcc` output, all sixteen targets, confirmed on both Windows and Linux |
 | `tools/bare-symbol-allowlist.txt` | consumed by the check above | still empty/draft — none of the sixteen targets needed anything allowlisted |
-| `docs/` | compat-matrix, known-gaps, decisions, escalations | 30 ADRs, 2 escalations, 10 gaps (8 resolved or resolved-for-current-scope — `unowned`/real vtable dispatch/elision passes 1,2,4,5/cycles/heap-in-loop remain within GAP-0003/0017, correctly deferred; GAP-0006 `@volatile` still fully open; GAP-0019 general asm/`@naked`/extern-FFI open, narrow port I/O resolved) |
+| `docs/` | compat-matrix, known-gaps, decisions, escalations | 31 ADRs, 2 escalations, 10 gaps (8 resolved or resolved-for-current-scope — `unowned`/real vtable dispatch/elision passes 1,2,5 + pass 4's general cases/cycles/heap-in-loop remain within GAP-0003/0017, correctly deferred; GAP-0006 `@volatile` still fully open; GAP-0019 general asm/`@naked`/extern-FFI open, narrow port I/O resolved) |
 
 ## Current milestone: M1 done, M2's naive ARC insertion done, M2 overall in progress
 
@@ -57,7 +57,7 @@ linked and run for real.
 criterion is "allocation-heavy programs run leak-free... `weak` references nil out correctly...
 elision firing" — the FULL criterion needs later work too (see below), but every ownership-transfer,
 object-death, AND weak-reference shape `DCDART_SPEC.md` §3.1/§3.2/§3.3-layer-1 describes now has real,
-verified codegen, across thirteen ADRs:
+verified codegen, across fourteen ADRs:
 
 1. **(ADR-0015/0016)** The core mechanism: `Alloc`/`Retain`/`Release` codegen against a fixed internal
    arena (explicitly NOT the real `Allocator` — spec §12's open decision 2, `escalations/0002`), real
@@ -154,6 +154,21 @@ verified codegen, across thirteen ADRs:
     would mis-parse) instead of twenty near-identical ones. `examples/m2-bitwise/bitwise.dart`: real
     execution (not just structural — these are unprivileged instructions), `&`/`|`/`^` exhaustive over a
     range at `u64`, `<<`/`>>` over a range, `&` at `u32`/`u16`/`u8`, all correct.
+
+14. **(ADR-0031)** Move semantics (spec §3.2 pass 4) — resolved for the call-consumed,
+    single-owned-argument case, scoped from a real example rather than speculatively.
+    `Call` gained `argOwnership: List<bool>`; `dc-elide` now lets a pending retain survive a `Call`
+    when it matches an owned-consumed argument, but under a STRICTLY STRONGER invalidation rule than an
+    ordinary pending retain (any later reference at all invalidates it, not just an opaque op) — the
+    ADR's own "critical correctness subtlety" explains why the weaker ordinary-pair rule isn't safe
+    here (cancelling this pair hands the object's LAST reference directly to the callee, unlike an
+    ordinary pair kept alive by some other reference regardless). `m2-owned/owned.dart`'s
+    `makeAndDropViaCall` goes from `retain=1 release=1` to `retain=0 release=0`, verified via
+    `dc-objdump --arc` on the real compiled source — exactly the number `known-gaps.md`'s own entry had
+    already named as the target. A dedicated negative test proves a "used again after the owned call"
+    shape is correctly left alone — the single most important safety check for this feature. General
+    move-semantics cases (struct fields, plain last-read moves, loop back-edges) remain unimplemented,
+    scoped for later.
 
 Every slice was verified against the FULL conformance suite (all sixteen targets) after landing, zero
 regressions at any step — see `docs/known-gaps.md` GAP-0017/GAP-0003/GAP-0019 for the itemized history.

@@ -1416,6 +1416,13 @@ class _BareFunctionLowerer {
     }
 
     final loweredArgs = <DCValue>[];
+    // (Move semantics, docs/decisions/0031-move-semantics.md) Parallel to
+    // loweredArgs -- records, per argument, whether the callee fully
+    // consumes it (an @owned DCHeapPointer parameter) so dc-elide can
+    // later tell a load-bearing borrowed pair apart from a redundant
+    // owned-consuming one, which look identical as a plain opaque `Call`
+    // otherwise.
+    final argOwnership = <bool>[];
     for (var i = 0; i < calleeParams.length; i++) {
       final expectedType = _lowerType(
         calleeParams[i].type,
@@ -1429,9 +1436,8 @@ class _BareFunctionLowerer {
           'implicit widening (same rule as arithmetic)',
         );
       }
-      if (expectedType is DCHeapPointer &&
-          _hasMarkerAnnotation(calleeParams[i].annotations, '_Owned', preludeUri) &&
-          !_isFreshHeapOwnership(callArgs[i])) {
+      final isOwnedParam = _hasMarkerAnnotation(calleeParams[i].annotations, '_Owned', preludeUri);
+      if (expectedType is DCHeapPointer && isOwnedParam && !_isFreshHeapOwnership(callArgs[i])) {
         _addInstr(Retain(object: arg));
       }
       // (ADR-0023) Same idea for a Weak<T>-typed @owned parameter, but
@@ -1442,9 +1448,7 @@ class _BareFunctionLowerer {
       // comment on why weak-to-weak aliasing is unsupported). Only a
       // fresh source is allowed through; anything else throws rather than
       // silently double-dropping the weak count.
-      if (expectedType is DCWeakPointer &&
-          _hasMarkerAnnotation(calleeParams[i].annotations, '_Owned', preludeUri) &&
-          !_isFreshHeapOwnership(callArgs[i])) {
+      if (expectedType is DCWeakPointer && isOwnedParam && !_isFreshHeapOwnership(callArgs[i])) {
         throw DccLowerError(
           '"$context": call to "${target.name.text}" passes an existing '
           'Weak<T> local to an @owned Weak<T> parameter -- only a fresh '
@@ -1452,11 +1456,16 @@ class _BareFunctionLowerer {
           'can be passed directly (see docs/known-gaps.md)',
         );
       }
+      // Only DCHeapPointer arguments record ownership for elision purposes
+      // -- a DCWeakPointer @owned param has no elision story built yet
+      // (weak-count elision is a separate, unstarted question), and
+      // non-pointer types have no ARC traffic to elide in the first place.
+      argOwnership.add(expectedType is DCHeapPointer && isOwnedParam);
       loweredArgs.add(arg);
     }
 
     final dest = DCValue(_allocId(), calleeReturnType);
-    _addInstr(Call(dest: dest, targetName: target.name.text, args: loweredArgs));
+    _addInstr(Call(dest: dest, targetName: target.name.text, args: loweredArgs, argOwnership: argOwnership));
     return dest;
   }
 

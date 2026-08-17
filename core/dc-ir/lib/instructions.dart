@@ -465,7 +465,28 @@ final class Call extends DCInstruction {
   final DCValue? dest;
   final String targetName;
   final List<DCValue> args;
-  const Call({this.dest, required this.targetName, required this.args});
+
+  /// Parallel to `args` (same length) -- `true` at position *i* when that
+  /// argument is passed to an `@owned` parameter (spec §3.2 item 2: the
+  /// callee fully consumes it), `false` when borrowed. Added for the first
+  /// slice of move semantics (spec §3.2 pass 4, docs/decisions/0031-move-
+  /// semantics.md): without this, an elision pass has no DC-IR-level way
+  /// to tell "the callee borrows, so a Retain/Release pair spanning this
+  /// call is load-bearing" apart from "the callee fully consumes, so the
+  /// pair is redundant" -- both look identical as a plain opaque `Call`
+  /// (see docs/decisions/0025-redundant-pair-removal.md's own worked
+  /// example of exactly this ambiguity). `dcc-lower` already computes this
+  /// exact fact per argument today (it decides whether to emit a caller-
+  /// side `Retain` from it) -- this just also records it here instead of
+  /// discarding it.
+  final List<bool> argOwnership;
+
+  const Call({
+    this.dest,
+    required this.targetName,
+    required this.args,
+    required this.argOwnership,
+  });
 
   @override
   DCValue? get result => dest;

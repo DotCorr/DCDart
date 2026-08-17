@@ -97,45 +97,39 @@ cycles under Linux) — genuinely the highest-risk part of M2 per `AGENTS.md`. W
    heap-signature target that didn't need to stop short of the 64-slot arena). All shapes compose
    correctly with each other and with the pre-existing naive release policy (ADR-0016), confirmed via
    a full regression run after every single addition, zero regressions at any step.
-2. **Elision (spec §3.2 passes 1, 3, 4, 5) — PASS 3 RESOLVED (ADR-0025); passes 1/2/4/5 remain.**
-   Earlier drafts of this entry framed elision as purely M3 scope ("naive-but-correct is the right M2
-   target") — CORRECTED after re-checking `ROADMAP.md`'s own M2 exit text directly: *"...`dc-objdump
-   --arc` shows elision firing on the reference benchmark" is part of M2's exit criterion, not M3's.*
-   M3's own exit is specifically the ≤10%-overhead *measurement* (a distinct, later gate). Pass 3
-   (redundant-pair removal: `retain(x); ...; release(x)` with no release of `x` in between → delete
-   both) is now implemented (`core/dc-elide/`) and demonstrably firing — `core/examples/m2-alias/
-   alias.dart`'s `makeAliasAndReadValue` went from `retain=1 release=2` to `retain=0 release=1`,
-   verified via `dc-objdump --arc` (ADR-0024) before and after, with zero regressions across all 11
-   conformance targets and two dedicated negative tests (a call-spanning pair, a weak-op-spanning
-   pair) proving the pass correctly refuses to touch cases where it can't prove safety. M2's exit
+2. **Elision (spec §3.2 passes 1, 3, 4, 5) — PASSES 3 and 4 (one case) RESOLVED; passes 1/2/5 and pass
+   4's general cases remain.** Earlier drafts of this entry framed elision as purely M3 scope
+   ("naive-but-correct is the right M2 target") — CORRECTED after re-checking `ROADMAP.md`'s own M2
+   exit text directly: *"...`dc-objdump --arc` shows elision firing on the reference benchmark" is part
+   of M2's exit criterion, not M3's.* M3's own exit is specifically the ≤10%-overhead *measurement* (a
+   distinct, later gate). Pass 3 (redundant-pair removal) is implemented (`core/dc-elide/`) and
+   demonstrably firing — `core/examples/m2-alias/alias.dart`'s `makeAliasAndReadValue` went from
+   `retain=1 release=2` to `retain=0 release=1`, verified via `dc-objdump --arc` (ADR-0024). M2's exit
    criterion text is satisfied for "elision firing." **Still open:** passes 1 (escape analysis), 2
    (borrow inference proper — proving MORE un-annotated parameters could safely skip retain/release
    than the source explicitly marks; NOT the `@owned`/borrowed-by-default *contract* ADR-0019/0021
    already built, which is the ownership rule elision would optimize on top of, not the optimization
-   itself — see ADR-0021's "one wrinkle worth recording"), 4 (move semantics), and 5 (uniqueness/reuse
-   analysis) — each a real, larger analysis, appropriately sequenced after this first, narrowest pass
-   proved the mechanism.
+   itself — see ADR-0021's "one wrinkle worth recording"), 5 (uniqueness/reuse analysis), and pass 4's
+   general cases (below) — each a real, larger analysis, appropriately sequenced after the narrowest
+   pass proved the mechanism.
 
-   **Move semantics (pass 4), scoped but deliberately NOT implemented yet — a real architectural
-   finding, not a stub.** The obvious next target is `core/examples/m2-owned/owned.dart`'s
-   `makeAndDropViaCall` (`final b = makeBox(v); return dropBoxAndReadValue(b);`): `b` is used exactly
-   once, as an `@owned` call argument, and is never referenced again — under move semantics the
-   caller's `Retain`+`Release` pair around that call is entirely redundant (the callee's own release
-   already accounts for it), which would take this function from `retain=1 release=1` to `retain=0
-   release=0`. **Why `dc-elide`'s existing pass can't safely do this**: `Call` (`core/dc-ir`) carries
-   no per-argument ownership metadata — from a pure DC-IR vantage point, a retain/release pair
-   spanning a `Call` is indistinguishable between "the callee borrows, so the pair is load-bearing"
-   (unsafe to remove, ADR-0025's own negative test) and "the callee fully consumes via `@owned`, so
-   the pair is redundant" (safe to remove) — nothing at the DC-IR level says which. Two real ways
-   forward, neither started: (a) tag `Call.args` (or a parallel list) with an ownership category per
-   argument, letting a DC-IR-level pass reason about it directly; (b) do it at LOWERING time instead
-   (`_lowerBareCall` already sees the Kernel-level `@owned` annotation directly), which needs a
-   reference-count pre-pass over the Kernel IR body to prove a given use is a variable's ONLY use —
-   itself a real correctness hazard if it doesn't stay in exact lockstep with `_lowerExpression`'s own
-   recognized-shape dispatch (an under-count would incorrectly apply the optimization to a variable
-   still used elsewhere — a genuine use-after-free, not a cosmetic bug). Deliberately not rushed in an
-   unsupervised pass, per `CLAUDE.md`'s own words on elision regressions being "invisible at runtime
-   and catastrophic in aggregate."
+   **Move semantics (pass 4) — RESOLVED for the call-consumed, single-owned-argument case
+   (`docs/decisions/0031-move-semantics.md`); general cases remain.** The target this was scoped from:
+   `core/examples/m2-owned/owned.dart`'s `makeAndDropViaCall` (`final b = makeBox(v); return
+   dropBoxAndReadValue(b);`) now shows `retain=0 release=0` (was `retain=1 release=1`), verified via
+   `dc-objdump --arc` on the real compiled source. `Call` gained `argOwnership: List<bool>`
+   (`core/dc-ir`), populated by `dcc-lower` from the same `@owned` check that already decided whether
+   to emit a caller-side `Retain`; `dc-elide` now lets a pending retain survive a `Call` specifically
+   when it matches an owned-consumed argument, but tracks it under a STRICTLY STRONGER invalidation
+   rule than an ordinary pending retain (any later reference at all invalidates it, not just an opaque
+   op) — the ADR's own "critical correctness subtlety" section explains why the weaker rule that's safe
+   for ordinary pairs is NOT safe here (cancelling this pair leaves the object's LAST reference handed
+   directly to the callee, unlike an ordinary pair where some other reference keeps it alive
+   regardless). A dedicated negative test proves a "used again after the owned call" shape is correctly
+   left alone. **What pass 4 still doesn't cover**, deliberately: moving into a struct/heap-object
+   field, moving on a plain variable's last read with no call involved (closer to escape-analysis
+   territory), moving across a loop back-edge, and `Weak<T>`'s own `@owned` convention (no weak-count
+   elision story exists at all yet).
 3. **`weak` (spec §3.3 layer 1) — RESOLVED (ADR-0023); `unowned` still not started.** A new
    `DCWeakPointer` type plus `MakeWeak`/`WeakLoad`/`DropWeak` DC-IR instructions; "nils out when the
    target dies" is real, backed by ADR-0022's destructor cascade for the "dies" part and a "zombie
@@ -190,17 +184,17 @@ cycles under Linux) — genuinely the highest-risk part of M2 per `AGENTS.md`. W
    real alternative for "iterate toward a base case" but is not a substitute for the general loop this
    item now provides (no iterating over a collection, no `for`, no `break`).
 
-**Cost of the workaround:** none for items 1/2(pass 3)/3(weak)/5/6 (resolved for real, not worked
-around). Item 4 (cycle collection/ORC) is correctly M3+/later: `ROADMAP.md`'s own M2 work list
+**Cost of the workaround:** none for items 1/2(passes 3 and 4's resolved case)/3(weak)/5/6 (resolved
+for real, not worked around). Item 4 (cycle collection/ORC) is correctly M3+/later: `ROADMAP.md`'s own M2 work list
 ("Retain/release insertion, destructors, weak/unowned, escape analysis, borrow inference,
 redundant-pair removal, move semantics, uniqueness/reuse") never mentions cycle collection at all —
 only spec §3.3's own layer numbering (this file's earlier framing) suggested otherwise. `unowned`
 (item 3's other half) is genuinely optional until a real use case needs it.
 
 **Next step:** item 2's remaining passes — escape analysis (1), borrow inference proper (2), move
-semantics (4), uniqueness/reuse (5) — are each real, larger analyses; pick whichever a real workload
-pressures first rather than building all four speculatively. Cycle collection and `unowned` remain
-correctly deferred until a real use case needs them.
+semantics' general cases (4), uniqueness/reuse (5) — are each real, larger analyses; pick whichever a
+real workload pressures first rather than building them all speculatively. Cycle collection and
+`unowned` remain correctly deferred until a real use case needs them.
 
 ---
 

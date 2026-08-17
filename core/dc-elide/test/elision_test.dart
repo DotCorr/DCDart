@@ -71,12 +71,11 @@ void main() {
     ]);
   });
 
-  test('does NOT remove a Retain/Release pair spanning a Call', () {
-    // Mirrors core/examples/m2-owned/owned.dart's makeAndDropViaCall: the
-    // caller retains before passing to an @owned parameter, then releases
-    // its own local at return. The Call in between is opaque -- the
-    // callee's own Release (in a different function entirely) is
-    // load-bearing, so this pair must NOT be touched.
+  test('does NOT remove a Retain/Release pair spanning a Call with a BORROWED argument', () {
+    // The Call in between is opaque when the argument is borrowed (not
+    // @owned) -- the callee could retain, release, or store the same
+    // object anywhere, and nothing here does interprocedural analysis to
+    // rule that out. This pair must NOT be touched.
     final heapPtr = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
     final callResult = DCValue(ValueId(1), DCInt.u64);
 
@@ -91,7 +90,7 @@ void main() {
           params: const [],
           body: [
             Retain(object: heapPtr),
-            Call(dest: callResult, targetName: 'someOwnedConsumer', args: [heapPtr]),
+            Call(dest: callResult, targetName: 'someBorrowingConsumer', args: [heapPtr], argOwnership: [false]),
             Release(object: heapPtr),
             Return(value: callResult),
           ],
@@ -102,8 +101,95 @@ void main() {
     final elided = elideRedundantRetainReleasePairs(function);
     final body = elided.blocks.single.body;
 
-    expect(body.whereType<Retain>().length, 1, reason: 'a retain spanning a Call must survive');
+    expect(body.whereType<Retain>().length, 1, reason: 'a retain spanning a borrowing Call must survive');
     expect(body.whereType<Release>().length, 1, reason: 'its matching release must survive too');
+  });
+
+  test('removes a Retain/Release pair spanning a Call when the argument is fully owned-consumed '
+      '(move semantics, docs/decisions/0031-move-semantics.md)', () {
+    // Mirrors core/examples/m2-owned/owned.dart's makeAndDropViaCall,
+    // now with the real fix: dropBoxAndReadValue's parameter is @owned
+    // (argOwnership: [true]), so the caller's Retain/Release pair around
+    // the call is genuinely redundant -- the callee's own release already
+    // accounts for the reference the caller retained. Unlike the borrowed
+    // case above, this is provably safe (see the ADR).
+    final heapPtr = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final callResult = DCValue(ValueId(1), DCInt.u64);
+
+    final function = DCFunction(
+      linkName: 'test_owned_call_consumed',
+      paramTypes: const [],
+      returnType: DCInt.u64,
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: const [],
+          body: [
+            Retain(object: heapPtr),
+            Call(dest: callResult, targetName: 'dropBoxAndReadValue', args: [heapPtr], argOwnership: [true]),
+            Release(object: heapPtr),
+            Return(value: callResult),
+          ],
+        ),
+      ],
+    );
+
+    final elided = elideRedundantRetainReleasePairs(function);
+    final body = elided.blocks.single.body;
+
+    expect(body.whereType<Retain>().length, 0,
+        reason: 'the retain around an owned-consumed argument with no later use is redundant');
+    expect(body.whereType<Release>().length, 0,
+        reason: "its matching release is redundant too -- the callee's own release already accounts for it");
+    expect(body, [isA<Call>(), isA<Return>()]);
+  });
+
+  test('does NOT remove a pair spanning an owned-consuming Call when the value is used again '
+      'afterward -- the critical safety case', () {
+    // Even though the argument is passed to an @owned parameter, if the
+    // SAME value is read again after the call (e.g. `return b.value;`
+    // after `consumeB(b)`), the pair is load-bearing: under naive
+    // semantics two references are alive across the call (the retained
+    // copy handed to the callee, and the local's own original reference),
+    // so the local's own reference survives the callee's release and
+    // stays valid to read afterward. Cancelling the pair would leave only
+    // ONE reference, which the callee's own release would drop to zero --
+    // making the later read a genuine use-after-free. This is exactly
+    // what `referencedValueIds`'s stricter call-consumed rule exists to
+    // catch.
+    final heapPtr = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final callResult = DCValue(ValueId(1), DCInt.u64);
+    final fieldPtr = DCValue(ValueId(2), const DCPointer(DCInt.u64));
+    final fieldVal = DCValue(ValueId(3), DCInt.u64);
+
+    final function = DCFunction(
+      linkName: 'test_owned_call_then_read_again',
+      paramTypes: const [],
+      returnType: DCInt.u64,
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: const [],
+          body: [
+            Retain(object: heapPtr),
+            Call(dest: callResult, targetName: 'ownedConsumer', args: [heapPtr], argOwnership: [true]),
+            PtrOffset(dest: fieldPtr, base: heapPtr, offsetBytes: 0),
+            Load(dest: fieldVal, pointer: fieldPtr),
+            Release(object: heapPtr),
+            Return(value: fieldVal),
+          ],
+        ),
+      ],
+    );
+
+    final elided = elideRedundantRetainReleasePairs(function);
+    final body = elided.blocks.single.body;
+
+    expect(body.whereType<Retain>().length, 1,
+        reason: 'heapPtr is referenced again after the call, so the pair must survive');
+    expect(body.whereType<Release>().length, 1);
   });
 
   test('does NOT remove a Retain/Release pair spanning a WeakLoad on a different value', () {
