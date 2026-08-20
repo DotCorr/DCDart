@@ -342,6 +342,29 @@ currently DCDart's only real `@bare` test, and that is a dependency in the wrong
 language project whose freestanding guarantees can only be validated by a downstream consumer has
 outsourced its own acceptance criteria.
 
+**2026-08-20: this is now three for three, and it is a property rather than a pattern.** Every
+bare-metal-only defect found so far was found OUTSIDE this suite, and in each case the suite
+structurally could not have found it:
+
+| defect | how the suite missed it |
+|---|---|
+| red zone (ADR-0039) | `@bare` objects run inside hosted processes, where the red zone is legitimate |
+| reserved symbols honorable by manifest (GAP-0029) | no test ever asked the checker to reject something |
+| **`volatile` / MMIO elimination (GAP-0006)** | `m1-pointer` asserts the returned VALUE, which stays correct after the load is deleted |
+
+**And "run the kernel harnesses as acceptance" is a stopgap, not the fix.** That is the obvious
+response and it is not sufficient, proven today: `oscortex_core`'s byte-exact captures (433 and 544
+bytes, the strongest evidence in either repo) would very likely **still have matched** with MMIO
+read-backs eliminated, because the printed VALUES stay correct — it is the ACCESSES that disappear.
+The kernel side offered those harnesses as the `-O` acceptance criterion in good faith and has since
+confirmed they would have passed a compiler that had stopped talking to hardware.
+
+So closing this gap requires a `dc-test --qemu` inside DCDart with targets that **observe the access
+itself, not its result**: a QEMU device trace, a port-I/O count, an MMIO watchpoint — something that
+fails when a read does not happen even though the value is right. Every harness in both repos today
+checks what a program computed or printed. Nothing anywhere checks that the hardware was touched. That
+is the actual hole, and it is wider than any single defect that has walked through it.
+
 **Cost of the workaround:** a whole class of defect is invisible until a downstream consumer hits it,
 which is the most expensive place to find it. `no-red-zone/` mitigates exactly one instance by
 inspecting instructions instead of results — that shape (assert a property of the emitted code, not of
