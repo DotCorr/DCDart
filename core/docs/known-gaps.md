@@ -31,8 +31,8 @@ a backend change — `DCInt.signed` is already threaded through.
 
 ## GAP-0032 — `dcc` never passes an optimization flag, so every DCDart program ships `-O0` code
 
-**Domain:** backend / dcc (M3 — this is the gate's single biggest lever)
-**Status:** OPEN
+**Domain:** backend / dcc
+**Status:** OPEN — **a PREREQUISITE of M3, not merely related to it. Do not benchmark before closing it.**
 
 `backend/lib/compile.dart` invokes `clang` with `-ffreestanding -fno-builtin -fno-stack-protector
 -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables -c`. There is no `-O` anywhere, so
@@ -48,11 +48,33 @@ compiled for `x86_64-unknown-none-elf`:
 | **the same DCDart IR at `-O2`** | **21** | values in registers; `xorl (%r9), %eax` direct memory operand; tight 8-instruction loop |
 | C at `-O2` | 36 | longer only because it unrolled 4x |
 
-**Why this entry matters more than its size.** M3 is the project's hard gate — geometric mean ARC
-overhead ≤10% vs C — and any measurement taken before this is closed measures the wrong thing. A
-benchmark run today would attribute to ARC what is actually the optimizer being switched off, and
-would fail the gate for a reason that has nothing to do with the memory model. Anyone reaching M3
-should close this FIRST, then measure.
+**Why this entry matters more than its size, stated as sharply as it deserves.** M3 is the project's
+hard gate — geometric mean ARC overhead ≤10% vs C — and `ROADMAP.md` says nothing downstream starts
+until it is green. A benchmark run today would attribute the ENTIRE `-O0` penalty to ARC. It would not
+merely produce a pessimistic number: it would **fail the gate**, and failing it triggers exactly the
+response the roadmap prescribes — *"fix the optimizer, or accept and document a higher number, or
+revisit the model."* The third option means changing the memory model. **The project would consider
+revisiting ARC to fix a missing compiler flag.**
+
+That is why this is a prerequisite rather than an optimization: it is not that the number would be
+wrong, it is that a wrong number here has a standing procedure attached to it that damages the
+language.
+
+Visible in shipped kernel code, not only in synthetic loops — `oscortex_core`'s `uartPutc`, verified
+by the kernel side from a real build:
+
+```
+b85: movb %al, 0x1(%rsp)      <- store to a stack slot
+b89: movb 0x1(%rsp), %al      <- reload it immediately; a no-op pair
+b8d: xorl %ecx, %ecx
+b8f: addb $0x20, %cl          <- the constant 0x20, built in two instructions
+b94: xorl %ecx, %ecx
+b96: addb $0x1, %cl
+b99: cmpb %cl, %al            <- instead of `cmpb $1, %al`
+```
+
+plus `xorl %eax,%eax; movw %ax,%dx; addw $0x3fd,%dx` to materialize a port number that is one `movw`.
+None of that is an ARC artefact or a memory-model cost.
 
 It also corrects a wrong conclusion that is easy to reach from reading the output: DCDart's emitted
 code looks nothing like C's, so it is tempting to infer that ARC or some runtime is responsible. It is
@@ -61,12 +83,20 @@ programs emit **zero** ARC instructions (`m2-port`, `m1-pointer`, `m2-bitwise`, 
 `m2-rodata` all report `alloc=0 retain=0 release=0`), and a `@bare` object has zero undefined symbols,
 so there is no runtime to call into.
 
-**Cost of the workaround:** nothing depends on `-O0`, so this is not load-bearing anywhere. But it is
-not a one-line change either, and that is worth saying: turning optimization on makes the red zone
-reachable (ADR-0039 already handles that), changes what `tests/conformance/no-red-zone/` actually
-exercises from a forward guard into a live check, and may expose latent UB in emitted IR that `-O0`
-currently hides. It should land as its own unit with the full suite re-run, not as a flag flipped in
-passing.
+**Cost of the workaround:** nothing depends on `-O0`, so it is not load-bearing anywhere. But it is not
+a one-line change, and the reasons are the interesting part:
+
+- It makes the red zone genuinely reachable for the first time. ADR-0039 already handles it, and
+  `tests/conformance/no-red-zone/`'s codegen half converts from a forward guard into a LIVE check —
+  that harness has never actually been exercised, because `-O0` does not use the red zone anyway.
+- It is the change most likely to expose latent UB in emitted IR that `-O0` hides, and by GAP-0027 the
+  conformance suite structurally cannot see the bare-metal-only classes of that.
+
+So the acceptance criterion should include `oscortex_core`, which is DCDart's only real `@bare` test
+(GAP-0027). Its three harnesses assert byte-exact serial output from real hardware behaviour — 256 IDT
+gates, PIT ticks with EOI, a real `#UD` survived. If the captures still match byte-for-byte at `-O2`,
+that is strong evidence. If they do not, `-O0` was hiding something real, which is worth more than a
+clean run. The kernel side has offered to run exactly that.
 
 ---
 
