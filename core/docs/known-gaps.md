@@ -161,10 +161,11 @@ inferring from the gaps file:
 | generics / monomorphization | `unsupported type TypeParameterType` (spec §4.2) | any container |
 | closures | `unsupported expression FunctionExpression` | the functional workload |
 | `String` | `unsupported expression StringLiteral` (spec §7) | JSON parser, string pass |
-| instance methods | not lowered; only top-level functions | idiomatic anything |
+| instance methods | **RESOLVED 2026-08-21 (ADR-0043)** | — |
 | `for` loops | `unsupported statement ForStatement` | cosmetic — `while` works |
 
-Only `bool` locals passed.
+Only `bool` locals passed. Instance methods have since been implemented (ADR-0043); the other six
+remain.
 
 **So M3 is not one unit away. It is most of the remaining language.** That is worth stating plainly
 because "the gate is unblocked" reads as "the gate is next", and it is not — the benchmarks are

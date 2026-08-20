@@ -134,6 +134,43 @@ Future<DCModule> lowerToDCModule(
       );
     }
 
+    // (ADR-0043) Instance methods on HeapObject subclasses, lowered as
+    // ordinary functions with the receiver as parameter 0. Collected AFTER
+    // the top-level walk so a method may call a top-level function and vice
+    // versa -- both end up in the same `functions` list and `Call` resolves
+    // by name at emission.
+    final methodNames = <Procedure, String>{};
+    for (final cls in targetLibrary.classes) {
+      if (!heapLayouts.extendsHeapObject(cls)) continue;
+      for (final proc in cls.procedures) {
+        if (proc.isStatic || proc.isAbstract || proc.isExternal) continue;
+        if (proc.kind != ProcedureKind.Method) {
+          // Getters/setters/operators on a HeapObject are not lowered yet;
+          // saying so beats emitting nothing and letting the call site fail
+          // with a confusing "has no field" error later.
+          throw DccLowerError(
+            '"${cls.name}.${proc.name.text}" is a ${proc.kind.name}; only '
+            'plain instance methods are lowered on a HeapObject subclass '
+            '(docs/decisions/0043-instance-methods.md)',
+          );
+        }
+        methodNames[proc] = methodLinkName(cls.name, proc.name.text);
+      }
+    }
+    for (final entry in methodNames.entries) {
+      functions.add(
+        _BareFunctionLowerer(
+          entry.key,
+          preludeUri,
+          structLayouts,
+          heapLayouts,
+          externNames,
+          globalNames,
+          entry.key.enclosingClass,
+        ).lower(linkNameOverride: entry.value),
+      );
+    }
+
     if (functions.isEmpty) {
       throw DccLowerError('no @bare top-level function found in $dartSourcePath');
     }
@@ -642,6 +679,9 @@ class _BareFunctionLowerer {
   late final DCType _declaredReturnType;
 
   final Map<VariableDeclaration, DCValue> _values = {};
+
+  /// The receiver value when lowering an instance method (ADR-0043).
+  DCValue? _thisValue;
   final List<DCBasicBlock> _finishedBlocks = [];
   List<DCInstruction> _currentInstructions = [];
   List<DCValue> _currentBlockParams = const [];
@@ -690,14 +730,25 @@ class _BareFunctionLowerer {
   /// else is still rejected.
   final Set<String> globalNames;
 
+  /// The enclosing class when lowering an INSTANCE METHOD (ADR-0043), null
+  /// for a top-level `@bare` function.
+  ///
+  /// A method is lowered as an ordinary function whose FIRST parameter is
+  /// the receiver — the same shape `_buildDestructor` already synthesizes
+  /// for the destructor cascade (ADR-0022), and the same shape C uses. No
+  /// dynamic dispatch is involved: every call site knows the concrete class
+  /// statically, exactly as ADR-0022 observed for destructors.
+  final Class? receiverClass;
+
   _BareFunctionLowerer(
     this.proc,
     this.preludeUri,
     this.structLayouts,
     this.heapLayouts,
     this.externNames,
-    this.globalNames,
-  );
+    this.globalNames, [
+    this.receiverClass,
+  ]);
 
   ValueId _allocId() => ValueId(_nextValueIndex++);
   BlockId _allocBlockId() => BlockId(_nextBlockIndex++);
@@ -738,11 +789,25 @@ class _BareFunctionLowerer {
     _currentInstructions.add(instr);
   }
 
-  DCFunction lower() {
+  DCFunction lower({String? linkNameOverride}) {
     final fn = proc.function;
 
     final paramTypes = <DCType>[];
     final paramValues = <DCValue>[];
+
+    // (ADR-0043) An instance method's receiver is param 0. Kernel does NOT
+    // put `this` in `positionalParameters` -- it is implicit, reached via
+    // `ThisExpression` -- so it is prepended here and bound to `_thisValue`
+    // rather than to a VariableDeclaration.
+    final cls = receiverClass;
+    if (cls != null) {
+      final selfType = DCHeapPointer(DCVoid());
+      final selfValue = DCValue(_allocId(), selfType);
+      _thisValue = selfValue;
+      paramTypes.add(selfType);
+      paramValues.add(selfValue);
+    }
+
     for (final param in fn.positionalParameters) {
       final type = _lowerType(param.type, context: '$context param ${param.name}');
       final value = DCValue(_allocId(), type);
@@ -819,7 +884,7 @@ class _BareFunctionLowerer {
     }
 
     return DCFunction(
-      linkName: context,
+      linkName: linkNameOverride ?? context,
       paramTypes: paramTypes,
       returnType: returnType,
       mode: DCMode.bare,
@@ -1818,11 +1883,54 @@ class _BareFunctionLowerer {
 
     if (expr is InstanceInvocation) {
       final target = expr.interfaceTarget;
+
+      // (ADR-0043) `receiver.method(args)` on a HeapObject subclass -> a
+      // direct Call with the receiver as argument 0. No dispatch: the
+      // concrete class is statically known at every call site, exactly as
+      // ADR-0022 established for destructors.
+      final enclosing = target.enclosingClass;
+      if (!target.isStatic &&
+          target.kind == ProcedureKind.Method &&
+          enclosing != null &&
+          heapLayouts.extendsHeapObject(enclosing)) {
+        final receiver = _lowerExpression(expr.receiver);
+        final args = <DCValue>[receiver];
+        for (final arg in expr.arguments.positional) {
+          args.add(_lowerExpression(arg));
+        }
+        final returnType = _lowerType(
+          target.function.returnType,
+          context: '$context call to ${target.name.text}',
+        );
+        final dest = DCValue(_allocId(), returnType);
+        _addInstr(Call(
+          dest: dest,
+          targetName: methodLinkName(enclosing.name, target.name.text),
+          args: args,
+          // The receiver is BORROWED (ADR-0019's default): the caller keeps
+          // its reference for the duration of the call, so the callee must
+          // not release it. Same convention as any non-@owned heap param.
+          argOwnership: List<bool>.filled(args.length, false),
+        ));
+        return dest;
+      }
+
       if (target.name.text == 'propagate' &&
           target.enclosingClass?.name == 'Result' &&
           target.enclosingLibrary.importUri == preludeUri) {
         return _lowerPropagate(expr);
       }
+    }
+
+    // (ADR-0043) `this` inside an instance method is param 0.
+    if (expr is ThisExpression) {
+      final self = _thisValue;
+      if (self == null) {
+        throw DccLowerError(
+          '"$context": `this` used outside an instance method',
+        );
+      }
+      return self;
     }
 
     // `@rodata` table address (ADR-0040). A `StaticGet` reaches here ONLY
@@ -2643,6 +2751,16 @@ void _checkRelocationTargets(
       }
   }
 }
+
+/// The emitted symbol name for an instance method (ADR-0043).
+///
+/// `Class_method`, not the Dart name alone, because two classes may declare
+/// the same method name and `linkName` goes out verbatim (spec §9) with no
+/// mangling anywhere downstream. Deliberately simple and readable rather
+/// than a mangling scheme — a C caller can name it, and there is no
+/// overloading in DCDart for a scheme to disambiguate.
+String methodLinkName(String className, String methodName) =>
+    '${className}_$methodName';
 
 /// Collects every `@rodata` field in [library] as a [DCGlobal] (ADR-0040).
 ///
