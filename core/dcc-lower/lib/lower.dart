@@ -893,7 +893,10 @@ class _BareFunctionLowerer {
         if (_isPointerValueMember(target)) {
           final pointer = _lowerExpression(expr.receiver);
           final value = _lowerExpression(expr.value);
-          _addInstr(Store(pointer: pointer, value: value));
+          // `Pointer<T>.value = x` is DCDart's MMIO mechanism (spec §6), so
+          // it is volatile: the optimizer may not drop, duplicate or reorder
+          // a hardware register write (ADR-0041).
+          _addInstr(Store(pointer: pointer, value: value, isVolatile: true));
           return;
         }
 
@@ -1797,7 +1800,10 @@ class _BareFunctionLowerer {
         }
         final pointeeType = (pointer.type as DCPointer).pointee;
         final dest = DCValue(_allocId(), pointeeType);
-        _addInstr(Load(dest: dest, pointer: pointer));
+        // `Pointer<T>.value` read -- volatile for the same reason as the
+        // store above. Without this, `-O2` deletes a register read-back
+        // entirely (ADR-0041, GAP-0006).
+        _addInstr(Load(dest: dest, pointer: pointer, isVolatile: true));
         return dest;
       }
 

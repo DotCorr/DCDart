@@ -390,10 +390,14 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
       );
     case Load():
       final type = _llvmType(instruction.dest.type, context: context);
-      e.line('%v${instruction.dest.id.index} = load $type, ptr %v${instruction.pointer.id.index}');
+      // `load volatile` is what stops LLVM deleting an MMIO read whose value
+      // it thinks it already knows (ADR-0041).
+      final vol = instruction.isVolatile ? 'volatile ' : '';
+      e.line('%v${instruction.dest.id.index} = load $vol$type, ptr %v${instruction.pointer.id.index}');
     case Store():
       final type = _llvmType(instruction.value.type, context: context);
-      e.line('store $type %v${instruction.value.id.index}, ptr %v${instruction.pointer.id.index}');
+      final vol = instruction.isVolatile ? 'volatile ' : '';
+      e.line('store $vol$type %v${instruction.value.id.index}, ptr %v${instruction.pointer.id.index}');
     case PortOut():
       // AT&T `outb %al, %dx` -- verified against a real disassembly (not
       // guessed) before wiring this in: value into {al} ($0), port into

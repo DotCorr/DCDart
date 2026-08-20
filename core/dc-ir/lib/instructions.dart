@@ -398,7 +398,28 @@ final class ExtractField extends DCInstruction {
 final class Load extends DCInstruction {
   final DCValue dest;
   final DCValue pointer;
-  const Load({required this.dest, required this.pointer});
+
+  /// Emit as `load volatile`, so the optimizer may not delete, duplicate,
+  /// reorder or hoist it (DCDART_SPEC.md §6, ADR-0041).
+  ///
+  /// Defaults to FALSE, which is the safe default for the sites that
+  /// dominate: heap-object field reads and the destructor cascade are
+  /// ordinary memory, and making those volatile would cost ARC performance
+  /// for no correctness benefit. Only `Pointer<T>.value` — the MMIO
+  /// mechanism — sets it true.
+  ///
+  /// This is not a hypothetical. At `-O2` a non-volatile MMIO read-back is
+  /// eliminated outright: `examples/m1-pointer/mmio.dart`'s store-then-read
+  /// became "return what you wrote", and its conformance harness still
+  /// passed, because the VALUE was right and only the hardware access was
+  /// gone (known-gaps GAP-0006).
+  final bool isVolatile;
+
+  const Load({
+    required this.dest,
+    required this.pointer,
+    this.isVolatile = false,
+  });
 
   @override
   DCValue? get result => dest;
@@ -411,7 +432,16 @@ final class Load extends DCInstruction {
 final class Store extends DCInstruction {
   final DCValue pointer;
   final DCValue value;
-  const Store({required this.pointer, required this.value});
+
+  /// Emit as `store volatile`. See [Load.isVolatile] — same rule, same
+  /// default, same reason.
+  final bool isVolatile;
+
+  const Store({
+    required this.pointer,
+    required this.value,
+    this.isVolatile = false,
+  });
 
   @override
   DCValue? get result => null;

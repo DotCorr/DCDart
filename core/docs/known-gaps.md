@@ -32,9 +32,8 @@ a backend change — `DCInt.signed` is already threaded through.
 ## GAP-0032 — `dcc` never passes an optimization flag, so every DCDart program ships `-O0` code
 
 **Domain:** backend / dcc
-**Status:** OPEN — a PREREQUISITE of M3, not merely related to it. **BLOCKED BY GAP-0006: enabling
-`-O` before volatile exists silently deletes MMIO loads and stores.** Do not benchmark before closing
-this, and do not close this before GAP-0006.
+**Status:** OPEN, and now UNBLOCKED — GAP-0006's volatile blocker was resolved by ADR-0041, verified
+at -O0/-O1/-O2/-O3/-Os. Still a PREREQUISITE of M3: do not benchmark before closing it.
 
 `backend/lib/compile.dart` invokes `clang` with `-ffreestanding -fno-builtin -fno-stack-protector
 -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables -c`. There is no `-O` anywhere, so
@@ -99,6 +98,46 @@ So the acceptance criterion should include `oscortex_core`, which is DCDart's on
 gates, PIT ticks with EOI, a real `#UD` survived. If the captures still match byte-for-byte at `-O2`,
 that is strong evidence. If they do not, `-O0` was hiding something real, which is worth more than a
 clean run. The kernel side has offered to run exactly that.
+
+---
+
+## GAP-0034 — Every `Pointer<T>` access is volatile, including bulk memory walks that do not need it
+
+**Domain:** runtime prelude, dcc-lower (M2/M3)
+**Status:** OPEN — correctness-safe, performance cost
+
+ADR-0041 makes `Pointer<T>.value` volatile because it is DCDart's MMIO mechanism. But it is also the
+only way to read ordinary memory through a pointer, so `examples/demo-stats/` — walking a plain `u32`
+array a C caller owns — now emits volatile loads it does not need. Volatile blocks vectorization, CSE
+and hoisting, so a bulk walk loses the optimizations it would most benefit from.
+
+Correctness is unaffected in both directions: volatile is strictly more conservative.
+
+**Cost of the workaround:** none today, since `dcc` does not optimize at all (GAP-0032). It becomes
+real the moment `-O` lands, and it lands on exactly the array-traversal shape M3's benchmark suite
+measures. The fix is a separate non-volatile accessor — `Pointer<T>.load()`/`.store()` beside
+`.value`, or the inverse spelling with `.volatileValue` for MMIO. Not added speculatively: the right
+split depends on which is the common case in real code, and there is not enough real code yet to say.
+
+---
+
+## GAP-0033 — `volatile` prevents elision and reordering, but there are no memory BARRIERS
+
+**Domain:** dc-ir, backend (M2, downstream: `oscortex_core`)
+**Status:** OPEN
+
+ADR-0041 emits LLVM `volatile`, which stops the optimizer deleting, duplicating or reordering an
+access relative to other volatile accesses. That is what MMIO correctness needs on a single core.
+
+It is NOT a memory-ordering model. `volatile` is not atomic, not a fence, and says nothing about
+multi-core visibility or about ordering relative to non-volatile accesses. `DCDART_SPEC.md` §6 asks
+for "explicit ordering", which means real barriers — `mfence`/`dmb`, acquire/release, or LLVM's
+`fence` instruction. None exist.
+
+**Cost of the workaround:** invisible today, because `oscortex_core` is single-core with interrupts as
+the only concurrency, and interrupt entry/exit is a serializing event. It becomes real at the first SMP
+bring-up or the first lock-free structure shared with a device, and at that point it is the kind of bug
+that reproduces once a week and never under a debugger.
 
 ---
 
@@ -858,8 +897,9 @@ the full decision record.
 ## GAP-0006 — `Pointer<T>` load/store carry no `@volatile` guarantee
 
 **Domain:** dc-ir, backend (M1)
-**Status:** OPEN — **and it is now a HARD BLOCKER for GAP-0032 (`-O`). Enabling optimization before
-this is fixed silently deletes MMIO accesses.**
+**Status:** RESOLVED (2026-08-20) for elision/reordering — `Pointer<T>` load/store are now volatile
+(ADR-0041, `tests/conformance/volatile/`). Memory ORDERING (barriers, spec §6's "explicit ordering")
+remains unimplemented and is tracked separately as GAP-0033.
 
 **2026-08-20 — measured, and it is worse than "unimplemented".** `examples/m1-pointer/mmio.dart` is the
 M1 exit criterion: write a memory-mapped register, read it back. Its emitted IR, compiled for
