@@ -29,6 +29,92 @@ a backend change — `DCInt.signed` is already threaded through.
 
 ---
 
+## GAP-0031 — `@rodata` emits homogeneous ARRAYS only; a type descriptor is a STRUCT and cannot be expressed
+
+**Domain:** dc-ir, backend, dcc-lower (M2)
+**Status:** OPEN — rejected loudly, not silently
+
+ADR-0040 emits `[N x iW]` arrays and, via `Ref('name')`, `[N x ptr]` relocation arrays. An LLVM array
+is **homogeneous**, so a mixed aggregate is not expressible. The shape a real type descriptor wants is
+exactly a mixed one:
+
+```
+{ ptr name, i64 fieldCount, ptr fields }
+```
+
+That is a struct constant, and `DCConstant` has no struct node. Found by the emitter's own homogeneity
+check rejecting a test that modelled a descriptor as an array — the check was right and the test was
+wrong, which is the good direction for that to happen in.
+
+So the current state is: a table of scalars works, a table of pointers works, and a **record** mixing
+the two does not. Reflection descriptors need the third. This is the remaining gap between "static
+data exists" and "descriptors can be built", and it is smaller than it looks — a `DCConstStruct`
+node plus the `{...}` emission, with the same name-based relocation leaf already in place.
+
+Note the interaction with GAP-0022: the C header emitter already orders structs by first appearance,
+which is not guaranteed to be valid C definition order once structs can nest.
+
+**Cost of the workaround:** parallel arrays (one array per field, indexed in lockstep) express the same
+information and are what `examples/m2-rodata/` uses. They cost an index-correctness invariant the
+compiler does not check, which is precisely what a struct would enforce.
+
+---
+
+## GAP-0030 — A `Store` into read-only static data is not prevented, and on the freestanding target it corrupts silently
+
+**Domain:** dc-ir, backend (M2)
+**Status:** OPEN
+
+`DCPointer` carries no const-ness, `Store` accepts any `DCPointer`, and DC-IR has no verifier pass at
+all. So nothing stops code from deriving a pointer via `Rodata.addressOf` (ADR-0040) and storing
+through it.
+
+**This is not a fault today, it is silent corruption.** `oscortex_core` maps a single RWE `PT_LOAD`
+with 2 MiB pages and no per-section permissions, so a write into `.rodata` succeeds and nothing
+anywhere notices. Confirmed from the kernel's own program headers, not assumed. On a system whose
+premise is self-knowledge, and whose type descriptors will live in `.rodata`, the failure mode is a
+corrupted descriptor — a program confidently reporting a false answer about itself — rather than a
+crash. That is categorically worse than a fault and justifies more urgency than "unimplemented
+checking" normally would.
+
+**Cost of the workaround:** none available at the language level; the discipline is entirely on the
+programmer. Two independent fixes, both real, neither in this unit: W^X page permissions on the kernel
+side (theirs, and it must NOT be attempted as a link-script-only change — separate segments without
+page-table enforcement look like protection while providing none), and const-ness on `DCPointer` plus
+a DC-IR verifier on this side. The second is the general fix and is the first real argument for a
+verifier pass, which DC-IR has never had.
+
+---
+
+## GAP-0051 — `Pointer<T>.elementAt(n)` does not exist, so every indexed read restates the element width by hand
+
+**Domain:** runtime prelude, dcc-lower (M1/M2)
+**Status:** OPEN — specified in `DCDART_SPEC.md` §6's required primitives, never built
+
+Reading an element of a static table or any pointer-addressed array is written:
+
+```dart
+Pointer<u64>.fromAddress(Rodata.addressOf(memmap) + i * u64(8))
+```
+
+That `u64(8)` is the element width, already declared one line up in `List<u64>`, restated as a literal
+at every call site with nothing checking the two agree. Change the declaration to `List<u32>` and
+every call site silently computes wrong addresses — plausible garbage, not an error.
+
+This is precisely the class of bug `c_header.dart` (ADR-0034) exists to eliminate for extern
+prototypes: a hand-written restatement of something the compiler already knows, free to drift from its
+source of truth, with no diagnostic.
+
+`Pointer<T>.elementAt(n)` derives the stride from `T` in one place and fixes **every** pointer user,
+not only `@rodata` ones — `oscortex_core`'s `multiboot.dart` and `interrupts.dart` both hand-compute
+strides today for the same reason. Raised by the kernel side, who own the motivating code.
+
+**Cost of the workaround:** the stride literal works and is what ADR-0040's examples use. It is a
+stopgap, named as one here and in the ADR so whoever first changes an element type has a chance of
+finding this.
+
+---
+
 ## GAP-0029 — The extern manifest is trusted input; reserved runtime families are now unhonorable, but everything else is taken on faith
 
 **Domain:** testing / build integrity (spine, `CLAUDE.md` rule 1)

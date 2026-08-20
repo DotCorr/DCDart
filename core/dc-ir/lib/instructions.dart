@@ -208,6 +208,27 @@ final class IConvert extends DCInstruction {
   DCValue? get result => dest;
 }
 
+/// The address of a module-level global (ADR-0040), as an integer.
+///
+/// Names a SYMBOL, not a value. That is deliberate and follows the
+/// precedent `Call.targetName` and `Alloc.destructorName` already set: DC-IR
+/// has no cross-function value namespace (see ssa.dart), so a global cannot
+/// be a `DCValue` that instructions in different functions both reference.
+/// The name is resolved at emission.
+///
+/// `dest` is an integer, not a `DCPointer`, because the source-level surface
+/// is `Rodata.addressOf(t) -> u64`, which composes with the existing
+/// `Pointer<T>.fromAddress`. That keeps one way to make a pointer instead of
+/// two.
+final class AddressOfGlobal extends DCInstruction {
+  final DCValue dest;
+  final String globalName;
+  const AddressOfGlobal({required this.dest, required this.globalName});
+
+  @override
+  DCValue? get result => dest;
+}
+
 /// Bitwise AND. `lhs`, `rhs`, `dest` must share the same `DCInt` type (no
 /// implicit widening, same rule as arithmetic, spec §4.1). No `Overflow`
 /// field -- bitwise ops don't have DCDart's arithmetic overflow-trap

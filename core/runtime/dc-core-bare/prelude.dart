@@ -92,7 +92,7 @@ const extern = _Extern();
 /// dcc-lower emits its own `IAdd(overflow: Overflow.trapping)` for any
 /// recognized `u64|+` call, and core/backend really does emit trapping codegen
 /// for it now (ADR-0009). This body's plain `+` is only here to type-check.
-extension type u64(int _value) {
+extension type const u64(int _value) {
   u64 operator +(u64 other) => u64(_value + other._value);
 
   /// Added for M1's `Result<T,E>`/`?` exit criterion (ADR-0010 [sic --
@@ -181,7 +181,7 @@ extension type u64(int _value) {
 /// u32 (DCDART_SPEC.md §4.1). Added for M1's `Pointer<u32>` exit criterion
 /// (ADR-0010). `&`/`|`/`^`/`<<`/`>>` added alongside u64's (same reasons,
 /// see u64's own doc comment) -- IDT/GDT entry fields are commonly u32.
-extension type u32(int _value) {
+extension type const u32(int _value) {
   u32 operator &(u32 other) => u32(_value & other._value);
   u32 operator |(u32 other) => u32(_value | other._value);
   u32 operator ^(u32 other) => u32(_value ^ other._value);
@@ -242,7 +242,7 @@ extension type u32(int _value) {
 /// u8 (DCDART_SPEC.md §4.1). Added for M1's `@packed` struct exit criterion
 /// (ADR-0011). `&`/`|`/`^`/`<<`/`>>` added alongside u64's (same reasons)
 /// -- UART/PIC register values are u8.
-extension type u8(int _value) {
+extension type const u8(int _value) {
   u8 operator &(u8 other) => u8(_value & other._value);
   u8 operator |(u8 other) => u8(_value | other._value);
   u8 operator ^(u8 other) => u8(_value ^ other._value);
@@ -307,7 +307,7 @@ extension type u8(int _value) {
 /// real hardware operand). `&`/`|`/`^`/`<<`/`>>` added alongside u64's
 /// (same reasons) -- some IDT/GDT fields are u16 (segment selectors,
 /// GDTR/IDTR limits).
-extension type u16(int _value) {
+extension type const u16(int _value) {
   u16 operator &(u16 other) => u16(_value & other._value);
   u16 operator |(u16 other) => u16(_value | other._value);
   u16 operator ^(u16 other) => u16(_value ^ other._value);
@@ -363,6 +363,91 @@ extension type u16(int _value) {
   u16 toU16() => u16(_value);
   u32 toU32() => u32(_value);
   u64 toU64() => u64(_value);
+}
+
+/// Marks a top-level `final` field for emission into read-only static data
+/// (`.rodata`), DCDART_SPEC.md §6. See docs/decisions/0040-static-rodata.md.
+///
+/// The declaration MUST be `final` with an explicitly `const` initializer:
+///
+/// ```dart
+/// @rodata final List<u64> memmap = const [u64(4096), u64(8192)];
+/// ```
+///
+/// That exact combination is load-bearing and neither half is stylistic:
+///
+///   * the `const` INITIALIZER makes the contents known at compile time, so
+///     they can be emitted into the object file with no initializer
+///     machinery, no init order, and nothing to run at startup -- `@bare` has
+///     none of those things.
+///   * `final` rather than `const` on the FIELD keeps the declaration's
+///     identity. Dart canonicalizes constants component-wide, so two `const`
+///     declarations with identical contents are literally the same object
+///     before the compiler sees them; two `final`s are not. It is also what
+///     keeps the name alive at use sites -- a reference to a `const` is
+///     inlined by the frontend, leaving no name to take the address of.
+///
+/// The cost of that choice, recorded here because it is not obvious: a
+/// `const` initializer cannot reference a `final` field, so a `@rodata`
+/// table can NEVER hold the address of another `@rodata` table. Internal
+/// relocations need the all-`const` form, which trades identity away. See
+/// the ADR -- this is the single most important thing to know before
+/// extending this feature.
+class _Rodata {
+  const _Rodata();
+}
+
+/// A RELOCATION inside a `@rodata` initializer: one pointer-sized word
+/// holding the ADDRESS of another `@rodata` table (ADR-0040).
+///
+/// Holds the target's NAME as a string, and that indirection is the whole
+/// trick. A `const` initializer cannot reference a `final` field —
+/// `const [Ref(pointFields)]` is "Not a constant expression" — but it can
+/// contain a const STRING that names one. So `@rodata final` keeps the
+/// declaration identity that `const` would canonicalize away, AND can still
+/// express a table pointing at another table. The two are not the trade-off
+/// they first appear to be.
+///
+/// The name is resolved against this compilation unit's own `@rodata`
+/// declarations at lowering time; an unknown name is a compile error, not a
+/// dangling symbol.
+///
+/// ```dart
+/// @rodata final List<u64> pointFields = const [u64(0), u64(8)];
+/// @rodata final List<Ref> pointDesc   = const [Ref('pointFields')];
+/// ```
+class Ref {
+  final String symbol;
+  const Ref(this.symbol);
+}
+
+/// See [_Rodata].
+const rodata = _Rodata();
+
+/// Addressing static read-only data (ADR-0040).
+///
+/// Static methods, not an extension type, for the same reason as [Port]:
+/// there is no natural receiver. Bodies are never executed -- `dcc-lower`
+/// substitutes real codegen, same discipline as `Pointer.fromAddress`.
+class Rodata {
+  /// The address of a `@rodata` table's FIRST ELEMENT.
+  ///
+  /// There is no header of any kind in front of it: a `@rodata List<u64>`
+  /// emits a bare `[N x i64]`, so this address points straight at element 0.
+  /// No length word, no class pointer, nothing to skip.
+  ///
+  /// Compose with `Pointer<T>.fromAddress` to read:
+  ///
+  /// ```dart
+  /// final p = Pointer<u64>.fromAddress(Rodata.addressOf(memmap) + i * u64(8));
+  /// ```
+  ///
+  /// The `u64(8)` there is a STOPGAP: it restates the element width that
+  /// `List<u64>` already declared, with nothing checking the two agree.
+  /// `Pointer<T>.elementAt(n)` (DCDART_SPEC.md §6, known-gaps GAP-0051) is
+  /// the real fix and derives the stride from `T` in one place.
+  static u64 addressOf(Object table) =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
 }
 
 /// x86 port I/O (DCDART_SPEC.md §6, oscortex_core's M0 escalation --

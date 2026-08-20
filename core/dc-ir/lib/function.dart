@@ -137,6 +137,86 @@ final class DCExternFunction {
   });
 }
 
+/// The initializer of a [DCGlobal], as a TREE rather than a byte blob.
+///
+/// This shape is deliberate and is the one part of ADR-0040 built for a
+/// capability nothing can reach yet. A flat `List<int>` of bytes would be
+/// simpler and would serve every case the language can express today — and
+/// it would have to be thrown away the moment a global needs to hold the
+/// ADDRESS of another global, because an address is not a value the compiler
+/// knows: it is a hole the linker fills. Modelling initializers as a tree
+/// with a relocation leaf ([DCConstAddrOf]) from the start makes that an
+/// extension rather than a redesign.
+sealed class DCConstant {
+  const DCConstant();
+}
+
+/// A scalar integer, emitted at the width of its [type].
+final class DCConstInt extends DCConstant {
+  final DCInt type;
+  final int value;
+  const DCConstInt(this.type, this.value);
+}
+
+/// A fixed-length array of same-typed elements, emitted as `[N x T]`.
+///
+/// No length word and no header of any kind: the emitted aggregate is
+/// exactly the elements, so the global's address IS element 0's address.
+/// Consumers read these through a raw `Pointer<T>`, where a prefix would
+/// silently shift every index rather than fail — which is why
+/// `tests/conformance/rodata/` asserts the emitted bytes instead of trusting
+/// this comment.
+final class DCConstArray extends DCConstant {
+  final DCType elementType;
+  final List<DCConstant> elements;
+  const DCConstArray(this.elementType, this.elements);
+}
+
+/// The ADDRESS of another global, plus a byte offset — a relocation.
+///
+/// UNREACHABLE FROM SOURCE TODAY, and present on purpose. `@rodata` requires
+/// a `final` field with a `const` initializer, and a `const` initializer
+/// cannot reference a `final` field, so no `@rodata` table can name another
+/// one. Reaching this leaf needs an all-`const` surface, which trades away
+/// the declaration identity `final` buys. ADR-0040 calls that fork its
+/// central finding; this node exists so resolving it later is a lowering
+/// change rather than an IR redesign.
+///
+/// Because nothing reaches it, nothing exercises it — so `dc-ir`'s own test
+/// suite builds this shape directly and asserts what it emits. An
+/// unreachable node with no test rots silently and is discovered broken by
+/// whoever first needs it.
+final class DCConstAddrOf extends DCConstant {
+  final String globalName;
+  final int offsetBytes;
+  const DCConstAddrOf(this.globalName, {this.offsetBytes = 0});
+}
+
+/// One module-level constant, emitted into read-only data.
+///
+/// There is deliberately NO `isMutable` field. A mutable module-level static
+/// is a global variable, which is a memory-model question — `CLAUDE.md`
+/// rule 4, frozen after M3, escalate rather than decide. A field existing
+/// only to be rejected would pre-commit the shape of an escalation nobody
+/// has held, so it is absent rather than present-and-refused.
+final class DCGlobal {
+  /// The emitted symbol name, verbatim (spec §9).
+  final String linkName;
+  final DCConstant initializer;
+
+  /// Emitted as an explicit `align N`. Explicit rather than left to LLVM:
+  /// nothing else in DCDart emits alignment for anything, so a consumer
+  /// reading this through a raw pointer has no other way to know what it
+  /// got.
+  final int alignBytes;
+
+  const DCGlobal({
+    required this.linkName,
+    required this.initializer,
+    required this.alignBytes,
+  });
+}
+
 /// A compilation unit — what `dcc-lower` hands to `backend/` as one job,
 /// and roughly what becomes one object file. M0 only ever has one function
 /// in one module (`add`); `DCModule` exists as a thin wrapper now so that
@@ -157,9 +237,19 @@ final class DCModule {
   /// is still a hard failure.
   final List<DCExternFunction> externFunctions;
 
+  /// Module-level read-only constants (ADR-0040). Defaults to empty, so
+  /// every module built before static data existed constructs unchanged.
+  ///
+  /// A separate list from `functions`, for the same reason `externFunctions`
+  /// is one: every pass that walks `module.functions` — `dc-elide`,
+  /// `dc-objdump --arc`, destructor synthesis — keeps seeing exactly the set
+  /// of things that have bodies, and needs no change to stay correct.
+  final List<DCGlobal> globals;
+
   const DCModule({
     required this.name,
     required this.functions,
     this.externFunctions = const [],
+    this.globals = const [],
   });
 }

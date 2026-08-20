@@ -10,3 +10,9 @@ environment:
 dependencies:
   dc_ir:
     path: ../dc-ir
+
+# Added for tests/ (ADR-0040). Same reasoning as dc-elide's pubspec: this
+# package depends only on dc_ir, NOT on the vendored `kernel` package, so
+# package:test resolves cleanly here where it cannot in dcc_lower.
+dev_dependencies:
+  test: ^1.24.0

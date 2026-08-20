@@ -98,6 +98,24 @@ Future<DCModule> lowerToDCModule(
     );
     final externNames = {for (final e in externFunctions) e.linkName};
 
+    // Read-only statics (ADR-0040). Collected BEFORE function bodies are
+    // lowered, because a body referencing one needs the symbol name to
+    // already be known -- same ordering reason ADR-0038 collects externs
+    // first.
+    final globals = _collectRodataGlobals(targetLibrary, preludeUri: preludeUri);
+    final globalNames = {for (final g in globals) g.linkName};
+
+    // A `Ref('name')` relocation is resolved against this unit's own
+    // `@rodata` declarations. Checked HERE, after every global is collected,
+    // so a table may reference one declared later in the file (and two
+    // tables may reference each other -- symbol-name references need no
+    // topological order). An unresolved name would otherwise reach `clang`
+    // as `use of undefined value '@name'`, which names neither DCDart nor
+    // the declaration that was meant.
+    for (final global in globals) {
+      _checkRelocationTargets(global.initializer, global.linkName, globalNames);
+    }
+
     final functions = <DCFunction>[];
     for (final proc in targetLibrary.procedures) {
       if (!_hasMarkerAnnotation(proc.annotations, '_Bare', preludeUri)) continue;
@@ -112,7 +130,7 @@ Future<DCModule> lowerToDCModule(
         );
       }
       functions.add(
-        _BareFunctionLowerer(proc, preludeUri, structLayouts, heapLayouts, externNames).lower(),
+        _BareFunctionLowerer(proc, preludeUri, structLayouts, heapLayouts, externNames, globalNames).lower(),
       );
     }
 
@@ -131,6 +149,16 @@ Future<DCModule> lowerToDCModule(
           '"$name" is declared `@extern` but this compilation unit also '
           'defines a `@bare` function with that name — one symbol cannot be '
           'both imported and exported by the same object file',
+        );
+      }
+    }
+
+    for (final name in globalNames) {
+      if (definedNames.contains(name) || externNames.contains(name)) {
+        throw DccLowerError(
+          '"$name" is a `@rodata` global but is also a function name in this '
+          'compilation unit — symbol names are emitted verbatim (spec §9), so '
+          'the two would collide in the object file',
         );
       }
     }
@@ -156,6 +184,7 @@ Future<DCModule> lowerToDCModule(
       name: dartSourcePath,
       functions: elidedFunctions,
       externFunctions: externFunctions,
+      globals: globals,
     );
   } finally {
     compileResult.dispose();
@@ -656,12 +685,18 @@ class _BareFunctionLowerer {
   /// nobody accounted for — the exact failure the manifest exists to prevent.
   final Set<String> externNames;
 
+  /// Symbol names of this module's `@rodata` globals (ADR-0040). A
+  /// `StaticGet` of one lowers to its address; a `StaticGet` of anything
+  /// else is still rejected.
+  final Set<String> globalNames;
+
   _BareFunctionLowerer(
     this.proc,
     this.preludeUri,
     this.structLayouts,
     this.heapLayouts,
     this.externNames,
+    this.globalNames,
   );
 
   ValueId _allocId() => ValueId(_nextValueIndex++);
@@ -1537,6 +1572,41 @@ class _BareFunctionLowerer {
         }
       }
 
+      // `Rodata.addressOf(table)` (ADR-0040) -- a plain static method call,
+      // recognized the same way `Port.inb` is: static + enclosing class name
+      // + prelude URI. Its argument must be a StaticGet naming a @rodata
+      // field; anything else cannot have an address.
+      if (target.isStatic &&
+          target.name.text == 'addressOf' &&
+          target.enclosingClass?.name == 'Rodata' &&
+          target.enclosingLibrary.importUri == preludeUri) {
+        final args = expr.arguments.positional;
+        if (args.length != 1) {
+          throw DccLowerError(
+            '"$context": Rodata.addressOf takes exactly one argument',
+          );
+        }
+        final arg = args.single;
+        if (arg is! StaticGet || arg.target is! Field) {
+          throw DccLowerError(
+            '"$context": Rodata.addressOf needs the NAME of a `@rodata` '
+            'table, got ${arg.runtimeType}. It cannot take an expression — '
+            'the address has to be resolvable to a symbol at compile time.',
+          );
+        }
+        final name = arg.target.name.text;
+        if (!globalNames.contains(name)) {
+          throw DccLowerError(
+            '"$context": "$name" is not a `@rodata` table in this '
+            'compilation unit, so it has no static address. Declare it '
+            '`@rodata final List<uN> $name = const [...]`.',
+          );
+        }
+        final dest = DCValue(_allocId(), DCInt.u64);
+        _addInstr(AddressOfGlobal(dest: dest, globalName: name));
+        return dest;
+      }
+
       if (target.isFactory &&
           target.enclosingClass?.name == 'Result' &&
           target.enclosingLibrary.importUri == preludeUri) {
@@ -1747,6 +1817,27 @@ class _BareFunctionLowerer {
           target.enclosingLibrary.importUri == preludeUri) {
         return _lowerPropagate(expr);
       }
+    }
+
+    // `@rodata` table address (ADR-0040). A `StaticGet` reaches here ONLY
+    // for a non-const field -- a `const` field's references are inlined by
+    // the frontend and never appear as a StaticGet at all, which is exactly
+    // why `@rodata` requires `final`.
+    if (expr is StaticGet) {
+      final target = expr.target;
+      final name = target.name.text;
+      if (target is Field && globalNames.contains(name)) {
+        throw DccLowerError(
+          '"$context": a `@rodata` table cannot be read directly as a value '
+          '-- it is static data, not a Dart list. Take its address with '
+          '`Rodata.addressOf($name)` and read through a `Pointer<T>`.',
+        );
+      }
+      throw DccLowerError(
+        '"$context": unsupported static read of "$name". Only `@rodata` '
+        'globals have a static-data representation (ADR-0040); ordinary '
+        'top-level variables are not implemented.',
+      );
     }
 
     // `a == b` and `a != b` on sized ints (ADR-0035).
@@ -2410,6 +2501,199 @@ void _rejectBareFunctionsInImportedLibraries(
     'the others in with `part`/`part of` so they share one library.',
   );
 }
+
+/// Walks a constant tree and rejects any [DCConstAddrOf] naming something
+/// that is not a `@rodata` global in this compilation unit.
+void _checkRelocationTargets(
+  DCConstant constant,
+  String owner,
+  Set<String> knownGlobals,
+) {
+  switch (constant) {
+    case DCConstInt():
+      return;
+    case DCConstArray(elements: final elements):
+      for (final element in elements) {
+        _checkRelocationTargets(element, owner, knownGlobals);
+      }
+    case DCConstAddrOf(globalName: final target):
+      if (!knownGlobals.contains(target)) {
+        throw DccLowerError(
+          '"$owner" contains Ref(\'$target\'), but "$target" is not a '
+          '`@rodata` table in this compilation unit. Cross-object references '
+          'would need address-of-extern, which does not exist '
+          '(docs/known-gaps.md GAP-0019).',
+        );
+      }
+  }
+}
+
+/// Collects every `@rodata` field in [library] as a [DCGlobal] (ADR-0040).
+///
+/// REQUIRES `final` with an explicitly `const` initializer, and rejects
+/// everything else by name. The near-miss spellings are the reason:
+///
+///   `@rodata const List<u64> t = [...]`  -- a `const` FIELD. Its references
+///       are inlined by the frontend, so no use site can ever name it, and
+///       two identical declarations are canonicalized to one object. It
+///       would emit a global nothing could address.
+///   `@rodata final List<u64> t = [...]`  -- no `const` on the initializer.
+///       Degrades to `StaticInvocation(_GrowableList._literal3(...))`, a
+///       dart:core factory that is unbound under `--no-link-platform` and
+///       carries no Constant at all. Looks almost identical to the correct
+///       spelling.
+///
+/// Both are rejected loudly rather than half-handled, per GAP-0028's rule
+/// that a silent drop is worse than a compile error.
+List<DCGlobal> _collectRodataGlobals(
+  Library library, {
+  required Uri preludeUri,
+}) {
+  final globals = <DCGlobal>[];
+  for (final field in library.fields) {
+    if (!_hasMarkerAnnotation(field.annotations, '_Rodata', preludeUri)) {
+      continue;
+    }
+    final name = field.name.text;
+
+    if (field.isConst) {
+      throw DccLowerError(
+        '"$name" is `@rodata const`. Use `final` with a `const` initializer '
+        'instead: `@rodata final List<u64> $name = const [...]`. A `const` '
+        'field is inlined at every use site, so nothing could take its '
+        'address, and identical constants are canonicalized into one object '
+        '(docs/decisions/0040-static-rodata.md).',
+      );
+    }
+    if (!field.isFinal) {
+      throw DccLowerError(
+        '"$name" is `@rodata` but not `final`. Static data has no '
+        'initializer machinery to run, so it must be `final` with a `const` '
+        'initializer.',
+      );
+    }
+
+    final initializer = field.initializer;
+    if (initializer is! ConstantExpression) {
+      throw DccLowerError(
+        '"$name" is `@rodata final` but its initializer is not a compile-time '
+        'constant (got ${initializer.runtimeType}). Write the initializer as '
+        '`const [...]` — without the `const` keyword a list literal becomes a '
+        'runtime-allocated list, which cannot be emitted as static data.',
+      );
+    }
+
+    final elementType = _rodataElementType(field.type, name);
+    final constant = initializer.constant;
+    if (constant is! ListConstant) {
+      throw DccLowerError(
+        '"$name" is `@rodata` but its constant is a '
+        '${constant.runtimeType}, not a list. Only `List<uN>` tables are '
+        'supported today (ADR-0040).',
+      );
+    }
+
+    final isRelocationTable = elementType == null;
+    final elements = <DCConstant>[];
+    for (final entry in constant.entries) {
+      if (isRelocationTable) {
+        // `Ref('other')` — a pointer-sized word holding another global's
+        // address. The name is carried as a const String precisely because a
+        // const initializer cannot reference a `final` field directly.
+        if (entry is! InstanceConstant ||
+            entry.classReference.canonicalName?.name != 'Ref') {
+          throw DccLowerError(
+            '"$name" is a `List<Ref>` but contains a ${entry.runtimeType}. '
+            'Every element must be `Ref(\'someTableName\')`.',
+          );
+        }
+        final values = entry.fieldValues.values.toList();
+        final symbol = values.length == 1 ? values.single : null;
+        if (symbol is! StringConstant) {
+          throw DccLowerError(
+            '"$name": Ref must hold a single constant string naming another '
+            '`@rodata` table',
+          );
+        }
+        elements.add(DCConstAddrOf(symbol.value));
+        continue;
+      }
+      if (entry is! IntConstant) {
+        throw DccLowerError(
+          '"$name" contains a ${entry.runtimeType} element, but its declared '
+          'type says the elements are integers. Use `List<Ref>` for a table '
+          'of addresses.',
+        );
+      }
+      elements.add(DCConstInt(elementType, entry.value));
+    }
+
+    globals.add(
+      DCGlobal(
+        linkName: name,
+        // A relocation table's elements are pointer-sized. `usize` rather
+        // than `u64` so the width follows the target if a 32-bit one is ever
+        // added, instead of being wrong silently.
+        initializer: DCConstArray(elementType ?? DCInt.usize, elements),
+        alignBytes: elementType == null ? 8 : _byteWidthOfInt(elementType),
+      ),
+    );
+  }
+  return globals;
+}
+
+/// The element type of a `@rodata` table, from its DECLARED type.
+///
+/// The declared type is the ONLY place the width survives: the constant
+/// erases every sized-int extension type back to a bare `IntConstant`, so
+/// `List<int>` and `List<u64>` produce byte-identical constants. A bare
+/// `List<int>` is therefore rejected — not for strictness, but because it
+/// does not carry the information codegen needs, and guessing 64-bit would
+/// silently read at the wrong stride if it were meant to be narrower.
+DCInt? _rodataElementType(DartType declared, String name) {
+  // `classReference.canonicalName`, NOT `classNode`. `List` is a dart:core
+  // class and dcc-lower compiles with --no-link-platform, so `classNode`
+  // throws "Reference to dart:core::List is not bound to an AST node" —
+  // the same unbound-platform-node trap ADR-0014 hit with `bool`. The
+  // canonical name is readable without binding anything.
+  if (declared is InterfaceType &&
+      declared.classReference.canonicalName?.name == 'List' &&
+      declared.typeArguments.length == 1) {
+    final arg = declared.typeArguments.single;
+    // `List<Ref>` — a table of relocations, one pointer-sized word each.
+    if (arg is InterfaceType &&
+        arg.classReference.canonicalName?.name == 'Ref') {
+      return null; // signals "relocation table"; caller uses pointer width
+    }
+    if (arg is ExtensionType) {
+      switch (arg.extensionTypeDeclaration.name) {
+        case 'u8':
+          return DCInt.u8;
+        case 'u16':
+          return DCInt.u16;
+        case 'u32':
+          return DCInt.u32;
+        case 'u64':
+          return DCInt.u64;
+      }
+    }
+  }
+  throw DccLowerError(
+    '"$name" must be declared `List<u8>`, `List<u16>`, `List<u32>`, '
+    '`List<u64>` or `List<Ref>` (got $declared). A bare `List<int>` is '
+    'rejected because the element width survives ONLY in the declared type — '
+    'the constant erases it — so `List<int>` would leave the emitted stride '
+    'ambiguous.',
+  );
+}
+
+int _byteWidthOfInt(DCInt type) => switch (type.width) {
+      IntWidth.w8 => 1,
+      IntWidth.w16 => 2,
+      IntWidth.w32 => 4,
+      IntWidth.w64 => 8,
+      IntWidth.wSize => 8,
+    };
 
 class DccLowerError extends Error {
   final String message;

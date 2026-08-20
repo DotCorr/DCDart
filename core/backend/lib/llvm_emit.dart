@@ -90,6 +90,16 @@ String emitModule(
     buffer.writeln('target triple = "$targetTriple"');
     buffer.writeln();
   }
+  // Read-only statics (ADR-0040) before the arena, so a reader sees the
+  // module's own data before its runtime scaffolding. Order is not forced by
+  // LLVM -- globals and declares may interleave -- this just matches the
+  // existing convention.
+  if (module.globals.isNotEmpty) {
+    for (final global in module.globals) {
+      buffer.write(_emitGlobal(global, context: module.name));
+    }
+    buffer.writeln();
+  }
   if (needsArena) {
     buffer.write(_emitArenaGlobals());
   }
@@ -327,6 +337,13 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
       _emitDivRem('rem', instruction.dest, instruction.lhs, instruction.rhs, e, context);
     case IConvert():
       _emitConvert(instruction, e, context);
+    case AddressOfGlobal():
+      // `ptrtoint` because the surface hands back a u64 that composes with
+      // Pointer.fromAddress, rather than a pointer value (ADR-0040).
+      final destType = _llvmType(instruction.dest.type, context: context);
+      e.line(
+        '%v${instruction.dest.id.index} = ptrtoint ptr @${instruction.globalName} to $destType',
+      );
     case IAnd():
       _emitBitwise('and', instruction.dest, instruction.lhs, instruction.rhs, e, context);
     case IOr():
@@ -694,6 +711,102 @@ void declareOverflowIntrinsic(Set<String> declared, String name, String type) {
 
 void declareTrapIntrinsic(Set<String> declared) {
   declared.add('declare void @llvm.trap()');
+}
+
+/// Names the backend emits for its own use. A DCDart global taking one of
+/// these would produce a duplicate-symbol error at best and silently shadow
+/// ARC arena state at worst — `linkName` goes out verbatim (spec §9) with no
+/// mangling, so nothing else would catch it.
+const _reservedGlobalNames = {'dc_arena', 'dc_free_list', 'dc_free_top'};
+
+/// One `@rodata` global: `@name = internal constant <init>, align N`.
+///
+/// `internal`, not `private`: private globals emit no symbol at all, which
+/// would make the data invisible to `nm` and un-referenceable from C.
+/// Internal keeps a real (local) symbol while still not exporting it.
+///
+/// Deliberately NOT `unnamed_addr`. That moves a global into a mergeable
+/// section (verified: `.section .rodata.cst8,"aM",@progbits,8`), which lets
+/// the linker collapse two byte-identical globals to ONE ADDRESS. Harmless
+/// for name strings; catastrophic for anything whose address means something,
+/// which is exactly what a type descriptor's address will mean.
+String _emitGlobal(DCGlobal global, {required String context}) {
+  if (_reservedGlobalNames.contains(global.linkName)) {
+    throw BackendError(
+      '"$context": global "${global.linkName}" collides with a name the '
+      'backend emits for its own ARC arena. Rename it — symbol names are '
+      'emitted verbatim (spec §9), so nothing downstream would catch this.',
+    );
+  }
+  final init = _emitConstant(global.initializer, context: context);
+  final buffer = StringBuffer();
+  buffer.writeln(
+    '@${global.linkName} = internal constant $init, align ${global.alignBytes}',
+  );
+  return buffer.toString();
+}
+
+/// A [DCConstant] tree as LLVM constant-expression text.
+String _emitConstant(DCConstant constant, {required String context}) {
+  switch (constant) {
+    case DCConstInt(type: final type, value: final value):
+      return '${_llvmType(type, context: context)} $value';
+    case DCConstArray(elementType: final elementType, elements: final elements):
+      // The array's element type comes from the ELEMENTS, not from
+      // `elementType`, because a relocation is a `ptr` regardless of the
+      // pointer-sized integer type the IR labelled the table with. Getting
+      // this from the declared type instead produces
+      // "constant expression type mismatch: got '[2 x ptr]' but expected
+      // '[2 x i64]'" -- which is at least loud, but only because LLVM
+      // type-checks constants.
+      final elemType = elements.isEmpty
+          ? _llvmType(elementType, context: context)
+          : _constantTypeText(elements.first, elementType, context: context);
+      for (final element in elements) {
+        final t = _constantTypeText(element, elementType, context: context);
+        if (t != elemType) {
+          throw BackendError(
+            '"$context": a constant array mixes element types ($elemType and '
+            '$t). An LLVM array is homogeneous; a mixed aggregate needs a '
+            'struct, which no source construct produces today.',
+          );
+        }
+      }
+      final body = elements
+          .map((e) => _emitConstant(e, context: context))
+          .join(', ');
+      // `[N x T] [T a, T b, ...]` -- each element repeats its own type, which
+      // is LLVM's required form for an array constant, not redundancy.
+      return '[${elements.length} x $elemType] [$body]';
+    case DCConstAddrOf(globalName: final name, offsetBytes: final offset):
+      // Unreachable from source today (see DCConstAddrOf's doc comment); the
+      // dc-ir unit tests construct it directly so this path is exercised.
+      if (offset == 0) return 'ptr @$name';
+      return 'ptr getelementptr (i8, ptr @$name, i64 $offset)';
+  }
+}
+
+/// The LLVM type text a [DCConstant] emits itself as.
+///
+/// A relocation is `ptr` no matter what pointer-sized integer type the
+/// enclosing table was labelled with — the label describes the table's
+/// stride, the element describes what is actually stored.
+String _constantTypeText(
+  DCConstant constant,
+  DCType fallback, {
+  required String context,
+}) {
+  switch (constant) {
+    case DCConstInt(type: final type):
+      return _llvmType(type, context: context);
+    case DCConstAddrOf():
+      return 'ptr';
+    case DCConstArray(elements: final elements, elementType: final elementType):
+      final inner = elements.isEmpty
+          ? _llvmType(elementType, context: context)
+          : _constantTypeText(elements.first, elementType, context: context);
+      return '[${elements.length} x $inner]';
+  }
 }
 
 /// The M2 ARC arena's global state (docs/decisions/0015): a fixed array of
