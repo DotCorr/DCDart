@@ -107,6 +107,11 @@ closing note — the backend assumes SysV 16-byte alignment and documents it now
 calling convention once that exists, MMIO ordering and `@volatile` (GAP-0006), and anything about
 behaviour with interrupts enabled at all.
 
+Stated at its sharpest, in the words of the `oscortex_core` side that found the bug: **the kernel is
+currently DCDart's only real `@bare` test, and that is a dependency in the wrong direction.** A
+language project whose freestanding guarantees can only be validated by a downstream consumer has
+outsourced its own acceptance criteria.
+
 **Cost of the workaround:** a whole class of defect is invisible until a downstream consumer hits it,
 which is the most expensive place to find it. `no-red-zone/` mitigates exactly one instance by
 inspecting instructions instead of results — that shape (assert a property of the emitted code, not of
