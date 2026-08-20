@@ -62,7 +62,11 @@ Future<void> runBuild(BuildOptions options) async {
   // asm operand that says nothing about Port.outb (ADR-0033).
   checkFeatureSupport(target, usesPortIo: _usesPortIo(module));
 
-  final llText = emitModule(module, targetTriple: target.triple);
+  final llText = emitModule(
+    module,
+    targetTriple: target.triple,
+    noRedZone: target.forbidsRedZone,
+  );
 
   final tempDir = Directory.systemTemp.createTempSync('dcc_backend_');
   try {
@@ -71,6 +75,7 @@ Future<void> runBuild(BuildOptions options) async {
       llFile.path,
       options.outputPath,
       targetTriple: target.triple,
+      noRedZone: target.forbidsRedZone,
     );
   } finally {
     tempDir.deleteSync(recursive: true);

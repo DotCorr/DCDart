@@ -54,6 +54,37 @@ prelude has no type for today.
 
 ---
 
+## GAP-0025 — The conformance suite structurally cannot catch bare-metal-only codegen defects
+
+**Domain:** testing (all milestones)
+**Status:** OPEN — partially mitigated by `tests/conformance/no-red-zone/`
+
+Every behavioural conformance harness links its `@bare` object into an **ordinary hosted process** and
+runs it there (a hand-written `_start.S` plus the Linux/x86-64 syscall ABI, or plain libc for
+`native-host`). That is a sound way to check what the code COMPUTES. It is no evidence at all about
+properties that only differ in the environment `@bare` actually targets.
+
+Made concrete by ADR-0039: `dcc` emitted red-zone-using code for freestanding targets, which is
+correct in userland and silent memory corruption in a kernel once interrupts are enabled. The suite
+was 21/21 green throughout, and could not have been otherwise — in a hosted process nothing ever
+writes below RSP, so the defect has no observable behaviour there. It was found by a downstream OS
+project disassembling its own kernel, not by this repo.
+
+Other properties in the same blind spot, none currently checked: stack alignment at entry (ADR-0039's
+closing note — the backend assumes SysV 16-byte alignment and documents it nowhere), `@interrupt`
+calling convention once that exists, MMIO ordering and `@volatile` (GAP-0006), and anything about
+behaviour with interrupts enabled at all.
+
+**Cost of the workaround:** a whole class of defect is invisible until a downstream consumer hits it,
+which is the most expensive place to find it. `no-red-zone/` mitigates exactly one instance by
+inspecting instructions instead of results — that shape (assert a property of the emitted code, not of
+its output) is the general answer, and is worth reusing for the others. The real fix is the one
+`DCDART_SPEC.md`'s own testing model already names and this repo has never had: `dc-test --qemu`,
+booting `@bare` objects under full-system emulation with interrupts live and asserting over serial.
+Until that exists, "the suite is green" and "this code is safe in a kernel" remain different claims.
+
+---
+
 ## GAP-0024 — Signed integer division is rejected, not implemented (needs an INT_MIN/-1 guard)
 
 **Domain:** backend (M2)
@@ -227,9 +258,19 @@ immediately motivated, verified against a real disassembly, but deliberately not
   declare, and `tests/conformance/ffi-extern/run.sh` step 3 asserts exactly that on every run.
 - `@interrupt` function safety enforcement (no allocation inside an interrupt handler, compiler-
   enforced) — mentioned in `CLAUDE.md`'s coding rules as a real requirement, not yet built at all.
-  **Whoever builds it also owes escalation 0003's second condition: `@extern` must be rejected inside
-  an `@interrupt` function.** That could not be built with ADR-0038 because `@interrupt` does not
-  exist; it is recorded here so it is not lost.
+  **Whoever builds it also owes escalation 0003's second condition, which ADR-0038 specified but
+  could not enforce because `@interrupt` does not exist:**
+
+  > A call to an `@extern` symbol, direct **or transitive** through another `@bare` function, is a
+  > compile-time error inside a function annotated `@interrupt`.
+
+  The hazard is reaching foreign code at all — unbounded stack depth, unknown blocking, unknown
+  reentrancy, none of which the compiler can see through a `declare` — not the syntactic position of
+  the call site, so enforcing it needs a call-graph walk over the module's `Call` instructions, not a
+  local check. A check keyed off an annotation nothing can write today would be dead code that looks
+  like a guarantee, which is why ADR-0038 wrote the rule down here instead of pretending to enforce
+  it. `oscortex_core` records its own M1 interrupt handlers as correct-by-inspection for exactly this
+  reason.
 - `@linkName` and `@section` (spec §6's linker-control row). ADR-0038 deliberately did not build them:
   the Dart identifier is the C symbol name, which covers every symbol needed so far. `@linkName`
   becomes necessary the moment a C symbol's name is not a legal Dart identifier (a leading underscore

@@ -90,6 +90,28 @@ class DCTarget {
     this.alias,
   });
 
+  /// Whether emitted code must NOT use the x86-64 red zone.
+  ///
+  /// The red zone is 128 bytes below RSP that a leaf function may use without
+  /// adjusting the stack, on the promise that nothing else will touch it.
+  /// Interrupts break that promise: the CPU pushes its interrupt frame at RSP
+  /// and lands directly on top of those locals. In userland that is fine —
+  /// the kernel switches stacks for you. In kernel or bare-metal code it is
+  /// silent memory corruption the moment interrupts are enabled: no fault, no
+  /// diagnostic, just wrong values later.
+  ///
+  /// So this is exactly the freestanding property, which is why it lives on
+  /// the target rather than being a flag someone has to remember to pass
+  /// (ADR-0039). A future freestanding target cannot get this wrong by
+  /// omission.
+  ///
+  /// Applied to aarch64 freestanding targets too even though AAPCS64 has no
+  /// red zone to disable: `clang` accepts `-mno-red-zone` there without
+  /// complaint, and asserting the property uniformly is safer than encoding
+  /// an arch-by-arch exception list that a new arch would silently fall out
+  /// of.
+  bool get forbidsRedZone => isFreestanding;
+
   /// True for bare-metal targets with no OS underneath. A freestanding
   /// object cannot be linked into an ordinary executable by the host
   /// toolchain without a hand-written entry stub — which is exactly what

@@ -21,10 +21,17 @@ Future<void> compileToObject(
   String llPath,
   String objPath, {
   String? targetTriple,
+  bool noRedZone = false,
   String clangExecutable = 'clang',
 }) async {
   final args = <String>[
     if (targetTriple != null) '--target=$targetTriple',
+    // The x86-64 red zone is unusable in kernel/bare-metal code: an interrupt
+    // pushes its frame at RSP, straight over a leaf function's red-zone
+    // locals. Correct in userland, silent corruption in a kernel. See
+    // docs/decisions/0039-no-red-zone-on-freestanding-targets.md — the caller
+    // derives this from the target rather than passing it by hand.
+    if (noRedZone) '-mno-red-zone',
     '-ffreestanding',
     '-fno-builtin',
     '-fno-stack-protector',

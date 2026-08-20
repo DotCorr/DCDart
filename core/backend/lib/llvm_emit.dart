@@ -68,7 +68,11 @@ const int _headerSizeBytes = 16; // u32 strong + u32 weak + ptr cls, spec §3.1
 /// core/backend/README's "why ELF can't link natively on Windows" note)
 /// should pass `null` to omit the `target triple` line entirely and let the
 /// downstream compiler pick its default.
-String emitModule(DCModule module, {String? targetTriple = 'x86_64-unknown-none-elf'}) {
+String emitModule(
+  DCModule module, {
+  String? targetTriple = 'x86_64-unknown-none-elf',
+  bool noRedZone = false,
+}) {
   final declaredIntrinsics = <String>{};
   final functionBuffers = <String>[];
   for (final function in module.functions) {
@@ -124,7 +128,15 @@ String emitModule(DCModule module, {String? targetTriple = 'x86_64-unknown-none-
     buffer.write(fnText);
     buffer.writeln();
   }
-  buffer.writeln('attributes #0 = { nounwind }');
+  // `noredzone` is set on every emitted function for freestanding targets, in
+  // addition to clang's `-mno-red-zone` (ADR-0039). Both, deliberately: the
+  // flag governs how clang compiles this .ll, while the attribute travels
+  // WITH the IR, so the guarantee survives anyone compiling the emitted .ll
+  // by hand or through a different driver. A guarantee that only exists in a
+  // command line is one command line away from being lost.
+  buffer.writeln(
+    'attributes #0 = { nounwind${noRedZone ? ' noredzone' : ''} }',
+  );
   return buffer.toString();
 }
 
