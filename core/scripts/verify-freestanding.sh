@@ -64,6 +64,43 @@ fi
 # Strip comments and blanks from the allowlist.
 mapfile -t ALLOWED < <(grep -vE '^\s*(#|$)' "$ALLOWLIST" | sed 's/\s*$//')
 
+# ---------------------------------------------------------------------------
+# RESERVED RUNTIME FAMILIES — never honorable, by allowlist OR by manifest.
+#
+# This closes a hole between this script's stated contract and what it did.
+# The header above says these families are "still a hard failure, always",
+# and ADR-0038/escalation 0003's ratified wording says the check "keeps
+# catching dc_alloc, dc_throw, dc_orc_* and Dart_* exactly as before". It did
+# not: a manifest listing `dc_alloc` or `Dart_EnterScope` made the check
+# report `FREESTANDING: pass`. Verified by hand before this was added.
+#
+# Why these specifically cannot be declared away: every other undefined
+# symbol is a claim about SOMEONE ELSE'S object file, which an author is
+# entitled to make. These four families are claims about OUR OWN runtime —
+# they appear because the compiler emitted them, and their own diagnostics
+# say so ("This is a backend bug. Escalate to E2 immediately."). A program
+# that declares `@extern external dc_alloc` is not expressing a dependency,
+# it is silencing the one check that would have caught the language smuggling
+# a runtime into @bare. No legitimate program calls Dart_EnterScope.
+#
+# Deliberately NOT configurable and not overridable. A safety property with an
+# escape hatch is a safety property that will be escaped.
+RESERVED=(
+  'dc_alloc' 'dc_free' 'dc_realloc'
+  'dc_throw' 'dc_unwind' '__gxx_personality*'
+  'dc_orc_*'
+  'dart_*' 'Dart_*'
+)
+
+is_reserved() {
+  local sym="$1" pat
+  for pat in "${RESERVED[@]}"; do
+    # shellcheck disable=SC2053
+    if [[ "$sym" == $pat ]]; then return 0; fi
+  done
+  return 1
+}
+
 fail=0
 
 for obj in "$@"; do
@@ -86,6 +123,11 @@ for obj in "$@"; do
   for sym in "${undef[@]}"; do
     [[ -z "$sym" ]] && continue
     ok=0
+    # Checked FIRST, so neither the allowlist nor the manifest can honor it.
+    if is_reserved "$sym"; then
+      leaked+=("$sym")
+      continue
+    fi
     for a in "${ALLOWED[@]}"; do
       # Allowlist entries may be exact names or shell globs (e.g. __aeabi_*).
       # shellcheck disable=SC2053
@@ -132,6 +174,14 @@ for obj in "$@"; do
     echo "  Do NOT add to the allowlist to make this pass. The allowlist is owned by E4."
     echo "  If this symbol is a deliberate C dependency, declare it in the DCDart"
     echo "  source as \`@extern external ...\` so dcc records it (ADR-0038)."
+    for sym in "${leaked[@]}"; do
+      if is_reserved "$sym"; then
+        echo "  NOTE: \"$sym\" is a RESERVED runtime name. Declaring it @extern will"
+        echo "  NOT make this pass — these families are never honorable, because their"
+        echo "  presence means the compiler emitted them, not that you asked for them."
+        break
+      fi
+    done
   else
     if (( ${#honored[@]} )); then
       echo "FREESTANDING: pass  $obj  (${#honored[@]} declared extern(s): ${honored[*]})"

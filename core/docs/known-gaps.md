@@ -29,6 +29,49 @@ a backend change — `DCInt.signed` is already threaded through.
 
 ---
 
+## GAP-0029 — The extern manifest is trusted input; reserved runtime families are now unhonorable, but everything else is taken on faith
+
+**Domain:** testing / build integrity (spine, `CLAUDE.md` rule 1)
+**Status:** OPEN — the worst case is FIXED (`tests/conformance/spine-reserved/`), the trust model is not
+
+ADR-0038 taught `scripts/verify-freestanding.sh` to permit symbols listed in `<objfile>.externs`. The
+script reads that file from disk and permits exactly the names in it. Nothing verifies that the
+manifest is the one `dcc` wrote, that it matches the source's `@extern` declarations, or that it is
+not stale from an earlier build.
+
+**The part that was actually dangerous, and is fixed.** The manifest could honor ANY name, including
+`dc_alloc`, `dc_throw`, `dc_orc_*` and `Dart_*` — the four families whose own diagnostics say their
+presence means *the compiler emitted them* ("This is a backend bug. Escalate to E2 immediately."). A
+manifest listing `dc_alloc` produced `FREESTANDING: pass`. That contradicted both the script's own
+header ("still a hard failure, always") and escalation 0003's ratified wording ("keeps catching
+`dc_alloc`, `dc_throw`, `dc_orc_*` and `Dart_*` exactly as before"). Verified by hand, then fixed:
+those families are now checked BEFORE the allowlist and the manifest, so neither can honor them, and
+the diagnostic says so explicitly. Deliberately not configurable — a safety property with an escape
+hatch is one that will be escaped.
+
+The distinction that justifies the asymmetry: every other undefined symbol is a claim about SOMEONE
+ELSE'S object file, which an author is entitled to make. The reserved families are claims about our
+own runtime, which an author is not.
+
+**What remains open.** For non-reserved names the manifest is still trusted input:
+
+- A hand-written or hand-edited manifest permits whatever it lists. There is no signature, no
+  checksum, and no cross-check against the source.
+- A stale manifest from an earlier build lingers next to the object. The script reports unmatched
+  entries as a note rather than a failure — correct, since an unmatched entry permits nothing — but a
+  manifest that is stale in the *other* direction (still listing a symbol the source no longer
+  declares, while the object still references it for a different reason) would be honored.
+- Nothing checks that `<objfile>.externs` was produced by the same `dcc` invocation as `<objfile>`.
+
+**Cost of the workaround:** low today, because the manifest is written by `dcc` immediately beside the
+object it describes and nobody hand-edits one. It grows if manifests ever get committed, shipped, or
+merged across repos — `oscortex_core` has already ported the manifest support, so the mechanism now
+runs in two repos. The honest fix is for `dcc` to embed the declared set IN the object (a custom
+section, or a symbol naming convention) so the manifest cannot be separated from what it describes.
+That was considered out of scope for ADR-0038 and remains so, but it is the direction.
+
+---
+
 ## GAP-0028 — `dcc` compiles ONE library per object file; `@bare` functions in imported libraries were silently dropped
 
 **Domain:** dcc-lower (all milestones)
