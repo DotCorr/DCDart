@@ -29,6 +29,38 @@ a backend change — `DCInt.signed` is already threaded through.
 
 ---
 
+## GAP-0026 — `dcc` compiles ONE library per object file; `@bare` functions in imported libraries were silently dropped
+
+**Domain:** dcc-lower (all milestones)
+**Status:** OPEN — the silence is fixed, the limitation is not
+
+`lowerToDCModule` lowers `targetLibrary.procedures` and nothing else, so a `@bare` function declared
+in an imported library is never compiled into the object. Reported by `oscortex_core`, which hit it
+splitting its kernel across files and worked around it with `part`/`part of`.
+
+The limitation is defensible for now — one source file, one object file is a normal compiler
+boundary. **The silence was not.** Before this fix there were two failure modes and both were bad:
+
+- If nothing called the dropped function, the build SUCCEEDED. The symbol was simply absent from the
+  object, and absent from `--emit-header`'s output too, so the C side found out at link time or not
+  at all.
+- If something did call it, `clang` failed with `use of undefined value '@helperDouble'` — an
+  LLVM-level message that names neither DCDart, nor the import, nor what to do.
+
+`dcc` now refuses to build, listing every dropped function with its library and naming the
+`part`/`part of` workaround. This converts a trap into a diagnostic; it does not make multi-library
+programs work.
+
+**Cost of the workaround:** `part`/`part of` forces every `@bare` function of a program into one
+library. That is a real ergonomic tax on any program large enough to want files — a kernel, for
+instance — and `part` is a Dart feature with its own baggage (no per-file imports; the part file
+cannot be analyzed alone). The real fix is compiling a library graph into one module, or emitting one
+object per library and letting the linker resolve across them; the second interacts directly with
+ADR-0038's extern manifest, since a cross-object DCDart call would look exactly like an undeclared
+external symbol to `verify-freestanding.sh`.
+
+---
+
 ## GAP-0025 — `Pointer<T>` cannot appear in a function signature, which most real C APIs need
 
 **Domain:** dcc-lower (M1, surfaced by ADR-0038's extern FFI)

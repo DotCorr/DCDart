@@ -64,6 +64,24 @@ Future<DCModule> lowerToDCModule(
       ),
     );
 
+    // Only `targetLibrary`'s procedures are lowered (see the loop below), so
+    // a `@bare` function in an IMPORTED library is not compiled into this
+    // object at all. Before this check that happened SILENTLY: the build
+    // succeeded, the symbol simply was not in the output, and the generated
+    // header did not mention it either. Splitting a program across files
+    // quietly deleted half of its API — a function that vanishes with no
+    // diagnostic is strictly worse than a compile error (GAP-0026, reported
+    // by oscortex_core, which worked around it with `part`/`part of`).
+    //
+    // This does not FIX multi-library compilation; it converts a silent trap
+    // into a diagnostic that names exactly what was dropped and what to do
+    // instead.
+    _rejectBareFunctionsInImportedLibraries(
+      component,
+      targetLibrary: targetLibrary,
+      preludeUri: preludeUri,
+    );
+
     final structLayouts = _StructLayouts(preludeUri);
     final heapLayouts = _HeapLayouts(preludeUri);
 
@@ -2350,6 +2368,47 @@ DCType _lowerSignatureType(
       'from the DCDart prelude so far, see core/dcc-lower/README.md',
     );
   }
+}
+
+/// Throws if any library OTHER than [targetLibrary] declares a `@bare`
+/// function, because `lowerToDCModule` only lowers `targetLibrary` and those
+/// functions would otherwise be dropped without a word.
+///
+/// Deliberately NOT a warning. The failure this replaces was a successful
+/// build with a missing symbol, which surfaces either as an unreadable
+/// `use of undefined value '@f'` from clang (if something calls it) or as
+/// nothing at all until a C caller fails to link (if nothing does). Both are
+/// worse than refusing to build.
+void _rejectBareFunctionsInImportedLibraries(
+  Component component, {
+  required Library targetLibrary,
+  required Uri preludeUri,
+}) {
+  final dropped = <String>[];
+  for (final library in component.libraries) {
+    if (identical(library, targetLibrary)) continue;
+    // The prelude declares no `@bare` functions (its members are extension
+    // types and marker classes), and `dart:` libraries are never ours.
+    if (library.importUri == preludeUri) continue;
+    if (library.importUri.scheme == 'dart') continue;
+    for (final proc in library.procedures) {
+      if (_hasMarkerAnnotation(proc.annotations, '_Bare', preludeUri)) {
+        dropped.add('${proc.name.text}  (${library.importUri})');
+      }
+    }
+  }
+  if (dropped.isEmpty) return;
+
+  throw DccLowerError(
+    'these `@bare` functions are declared in imported libraries and would be '
+    'silently dropped from the output object:\n'
+    '  ${dropped.join('\n  ')}\n'
+    'dcc compiles ONE library per object file — only `${targetLibrary.importUri}` '
+    'is lowered, and anything `@bare` in a library it imports is not compiled '
+    'at all (docs/known-gaps.md GAP-0026). Until multi-library compilation '
+    'exists, put every `@bare` function in the file being compiled, or pull '
+    'the others in with `part`/`part of` so they share one library.',
+  );
 }
 
 class DccLowerError extends Error {
