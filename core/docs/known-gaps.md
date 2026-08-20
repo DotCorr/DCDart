@@ -32,7 +32,9 @@ a backend change — `DCInt.signed` is already threaded through.
 ## GAP-0032 — `dcc` never passes an optimization flag, so every DCDart program ships `-O0` code
 
 **Domain:** backend / dcc
-**Status:** OPEN — **a PREREQUISITE of M3, not merely related to it. Do not benchmark before closing it.**
+**Status:** OPEN — a PREREQUISITE of M3, not merely related to it. **BLOCKED BY GAP-0006: enabling
+`-O` before volatile exists silently deletes MMIO loads and stores.** Do not benchmark before closing
+this, and do not close this before GAP-0006.
 
 `backend/lib/compile.dart` invokes `clang` with `-ffreestanding -fno-builtin -fno-stack-protector
 -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables -c`. There is no `-O` anywhere, so
@@ -830,9 +832,42 @@ the full decision record.
 
 ---
 
-## GAP-0006 — Pointer<T> load/store carry no `@volatile` guarantee
+## GAP-0006 — `Pointer<T>` load/store carry no `@volatile` guarantee
 
-**Domain:** backend (M1)
+**Domain:** dc-ir, backend (M1)
+**Status:** OPEN — **and it is now a HARD BLOCKER for GAP-0032 (`-O`). Enabling optimization before
+this is fixed silently deletes MMIO accesses.**
+
+**2026-08-20 — measured, and it is worse than "unimplemented".** `examples/m1-pointer/mmio.dart` is the
+M1 exit criterion: write a memory-mapped register, read it back. Its emitted IR, compiled for
+`x86_64-unknown-none-elf`:
+
+```
+-O0 (what dcc ships today)      -O2 (the same IR)
+  movl %esi, (%rdi)   store       movl %esi, %eax     <- returns what it wrote
+  movl (%rdi), %eax   load        movl %esi, (%rdi)
+  retq                            retq                <- THE LOAD IS GONE
+```
+
+At `-O2` LLVM legally eliminates the read-back, because the load is not marked `volatile`. For a real
+hardware register the read-back IS the operation — status bits change, write-only bits read
+differently, devices acknowledge on read. And **`tests/conformance/m1-pointer/run.sh` still passes**,
+because the returned value is correct; only the hardware semantics are destroyed. That is precisely
+the failure class GAP-0027 describes: the suite links `@bare` objects into hosted processes where
+nothing observes a missing MMIO read.
+
+Marking the same two instructions `volatile` makes the `-O2` output **byte-identical to `-O0`**,
+verified. So the fix is understood and narrow; it is the sequencing that matters.
+
+**Consequence for ordering:** `-O` must NOT be enabled before this. Every `Pointer<T>.value` access in
+`oscortex_core` — UART, PIC, PIT, IDT — is an MMIO or MMIO-like access whose load or store the
+optimizer may drop or reorder. The kernel already knows about one instance and routed around it by
+hand: its `tick_count` extern exists because a plain `Pointer<u64>` load in a wait loop is legally
+hoistable, and at `-O` that hoist becomes real. There is no reason to think it is the only one; nothing
+has ever optimized this code.
+
+---
+
 **Status:** open, low urgency
 
 `DCDART_SPEC.md` §6 requires `@volatile` MMIO access to never be reordered or elided by the
