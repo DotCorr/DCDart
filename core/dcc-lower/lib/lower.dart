@@ -641,20 +641,23 @@ class _BareFunctionLowerer {
           _lowerStructFieldStore(expr, enclosingClass);
           return;
         }
+
+        if (enclosingClass != null && heapLayouts.extendsHeapObject(enclosingClass)) {
+          _lowerHeapFieldStore(expr, enclosingClass);
+          return;
+        }
       }
       // (M2, ADR-0027) `x = <expr>;` -- reassigning an existing non-final
       // local. DC-IR is SSA (dc-ir/README.md): there is no single fixed
       // SSA value a "mutable variable" keeps across its lifetime.
       // Reassignment is just rebinding `_values[variable]` to point at a
       // freshly-lowered DCValue -- every SUBSEQUENT VariableGet naturally
-      // sees the new one, since `_values` is consulted lazily. This is
-      // safe for straight-line code and for a reassignment inside an
-      // if-branch, because `_closeBranchIfOpen` already requires every
-      // WRITTEN branch to terminate via `return` (GAP-0007) -- there is
-      // no "conditionally reassign, then fall through with an ambiguous
-      // merged value" shape reachable today (that's the classic SSA
-      // phi/merge problem, and it stays out of scope until `_lowerIf`
-      // itself supports merging control flow back together).
+      // sees the new one, since `_values` is consulted lazily. Safe for
+      // straight-line code; a reassignment inside an if-branch that falls
+      // through (rather than returning) is the classic SSA phi/merge
+      // problem -- `_lowerIf` (ADR-0032) handles it by threading the
+      // reassigned value through a real DC-IR merge block, the same
+      // block-parameter mechanism `_lowerWhile`'s own header already uses.
       //
       // Scalar (`DCInt`) ONLY. A heap- or weak-typed reassignment raises
       // real ownership questions this project has deliberately deferred
@@ -724,8 +727,9 @@ class _BareFunctionLowerer {
       throw DccLowerError(
         '"$context": unsupported expression statement $expr '
         '(${expr.runtimeType}) — M1 only understands `pointer.value = x;`, '
-        '`structInstance.field = x;`, scalar local reassignment '
-        '(`x = <expr>;`), and `Port.outb(port, value);`',
+        '`structInstance.field = x;`, `heapInstance.field = x;` (scalar '
+        'fields only), scalar local reassignment (`x = <expr>;`), and '
+        '`Port.outb(port, value);`',
       );
     }
 
@@ -750,16 +754,23 @@ class _BareFunctionLowerer {
     );
   }
 
-  /// `if (cond) { thenBranch } [else { elseBranch }]`. M1 scope: every
-  /// branch that's written must terminate (end in `return`) — there is no
-  /// merge-block/phi generation from source yet (docs/known-gaps.md
-  /// GAP-0007). Two shapes are supported:
+  /// `if (cond) { thenBranch } [else { elseBranch }]`. Three shapes:
   ///   - if/else, both branches terminate: no fallthrough after the if:
   ///     subsequent statements (if any) are unreachable and throw.
-  ///   - if without else, then-branch terminates: the false path IS the
-  ///     fallthrough — becomes the new open "current" block that subsequent
-  ///     statements continue into. This is the guard-clause pattern
-  ///     `Result`-returning functions use with `.propagate()`.
+  ///   - if without else, then-branch terminates, no reassignment escapes:
+  ///     the false path IS the fallthrough — becomes the new open "current"
+  ///     block subsequent statements continue into. The guard-clause
+  ///     pattern `Result`-returning functions use with `.propagate()`.
+  ///   - (ADR-0032) either branch falls through instead of terminating —
+  ///     a plain conditional reassignment (`if (cond) { x = 1; } else
+  ///     { x = 2; }`, with or without an explicit `else`) — merges back
+  ///     into a real DC-IR merge block, using the exact same block-
+  ///     parameter mechanism `_lowerWhile`'s own header already uses.
+  ///     Scalar (`DCInt`) reassignments only, same rule as ADR-0027; a
+  ///     heap/weak local declared inside a branch that falls through
+  ///     (rather than returning) is not supported yet — nothing would
+  ///     release it, since the naive release policy only fires on a real
+  ///     `return` (docs/known-gaps.md).
   void _lowerIf(IfStatement stmt) {
     final cond = _lowerExpression(stmt.condition);
     if (cond.type is! DCBool) {
@@ -778,59 +789,130 @@ class _BareFunctionLowerer {
     );
     _finishBlock();
 
-    // Heap/weak locals declared inside a branch are scoped to that branch:
-    // once it closes (always via return -- _closeBranchIfOpen requires
-    // it), their releases have already been emitted by _lowerReturn, so
-    // they must NOT still be tracked for a return in a DIFFERENT branch to
-    // see (that would double-release an already-freed slot). Snapshot and
-    // truncate BOTH lists around each branch (ADR-0023 extended this to
-    // _weakLocals, same reasoning as _heapLocals).
-    //
-    // `_values` gets the SAME snapshot/restore treatment (ADR-0027), for a
-    // DIFFERENT but related reason: a scalar reassignment (`x = ...;`,
-    // ADR-0027) REBINDS `_values[decl]` to a new DCValue defined INSIDE
-    // whichever branch's blocks are currently open. Without restoring
-    // `_values` after the branch closes, that rebinding would leak into
-    // a sibling branch or the fallthrough continuation, which reference a
-    // DCValue that doesn't dominate their own blocks -- a real, verified
-    // bug (a genuine LLVM "does not dominate all uses" failure caught
-    // building this very feature, not a hypothetical). A `VariableDeclaration`
-    // made INSIDE a branch is correctly discarded by the same restore,
-    // matching ordinary lexical block-scoping -- it was never visible
-    // outside the branch at the Dart source level either.
+    // (ADR-0032) Merge-candidate scalars: every local reassigned anywhere
+    // in EITHER branch, already tracked before this `if`. Computed UP
+    // FRONT, before lowering either branch — a reassignment can't change a
+    // variable's type (ADR-0027), so the merge block's param types are
+    // already knowable from `_values` as it stands right now. Reuses
+    // `_collectLoopCarriedCandidates` — the exact same "which locals get
+    // reassigned in this subtree" scan `_lowerWhile` already uses for its
+    // own header params, including its throw-on-nested-while scope cut
+    // (composing a nested loop's own header merge with an if/else merge
+    // in the same pass is real, separate work, not attempted here).
+    final mergeCandidates = <VariableDeclaration>{};
+    _collectLoopCarriedCandidates(stmt.then, mergeCandidates);
+    if (otherwise != null) {
+      _collectLoopCarriedCandidates(otherwise, mergeCandidates);
+    }
+    final valuesBeforeIf = Map<VariableDeclaration, DCValue>.from(_values);
+    final mergeVars = <VariableDeclaration>[
+      for (final v in mergeCandidates)
+        if (valuesBeforeIf.containsKey(v)) v,
+    ];
+    for (final v in mergeVars) {
+      if (valuesBeforeIf[v]!.type is! DCInt) {
+        throw DccLowerError(
+          '"$context": "${v.name}" (type ${valuesBeforeIf[v]!.type}) is reassigned in a '
+          'branch of this if/else that falls through -- only scalar '
+          '(u8/u16/u32/u64) locals can be reassigned this way, same rule '
+          'as ADR-0027\'s straight-line reassignment',
+        );
+      }
+    }
+    final mergeBlockId = _allocBlockId();
+    final mergeParams = [
+      for (final v in mergeVars) DCValue(_allocId(), valuesBeforeIf[v]!.type),
+    ];
+
+    // Closes the CURRENTLY open (fallen-through) branch by branching into
+    // the merge block, passing each merge variable's current value.
+    void branchToMerge(String branchName, int heapLocalsBefore, int weakLocalsBefore) {
+      if (_heapLocals.length != heapLocalsBefore || _weakLocals.length != weakLocalsBefore) {
+        throw DccLowerError(
+          '"$context": a heap- or weak-typed local was declared in an '
+          'if-branch ($branchName) that falls through to code after the '
+          'if -- not supported yet, see docs/known-gaps.md',
+        );
+      }
+      final mergeArgs = [for (final v in mergeVars) _values[v]!];
+      _addInstr(Branch(target: mergeBlockId, args: mergeArgs));
+      _finishBlock();
+    }
+
+    // Heap/weak locals declared inside a branch are scoped to that branch
+    // (ADR-0023 extended this to _weakLocals, same reasoning as
+    // _heapLocals) — snapshot and truncate BOTH lists around each branch.
+    // `_values` gets the same snapshot/restore treatment (ADR-0027):
+    // without restoring it after a branch closes, a reassignment inside it
+    // would leak into a sibling branch or the fallthrough continuation,
+    // referencing a DCValue that doesn't dominate their own blocks -- a
+    // real, verified bug (a genuine LLVM "does not dominate all uses"
+    // failure caught building that feature).
     _startBlock(thenBlockId, const []);
     final heapLocalsBeforeThen = _heapLocals.length;
     final weakLocalsBeforeThen = _weakLocals.length;
-    final valuesBeforeThen = Map<VariableDeclaration, DCValue>.from(_values);
     _lowerBranchBody(stmt.then);
-    _closeBranchIfOpen('then');
+    final thenOpenAfter = _blockOpen &&
+        !(_currentInstructions.isNotEmpty && _currentInstructions.last is DCTerminator);
+    if (thenOpenAfter) {
+      branchToMerge('then', heapLocalsBeforeThen, weakLocalsBeforeThen);
+    } else if (_blockOpen) {
+      _finishBlock(); // ends in a real terminator (return)
+    }
+    // else: !_blockOpen already -- nested control flow (e.g. a nested
+    // if/else that itself terminated on every path) fully closed this
+    // branch; nothing more to do.
     _heapLocals.removeRange(heapLocalsBeforeThen, _heapLocals.length);
     _weakLocals.removeRange(weakLocalsBeforeThen, _weakLocals.length);
+    final thenReachesMerge = thenOpenAfter;
     _values
       ..clear()
-      ..addAll(valuesBeforeThen);
+      ..addAll(valuesBeforeIf);
 
     _startBlock(elseBlockId, const []);
+    bool elseReachesMerge;
     if (otherwise != null) {
       final heapLocalsBeforeElse = _heapLocals.length;
       final weakLocalsBeforeElse = _weakLocals.length;
-      final valuesBeforeElse = Map<VariableDeclaration, DCValue>.from(_values);
       _lowerBranchBody(otherwise);
-      _closeBranchIfOpen('else');
+      final elseOpenAfter = _blockOpen &&
+          !(_currentInstructions.isNotEmpty && _currentInstructions.last is DCTerminator);
+      if (elseOpenAfter) {
+        branchToMerge('else', heapLocalsBeforeElse, weakLocalsBeforeElse);
+      } else if (_blockOpen) {
+        _finishBlock();
+      }
       _heapLocals.removeRange(heapLocalsBeforeElse, _heapLocals.length);
       _weakLocals.removeRange(weakLocalsBeforeElse, _weakLocals.length);
-      _values
-        ..clear()
-        ..addAll(valuesBeforeElse);
-      // Both arms closed (or this is unreachable if they didn't -- caught
-      // above): nothing left open. A subsequent statement at this point is
-      // genuinely unreachable; the caller's loop / _addInstr catches it.
+      elseReachesMerge = elseOpenAfter;
+    } else if (mergeVars.isEmpty && !thenReachesMerge) {
+      // Existing guard-clause shape, unchanged: then terminates, no else,
+      // no merge candidates -- elseBlockId (already open, still holding
+      // valuesBeforeIf) IS the fallthrough continuation. Leave it open.
+      elseReachesMerge = false;
+    } else {
+      // Implicit empty else that DOES need to participate in a merge
+      // (either the then-branch fell through too, or it reassigned
+      // something) -- its "body" is nothing, so its merge args are just
+      // the unchanged pre-if values already restored into `_values` above.
+      branchToMerge('else (implicit)', _heapLocals.length, _weakLocals.length);
+      elseReachesMerge = true;
     }
-    // else: no `otherwise` -- elseBlockId IS the fallthrough continuation,
-    // deliberately left open for subsequent statements to continue into,
-    // correctly seeing `_values` as restored to its pre-then-branch state
-    // (the then-branch's own reassignments/declarations are scoped to
-    // itself, exactly like the heap/weak-local lists above).
+    _values
+      ..clear()
+      ..addAll(valuesBeforeIf);
+
+    if (!thenReachesMerge && !elseReachesMerge) {
+      // Both branches terminated, or this is the guard-clause shape
+      // (elseBlockId left open above, `_blockOpen` already reflects it
+      // correctly either way) -- nothing more to do.
+      return;
+    }
+
+    _startBlock(mergeBlockId, mergeParams);
+    for (var i = 0; i < mergeVars.length; i++) {
+      _values[mergeVars[i]] = mergeParams[i];
+    }
   }
 
   void _lowerBranchBody(Statement stmt) {
@@ -847,20 +929,6 @@ class _BareFunctionLowerer {
     } else {
       _lowerStatement(stmt);
     }
-  }
-
-  void _closeBranchIfOpen(String branchName) {
-    if (!_blockOpen) return; // branch already closed itself (nested if, etc.)
-    final last = _currentInstructions.isNotEmpty ? _currentInstructions.last : null;
-    if (last is! DCTerminator) {
-      throw DccLowerError(
-        '"$context": if-branch ($branchName) does not end in a return — M1 '
-        'requires every written if-branch to terminate; merging control '
-        'flow back together from source is not implemented, see '
-        'docs/known-gaps.md GAP-0007',
-      );
-    }
-    _finishBlock();
   }
 
   /// `while (cond) { body }` (M2, ADR-0028). DC-IR already represents merge
@@ -987,9 +1055,12 @@ class _BareFunctionLowerer {
   /// reachable inside `stmt` (recursing into `Block` and `IfStatement`'s
   /// arms) — used by `_lowerWhile` to find candidate loop-carried variables
   /// BEFORE actually lowering the body (the header block's phi params must
-  /// exist before the body that reads/writes them does). Throws on a
-  /// nested loop rather than silently scoping the analysis to the wrong
-  /// loop — nested loops are real, separate, unimplemented work.
+  /// exist before the body that reads/writes them does), AND by `_lowerIf`
+  /// (ADR-0032) to find candidate if/else-merge variables before lowering
+  /// either branch, for the identical reason. Throws on a nested loop
+  /// rather than silently scoping the analysis to the wrong loop — nested
+  /// loops (and composing a loop's own header merge with an if/else merge
+  /// in the same pass) are real, separate, unimplemented work.
   void _collectLoopCarriedCandidates(Statement stmt, Set<VariableDeclaration> out) {
     if (stmt is Block) {
       for (final s in stmt.statements) {
@@ -1709,6 +1780,41 @@ class _BareFunctionLowerer {
     final dest = DCValue(_allocId(), field.type);
     _addInstr(Load(dest: dest, pointer: fieldPtr));
     return dest;
+  }
+
+  /// `heapInstance.field = value` -> `PtrOffset` + `Store` (ADR-0032),
+  /// mirroring `_lowerHeapFieldLoad`'s addressing exactly, just in the
+  /// Store direction -- a real gap `_lowerHeapFieldLoad` existed but this
+  /// never did, only found by writing an actual program (`sumCollatzSteps`
+  /// mutating an accumulator field in a loop, `core/examples/demo-collatz`).
+  /// Scalar (`DCInt`) fields only: a heap- or weak-typed field STORE
+  /// raises the exact same real ownership question ADR-0027 already
+  /// flagged for local reassignment (does overwriting release the old
+  /// value? retain the new one?) -- undecided, so it throws a clear error
+  /// rather than guessing at a policy nobody has designed yet.
+  void _lowerHeapFieldStore(InstanceSet expr, Class heapClass) {
+    final field = _findHeapField(heapClass, expr.interfaceTarget.name.text);
+    if (field.type is! DCInt) {
+      throw DccLowerError(
+        '"$context": storing to "${heapClass.name}.${field.name}" (type '
+        '${field.type}) is not supported -- only scalar (u8/u16/u32/u64) '
+        'heap-object fields can be reassigned; heap- and weak-typed field '
+        'stores need a real ownership policy this project has not '
+        'designed yet, see docs/known-gaps.md',
+      );
+    }
+    final objectPtr = _lowerExpression(expr.receiver);
+    final fieldPtr = DCValue(_allocId(), DCPointer(field.type));
+    _addInstr(PtrOffset(dest: fieldPtr, base: objectPtr, offsetBytes: field.offset));
+    final value = _lowerExpression(expr.value);
+    if (value.type != field.type) {
+      throw DccLowerError(
+        '"$context": assigning a value of type ${value.type} to '
+        '"${heapClass.name}.${field.name}", declared ${field.type} -- no '
+        'implicit widening (same rule as arithmetic)',
+      );
+    }
+    _addInstr(Store(pointer: fieldPtr, value: value));
   }
 
   _StructField _findHeapField(Class heapClass, String name) {

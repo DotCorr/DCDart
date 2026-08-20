@@ -8,7 +8,7 @@ Layout follows the compiler pipeline's own stages (frontend → lowering → IR 
 | Path | Maps to spec §1 stage | Status |
 |---|---|---|
 | `frontend/` | DCDart CFE (fork of `pkg/front_end`) | vendored at `vendor/dart-sdk/`, pinned at the `3.12.2` tag, `pub get` resolves cleanly (docs/decisions/0005, 0007). Not invoked directly — shells to `dart compile kernel` instead (ADR-0008); the vendored copy is ready for when a real fork is needed |
-| `dcc-lower/` | Kernel IR → DC-IR | **implemented, working, fully verified** for M0/M1 (all clauses) and M2's fifteen ARC/elision/recursion/mutability/control-flow/port-io/bitwise/move-semantics slices, ADR-0016 through ADR-0031 (real heap objects, alias retain, calls, heap-typed signatures, heap-typed fields, `@owned` parameters, destructor cascade, weak references, redundant-pair elision, verified recursion, scalar reassignment, real `while`-loop control flow, x86 port I/O, move semantics) |
+| `dcc-lower/` | Kernel IR → DC-IR | **implemented, working, fully verified** for M0/M1 (all clauses) and M2's sixteen ARC/elision/recursion/mutability/control-flow/port-io/bitwise/move-semantics/if-else-merge slices, ADR-0016 through ADR-0032 (real heap objects, alias retain, calls, heap-typed signatures, heap-typed fields, `@owned` parameters, destructor cascade, weak references, redundant-pair elision, verified recursion, scalar reassignment, real `while`-loop control flow, x86 port I/O, move semantics, if/else merge blocks, heap field stores) |
 | `dc-ir/` | DC-IR: typed SSA, explicit retain/release | real pub package (`dc_ir`), plain hosted Dart per ADR-0006. Arithmetic, `Load`/`Store`/`IntToPtr`/`PtrOffset`, `ICmp`, `Branch`/`CondBranch`, `MakeStruct`/`ExtractField`, `Alloc`/`Retain`/`Release`, `Call` (now carrying `argOwnership`, ADR-0031), `MakeWeak`/`WeakLoad`/`DropWeak`, `PortOut`/`PortIn` (M2, ADR-0018/0022/0023/0029). Consumed for real by `dcc-lower` and `backend` — `while`-loop back edges (ADR-0028) needed no new instructions, just real use of the block-parameter merge points already there |
 | `dc-elide/` | Elision passes (spec §3.2) | **`elideRedundantRetainReleasePairs` implemented and verified** for pass 3 (ADR-0025) and pass 4's call-consumed case (ADR-0031) — a separate small package (only depends on `dc_ir`) purely so its own test suite can use `package:test`, which `dcc_lower`'s vendored-`kernel` dependency can't reconcile. 6 unit tests (3 positive, 3 negative/safety, including the critical "used again after an owned call" case) plus real end-to-end firing verified via `dc-objdump --arc` |
 | `backend/` | DC-IR → LLVM IR → object file | **implemented, working, fully verified** for M0/M1, plus M2's real ARC codegen (`Alloc`/`Retain`/`Release` against a fixed arena, ADR-0015), real function-call codegen (`Call`, ADR-0018), a real destructor-dispatch call through the object header's `cls` field (ADR-0022), real weak-reference codegen with zombie-slot semantics (ADR-0023), correct `phi`-predecessor tracking across internally-split blocks (ADR-0028, a real latent bug fixed), and real x86 port-I/O codegen via fixed inline asm (ADR-0029, verified against a real disassembly) — compiled via `clang -c` |
@@ -32,10 +32,11 @@ Layout follows the compiler pipeline's own stages (frontend → lowering → IR 
 | `examples/m2-loop/` | M2 target (`loop.dart`, `main.c`) | **`tests/conformance/m2-loop/run.sh`: unqualified PASS** — real `while`-loop control flow: loop-carried scalar variables (`sumTo`, 50 checks) and a nested early-return inside a loop body (`firstAtLeast`, 19×15 checks), proves `_lowerWhile` (ADR-0028) and the backend `phi`-predecessor-label fix it required |
 | `examples/m2-port/` | M2 target (`port_io.dart`) | **`tests/conformance/m2-port/run.sh`: unqualified PASS** — a real 16550 UART init sequence, verified STRUCTURALLY (disassembly shows exactly 7 `outb` + 1 `inb`, correct opcodes) since `outb`/`inb` are privileged instructions that can't run in a normal Linux process; proves `Port.outb`/`Port.inb` (ADR-0029) — the first DCDart feature built for a downstream project (`oscortex_core`) |
 | `examples/m2-bitwise/` | M2 target (`bitwise.dart`, `main.c`) | **`tests/conformance/m2-bitwise/run.sh`: unqualified PASS** — real execution (unlike `m2-port`, these are unprivileged instructions): `&`/`|`/`^` exhaustive over a value range at `u64`, `<<`/`>>` over a range, `&` at `u32`/`u16`/`u8` too, proves ADR-0030 |
+| `examples/demo-collatz/` | a real, hand-written program (not a single-ADR conformance target) | **not a `tests/conformance/` harness — a demo, kept in-repo.** A Collatz step-counter using a heap-object accumulator + `while` loop + arithmetic + bitwise ops together; links as an ORDINARY hosted C program (real `printf`, no `-nostdlib`). `collatzSteps(27) = 111`, the well-known correct value, checked independently, not just "it ran." Found two real gaps immediately (proves ADR-0032): `if`/`else` where both branches fall through wasn't supported (only guard-clause style was), and heap-object fields could be read but never written to |
 | `tests/conformance/`, `tests/leak/` | per `SKILL.md` §4 | **all sixteen `run.sh` harnesses report an unqualified PASS**, verified under WSL2/Ubuntu (real freestanding link + real run on the actual `x86_64-unknown-none-elf` target, except `m2-port` which verifies structurally — see above). `tests/leak/` empty — the `m2-*` harnesses are the de facto leak tests; a dedicated `dc-test --leakcheck` harness is future work |
 | `scripts/verify-freestanding.sh` | the spine check (`CLAUDE.md` rule 1) | **`FREESTANDING: pass`** against real `dcc` output, all sixteen targets, confirmed on both Windows and Linux |
 | `tools/bare-symbol-allowlist.txt` | consumed by the check above | still empty/draft — none of the sixteen targets needed anything allowlisted |
-| `docs/` | compat-matrix, known-gaps, decisions, escalations | 31 ADRs, 2 escalations, 10 gaps (8 resolved or resolved-for-current-scope — `unowned`/real vtable dispatch/elision passes 1,2,5 + pass 4's general cases/cycles/heap-in-loop remain within GAP-0003/0017, correctly deferred; GAP-0006 `@volatile` still fully open; GAP-0019 general asm/`@naked`/extern-FFI open, narrow port I/O resolved) |
+| `docs/` | compat-matrix, known-gaps, decisions, escalations | 32 ADRs, 2 escalations, 11 gaps (9 resolved or resolved-for-current-scope — `unowned`/real vtable dispatch/elision passes 1,2,5 + pass 4's general cases/cycles/heap-in-loop remain within GAP-0003/0017, correctly deferred; GAP-0006 `@volatile` still fully open; GAP-0019 general asm/`@naked`/extern-FFI open, narrow port I/O resolved; GAP-0020 heap/weak field stores open, scalar resolved) |
 
 ## Current milestone: M1 done, M2's naive ARC insertion done, M2 overall in progress
 
@@ -57,7 +58,7 @@ linked and run for real.
 criterion is "allocation-heavy programs run leak-free... `weak` references nil out correctly...
 elision firing" — the FULL criterion needs later work too (see below), but every ownership-transfer,
 object-death, AND weak-reference shape `DCDART_SPEC.md` §3.1/§3.2/§3.3-layer-1 describes now has real,
-verified codegen, across fourteen ADRs:
+verified codegen, across fifteen ADRs:
 
 1. **(ADR-0015/0016)** The core mechanism: `Alloc`/`Retain`/`Release` codegen against a fixed internal
    arena (explicitly NOT the real `Allocator` — spec §12's open decision 2, `escalations/0002`), real
@@ -170,8 +171,22 @@ verified codegen, across fourteen ADRs:
     move-semantics cases (struct fields, plain last-read moves, loop back-edges) remain unimplemented,
     scoped for later.
 
+15. **(ADR-0032)** if/else merge blocks, and heap object field stores — found by writing
+    `examples/demo-collatz/`, the project's first real, hand-written program rather than a single-ADR
+    conformance target. `_lowerIf` only ever supported branches that terminate (`return`); a plain
+    conditional reassignment (`if (cond) { x = 1; } else { x = 2; }`, arguably the single most common
+    shape in imperative code) threw immediately. Now supported via a real DC-IR merge block — the exact
+    same block-parameter mechanism `_lowerWhile`'s own header already uses — reusing (not
+    reimplementing) the same variable-scan helper both now share. Separately, `_lowerHeapFieldLoad`
+    existed since ADR-0016/0020 but its Store-direction counterpart never did; added
+    `_lowerHeapFieldStore` (scalar fields only — heap/weak-typed field stores raise the same
+    undecided ownership question as scalar-vs-heap local reassignment, GAP-0020). The demo now produces
+    the mathematically correct answer (`collatzSteps(27) = 111`, the well-known reference value),
+    independently checkable — real proof, not just "it compiled."
+
 Every slice was verified against the FULL conformance suite (all sixteen targets) after landing, zero
-regressions at any step — see `docs/known-gaps.md` GAP-0017/GAP-0003/GAP-0019 for the itemized history.
+regressions at any step — see `docs/known-gaps.md` GAP-0017/GAP-0003/GAP-0019/GAP-0020 for the itemized
+history.
 
 **What M2 still needs** (elision's remaining passes — escape analysis, borrow inference proper, move
 semantics, uniqueness/reuse, spec §3.2 passes 1/2/4/5 — each a real, larger analysis, appropriately

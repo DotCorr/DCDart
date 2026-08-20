@@ -4,6 +4,31 @@ Work queue, not a confession log (`CLAUDE.md`). Every entry: what was worked aro
 
 ---
 
+## GAP-0020 — Heap- and weak-typed heap-object field stores rejected (undecided ownership policy)
+
+**Domain:** dcc-lower (M2)
+**Status:** OPEN — scalar (`DCInt`) heap-object field stores RESOLVED
+(`docs/decisions/0032-if-else-merge-and-heap-field-store.md`); heap/weak-typed field stores throw a
+clear error rather than guessing.
+
+Found while writing `core/examples/demo-collatz/` (a real, hand-written program, not a narrow
+conformance target): `_lowerHeapFieldLoad` (reading a `HeapObject` subclass's field) existed since
+ADR-0016/0020, but its Store-direction counterpart never did — `counter.total = counter.total + n;`
+threw "unsupported expression statement." Added `_lowerHeapFieldStore`, but scoped to scalar fields
+only: overwriting a field that currently holds a strong heap/weak reference raises the exact same real
+ownership question ADR-0027 already flagged for scalar-vs-heap LOCAL reassignment — does the store
+release the old value first? does it need to retain the new one, or does it take over an existing
+strong reference from the assigning expression? None of this is decided.
+
+**Cost of the workaround:** none for the scalar case (resolved for real). Heap/weak-typed field
+mutation after construction remains genuinely unsupported — a real gap for any program wanting a
+mutable heap-typed field (e.g. a linked-list `next` pointer, an observer's target), not just a
+theoretical one. Next step: this needs the same kind of ownership-policy decision move semantics
+(ADR-0031) and scalar reassignment (ADR-0027) already flagged as undecided — likely resolved together
+once a real program needs mutable heap-typed fields, not speculatively now.
+
+---
+
 ## GAP-0019 — No general inline asm / `@naked` / extern-to-external-symbol FFI; only the narrow `Port.outb`/`Port.inb` primitive exists
 
 **Domain:** dc-ir, backend, dcc-lower (M2, downstream: `oscortex_core`)
