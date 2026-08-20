@@ -32,8 +32,10 @@ a backend change — `DCInt.signed` is already threaded through.
 ## GAP-0032 — `dcc` never passes an optimization flag, so every DCDart program ships `-O0` code
 
 **Domain:** backend / dcc
-**Status:** OPEN, and now UNBLOCKED — GAP-0006's volatile blocker was resolved by ADR-0041, verified
-at -O0/-O1/-O2/-O3/-Os. Still a PREREQUISITE of M3: do not benchmark before closing it.
+**Status:** RESOLVED (2026-08-21) — `dcc` compiles at `-O2` (ADR-0042). Landed only after ADR-0041
+made `Pointer<T>` access volatile; doing it in the other order would have silently deleted MMIO
+accesses while every test went green. M3's measurement is now meaningful, and should be read with
+GAP-0034 in mind.
 
 `backend/lib/compile.dart` invokes `clang` with `-ffreestanding -fno-builtin -fno-stack-protector
 -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables -c`. There is no `-O` anywhere, so

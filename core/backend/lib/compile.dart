@@ -22,10 +22,25 @@ Future<void> compileToObject(
   String objPath, {
   String? targetTriple,
   bool noRedZone = false,
+  String optLevel = '2',
   String clangExecutable = 'clang',
 }) async {
   final args = <String>[
     if (targetTriple != null) '--target=$targetTriple',
+    // Optimization level (ADR-0042). Until this landed dcc passed no -O at
+    // all, so every DCDart program shipped -O0 code: locals spilled to the
+    // stack, constants materialized in two instructions, no register
+    // allocation worth the name.
+    //
+    // -O2 rather than -O3: -O3 trades size for aggressive unrolling and
+    // vectorization, which is the wrong default for kernel code, and nothing
+    // has measured a case where it wins here. -Os is the other defensible
+    // choice for @bare and is a per-target question nobody has needed yet.
+    //
+    // ORDERING: this could not land before ADR-0041 made Pointer<T> access
+    // volatile. At -O2 a non-volatile MMIO read-back is deleted outright,
+    // and the conformance suite could not see it (GAP-0006/GAP-0027).
+    '-O$optLevel',
     // The x86-64 red zone is unusable in kernel/bare-metal code: an interrupt
     // pushes its frame at RSP, straight over a leaf function's red-zone
     // locals. Correct in userland, silent corruption in a kernel. See
