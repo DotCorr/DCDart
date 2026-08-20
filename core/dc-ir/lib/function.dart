@@ -105,6 +105,38 @@ final class DCFunction {
   });
 }
 
+/// One EXTERNAL C-ABI symbol this module calls but does not define
+/// (DCDART_SPEC.md §9, docs/decisions/0038-extern-symbols-and-linking.md).
+///
+/// A signature and nothing else — there are no blocks, because the body is
+/// in somebody else's object file. This is deliberately NOT a `DCFunction`
+/// with an empty block list: "a function with no blocks" is an invalid
+/// `DCFunction` by its own invariant (`blocks[0]` is always the entry
+/// block), and every pass that walks `module.functions` would have to learn
+/// to skip it. A separate list means those passes are correct by
+/// construction — `dc-elide`, `dc-objdump --arc` and the destructor
+/// synthesis all keep seeing exactly the set of functions that have bodies.
+///
+/// WHY THERE IS NO `CallExtern` INSTRUCTION. At the call site there is
+/// nothing to distinguish: a call to an external C-ABI symbol and a call to
+/// a sibling `@bare` function emit the identical machine instruction, take
+/// arguments the same way, and are subject to the same optimizer rules.
+/// What actually differs is purely module-level — whether the symbol gets a
+/// `define` or a `declare` — so that is where the distinction lives. See
+/// the ADR's "Options" section.
+final class DCExternFunction {
+  /// The C symbol name, emitted verbatim. No mangling, ever (spec §9).
+  final String linkName;
+  final List<DCType> paramTypes;
+  final DCType returnType;
+
+  const DCExternFunction({
+    required this.linkName,
+    required this.paramTypes,
+    required this.returnType,
+  });
+}
+
 /// A compilation unit — what `dcc-lower` hands to `backend/` as one job,
 /// and roughly what becomes one object file. M0 only ever has one function
 /// in one module (`add`); `DCModule` exists as a thin wrapper now so that
@@ -113,5 +145,21 @@ final class DCFunction {
 final class DCModule {
   final String name;
   final List<DCFunction> functions;
-  const DCModule({required this.name, required this.functions});
+
+  /// External C-ABI symbols this module calls but does not define
+  /// (ADR-0038). Defaults to empty, so every module built before extern
+  /// declarations existed constructs exactly as it did.
+  ///
+  /// This list is the ONLY authority on which undefined symbols the emitted
+  /// object file is allowed to carry — `dcc` writes it out as a manifest
+  /// beside the object and `scripts/verify-freestanding.sh` checks `nm -u`
+  /// against it (CLAUDE.md rule 1). Anything undefined that is not in here
+  /// is still a hard failure.
+  final List<DCExternFunction> externFunctions;
+
+  const DCModule({
+    required this.name,
+    required this.functions,
+    this.externFunctions = const [],
+  });
 }

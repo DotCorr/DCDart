@@ -41,6 +41,44 @@ class _Bare {
 
 const bare = _Bare();
 
+/// Marks a top-level declaration as an EXTERNAL C-ABI symbol that this
+/// compilation unit calls but does not define (DCDART_SPEC.md §9: "C ABI is
+/// the native ABI... `extern` declarations bind directly"). See
+/// docs/decisions/0038-extern-symbols-and-linking.md.
+///
+/// Usage — the annotation and Dart's own `external` keyword are BOTH
+/// required, and dcc-lower rejects either one without the other:
+///
+/// ```dart
+/// @extern
+/// external u64 dcx_c_add(u64 a, u64 b);
+/// ```
+///
+/// `external` is Dart's own word for "declared here, defined elsewhere", so
+/// front_end already enforces that the declaration has no body and Kernel IR
+/// already records it as `Procedure.isExternal` — no new Kernel node, no
+/// front_end change (CLAUDE.md rule 2). The `@extern` annotation on top of it
+/// is what makes the DECLARATION SET explicit, greppable, and mechanically
+/// collectable, which is what `scripts/verify-freestanding.sh` now
+/// cross-checks the object file's undefined symbols against (CLAUDE.md rule
+/// 1, docs/escalations/0003-extern-c-calls-vs-freestanding.md).
+///
+/// The Dart identifier IS the C symbol name. There is no `@linkName` yet —
+/// nothing has needed a C name that isn't a legal Dart identifier. Add it
+/// against a real case, not speculatively.
+///
+/// SCOPE, deliberately narrow: parameter and return types may be
+/// `u8`/`u16`/`u32`/`u64`/`Result`/`void` only. An ARC-managed `HeapObject`
+/// or `Weak<T>` in an extern signature is REJECTED — handing a refcounted
+/// pointer to a C function raises an ownership-convention question (does the
+/// callee consume it? borrow it? retain it?) that nothing has decided, and
+/// guessing would be a memory-model change made silently (CLAUDE.md rule 4).
+class _Extern {
+  const _Extern();
+}
+
+const extern = _Extern();
+
 /// u64 (DCDART_SPEC.md §4.1). Surface: construction and `+` -- no other
 /// operators yet, because nothing built so far needs them (see
 /// core/dc-ir/instructions.dart's identical discipline).
@@ -91,6 +129,53 @@ extension type u64(int _value) {
   u64 operator ^(u64 other) => u64(_value ^ other._value);
   u64 operator <<(u64 other) => u64(_value << other._value);
   u64 operator >>(u64 other) => u64(_value >> other._value);
+
+  /// Comparison and multiplication, completed across all four sized-int
+  /// widths (docs/decisions/0035-complete-integer-operators.md). Until this
+  /// landed the language had `<` on u64 ONLY, and no `*` at all, which is
+  /// why `examples/demo-collatz/collatz.dart` had to spell `3 * n` as
+  /// `n + n + n` and halving as `n >> u64(1)`.
+  ///
+  /// Every one of these was already fully supported downstream and simply
+  /// had no source-level operator wired to it: `IMul` has existed in
+  /// `core/dc-ir/instructions.dart` since M0 with real `llvm_emit` codegen,
+  /// and `ICmpPredicate` has carried all ten predicates
+  /// (`eq`/`ne`/`ult`/`ule`/`ugt`/`uge`/`slt`/`sle`/`sgt`/`sge`) just as
+  /// long. So this is a frontend-recognition change, not new codegen.
+  ///
+  /// `*` traps on overflow like `+`/`-` (spec §4.1). The comparisons use the
+  /// UNSIGNED predicates, which is correct because every sized-int type the
+  /// prelude exposes today is unsigned; a signed type would need the
+  /// `s`-prefixed predicates chosen from the operand's own signedness.
+  u64 operator *(u64 other) => u64(_value * other._value);
+  bool operator <=(u64 other) => _value <= other._value;
+  bool operator >(u64 other) => _value > other._value;
+  bool operator >=(u64 other) => _value >= other._value;
+
+  /// Integer division and remainder (ADR-0036). `~/` is Dart's INTEGER
+  /// division operator; plain `/` in Dart returns a `double`, and DCDart
+  /// has no floating point, so `~/` is the honest spelling rather than
+  /// redefining `/` to mean something Dart users would read as float
+  /// division. Both TRAP on a zero divisor -- LLVM treats `udiv x, 0` as
+  /// undefined behaviour, so the backend emits an explicit check.
+  u64 operator ~/(u64 other) => u64(_value ~/ other._value);
+  u64 operator %(u64 other) => u64(_value % other._value);
+
+  /// Explicit width conversion, DCDART_SPEC.md §4.1: "No implicit widening
+  /// or narrowing. `u8 -> u32` requires `.toU32()`. Explicit is the entire
+  /// point." Lowers to `IConvert` (ADR-0037), i.e. `zext` when widening and
+  /// `trunc` when narrowing; narrowing discards the high bits WITHOUT
+  /// trapping, because writing `.toU8()` is itself the statement that you
+  /// meant to.
+  ///
+  /// Found missing by writing `examples/demo-stats/stats.dart`: summing a
+  /// `u32` array into a `u64` accumulator is impossible without this, and
+  /// there was no way to express it at all -- the representation field is
+  /// library-private, so not even a cast could get around it.
+  u8 toU8() => u8(_value);
+  u16 toU16() => u16(_value);
+  u32 toU32() => u32(_value);
+  u64 toU64() => u64(_value);
 }
 
 /// u32 (DCDART_SPEC.md §4.1). Added for M1's `Pointer<u32>` exit criterion
@@ -102,6 +187,56 @@ extension type u32(int _value) {
   u32 operator ^(u32 other) => u32(_value ^ other._value);
   u32 operator <<(u32 other) => u32(_value << other._value);
   u32 operator >>(u32 other) => u32(_value >> other._value);
+
+  /// Comparison and multiplication, completed across all four sized-int
+  /// widths (docs/decisions/0035-complete-integer-operators.md). Until this
+  /// landed the language had `<` on u64 ONLY, and no `*` at all, which is
+  /// why `examples/demo-collatz/collatz.dart` had to spell `3 * n` as
+  /// `n + n + n` and halving as `n >> u64(1)`.
+  ///
+  /// Every one of these was already fully supported downstream and simply
+  /// had no source-level operator wired to it: `IMul` has existed in
+  /// `core/dc-ir/instructions.dart` since M0 with real `llvm_emit` codegen,
+  /// and `ICmpPredicate` has carried all ten predicates
+  /// (`eq`/`ne`/`ult`/`ule`/`ugt`/`uge`/`slt`/`sle`/`sgt`/`sge`) just as
+  /// long. So this is a frontend-recognition change, not new codegen.
+  ///
+  /// `*` traps on overflow like `+`/`-` (spec §4.1). The comparisons use the
+  /// UNSIGNED predicates, which is correct because every sized-int type the
+  /// prelude exposes today is unsigned; a signed type would need the
+  /// `s`-prefixed predicates chosen from the operand's own signedness.
+  u32 operator +(u32 other) => u32(_value + other._value);
+  u32 operator -(u32 other) => u32(_value - other._value);
+  u32 operator *(u32 other) => u32(_value * other._value);
+  bool operator <(u32 other) => _value < other._value;
+  bool operator <=(u32 other) => _value <= other._value;
+  bool operator >(u32 other) => _value > other._value;
+  bool operator >=(u32 other) => _value >= other._value;
+
+  /// Integer division and remainder (ADR-0036). `~/` is Dart's INTEGER
+  /// division operator; plain `/` in Dart returns a `double`, and DCDart
+  /// has no floating point, so `~/` is the honest spelling rather than
+  /// redefining `/` to mean something Dart users would read as float
+  /// division. Both TRAP on a zero divisor -- LLVM treats `udiv x, 0` as
+  /// undefined behaviour, so the backend emits an explicit check.
+  u32 operator ~/(u32 other) => u32(_value ~/ other._value);
+  u32 operator %(u32 other) => u32(_value % other._value);
+
+  /// Explicit width conversion, DCDART_SPEC.md §4.1: "No implicit widening
+  /// or narrowing. `u8 -> u32` requires `.toU32()`. Explicit is the entire
+  /// point." Lowers to `IConvert` (ADR-0037), i.e. `zext` when widening and
+  /// `trunc` when narrowing; narrowing discards the high bits WITHOUT
+  /// trapping, because writing `.toU8()` is itself the statement that you
+  /// meant to.
+  ///
+  /// Found missing by writing `examples/demo-stats/stats.dart`: summing a
+  /// `u32` array into a `u64` accumulator is impossible without this, and
+  /// there was no way to express it at all -- the representation field is
+  /// library-private, so not even a cast could get around it.
+  u8 toU8() => u8(_value);
+  u16 toU16() => u16(_value);
+  u32 toU32() => u32(_value);
+  u64 toU64() => u64(_value);
 }
 
 /// u8 (DCDART_SPEC.md §4.1). Added for M1's `@packed` struct exit criterion
@@ -113,6 +248,56 @@ extension type u8(int _value) {
   u8 operator ^(u8 other) => u8(_value ^ other._value);
   u8 operator <<(u8 other) => u8(_value << other._value);
   u8 operator >>(u8 other) => u8(_value >> other._value);
+
+  /// Comparison and multiplication, completed across all four sized-int
+  /// widths (docs/decisions/0035-complete-integer-operators.md). Until this
+  /// landed the language had `<` on u64 ONLY, and no `*` at all, which is
+  /// why `examples/demo-collatz/collatz.dart` had to spell `3 * n` as
+  /// `n + n + n` and halving as `n >> u64(1)`.
+  ///
+  /// Every one of these was already fully supported downstream and simply
+  /// had no source-level operator wired to it: `IMul` has existed in
+  /// `core/dc-ir/instructions.dart` since M0 with real `llvm_emit` codegen,
+  /// and `ICmpPredicate` has carried all ten predicates
+  /// (`eq`/`ne`/`ult`/`ule`/`ugt`/`uge`/`slt`/`sle`/`sgt`/`sge`) just as
+  /// long. So this is a frontend-recognition change, not new codegen.
+  ///
+  /// `*` traps on overflow like `+`/`-` (spec §4.1). The comparisons use the
+  /// UNSIGNED predicates, which is correct because every sized-int type the
+  /// prelude exposes today is unsigned; a signed type would need the
+  /// `s`-prefixed predicates chosen from the operand's own signedness.
+  u8 operator +(u8 other) => u8(_value + other._value);
+  u8 operator -(u8 other) => u8(_value - other._value);
+  u8 operator *(u8 other) => u8(_value * other._value);
+  bool operator <(u8 other) => _value < other._value;
+  bool operator <=(u8 other) => _value <= other._value;
+  bool operator >(u8 other) => _value > other._value;
+  bool operator >=(u8 other) => _value >= other._value;
+
+  /// Integer division and remainder (ADR-0036). `~/` is Dart's INTEGER
+  /// division operator; plain `/` in Dart returns a `double`, and DCDart
+  /// has no floating point, so `~/` is the honest spelling rather than
+  /// redefining `/` to mean something Dart users would read as float
+  /// division. Both TRAP on a zero divisor -- LLVM treats `udiv x, 0` as
+  /// undefined behaviour, so the backend emits an explicit check.
+  u8 operator ~/(u8 other) => u8(_value ~/ other._value);
+  u8 operator %(u8 other) => u8(_value % other._value);
+
+  /// Explicit width conversion, DCDART_SPEC.md §4.1: "No implicit widening
+  /// or narrowing. `u8 -> u32` requires `.toU32()`. Explicit is the entire
+  /// point." Lowers to `IConvert` (ADR-0037), i.e. `zext` when widening and
+  /// `trunc` when narrowing; narrowing discards the high bits WITHOUT
+  /// trapping, because writing `.toU8()` is itself the statement that you
+  /// meant to.
+  ///
+  /// Found missing by writing `examples/demo-stats/stats.dart`: summing a
+  /// `u32` array into a `u64` accumulator is impossible without this, and
+  /// there was no way to express it at all -- the representation field is
+  /// library-private, so not even a cast could get around it.
+  u8 toU8() => u8(_value);
+  u16 toU16() => u16(_value);
+  u32 toU32() => u32(_value);
+  u64 toU64() => u64(_value);
 }
 
 /// u16 (DCDART_SPEC.md §4.1). Added for `Port.outb`/`Port.inb` below
@@ -128,6 +313,56 @@ extension type u16(int _value) {
   u16 operator ^(u16 other) => u16(_value ^ other._value);
   u16 operator <<(u16 other) => u16(_value << other._value);
   u16 operator >>(u16 other) => u16(_value >> other._value);
+
+  /// Comparison and multiplication, completed across all four sized-int
+  /// widths (docs/decisions/0035-complete-integer-operators.md). Until this
+  /// landed the language had `<` on u64 ONLY, and no `*` at all, which is
+  /// why `examples/demo-collatz/collatz.dart` had to spell `3 * n` as
+  /// `n + n + n` and halving as `n >> u64(1)`.
+  ///
+  /// Every one of these was already fully supported downstream and simply
+  /// had no source-level operator wired to it: `IMul` has existed in
+  /// `core/dc-ir/instructions.dart` since M0 with real `llvm_emit` codegen,
+  /// and `ICmpPredicate` has carried all ten predicates
+  /// (`eq`/`ne`/`ult`/`ule`/`ugt`/`uge`/`slt`/`sle`/`sgt`/`sge`) just as
+  /// long. So this is a frontend-recognition change, not new codegen.
+  ///
+  /// `*` traps on overflow like `+`/`-` (spec §4.1). The comparisons use the
+  /// UNSIGNED predicates, which is correct because every sized-int type the
+  /// prelude exposes today is unsigned; a signed type would need the
+  /// `s`-prefixed predicates chosen from the operand's own signedness.
+  u16 operator +(u16 other) => u16(_value + other._value);
+  u16 operator -(u16 other) => u16(_value - other._value);
+  u16 operator *(u16 other) => u16(_value * other._value);
+  bool operator <(u16 other) => _value < other._value;
+  bool operator <=(u16 other) => _value <= other._value;
+  bool operator >(u16 other) => _value > other._value;
+  bool operator >=(u16 other) => _value >= other._value;
+
+  /// Integer division and remainder (ADR-0036). `~/` is Dart's INTEGER
+  /// division operator; plain `/` in Dart returns a `double`, and DCDart
+  /// has no floating point, so `~/` is the honest spelling rather than
+  /// redefining `/` to mean something Dart users would read as float
+  /// division. Both TRAP on a zero divisor -- LLVM treats `udiv x, 0` as
+  /// undefined behaviour, so the backend emits an explicit check.
+  u16 operator ~/(u16 other) => u16(_value ~/ other._value);
+  u16 operator %(u16 other) => u16(_value % other._value);
+
+  /// Explicit width conversion, DCDART_SPEC.md §4.1: "No implicit widening
+  /// or narrowing. `u8 -> u32` requires `.toU32()`. Explicit is the entire
+  /// point." Lowers to `IConvert` (ADR-0037), i.e. `zext` when widening and
+  /// `trunc` when narrowing; narrowing discards the high bits WITHOUT
+  /// trapping, because writing `.toU8()` is itself the statement that you
+  /// meant to.
+  ///
+  /// Found missing by writing `examples/demo-stats/stats.dart`: summing a
+  /// `u32` array into a `u64` accumulator is impossible without this, and
+  /// there was no way to express it at all -- the representation field is
+  /// library-private, so not even a cast could get around it.
+  u8 toU8() => u8(_value);
+  u16 toU16() => u16(_value);
+  u32 toU32() => u32(_value);
+  u64 toU64() => u64(_value);
 }
 
 /// x86 port I/O (DCDART_SPEC.md §6, oscortex_core's M0 escalation --

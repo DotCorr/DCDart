@@ -16,3 +16,5 @@ dependencies:
     path: ../dcc-lower
   backend:
     path: ../backend
+  dc_ir:
+    path: ../dc-ir

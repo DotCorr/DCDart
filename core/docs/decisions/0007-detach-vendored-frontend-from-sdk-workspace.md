@@ -49,6 +49,13 @@ siblings plus `collection`, `meta`, `package_config`, `path`, `source_span`, `st
   (ADR-0005) and this workspace-detach edit — the detach is not a one-time patch that survives a
   re-clone. Worth a small script if re-vendoring becomes routine; not written now since it's happened
   exactly once.
+
+  **Addendum (2026-08-20):** it happened a second time — a fresh clone on a new machine, where the
+  ignored `vendor/` tree meant *nothing* in `core/` could `pub get` at all (known-gaps.md GAP-0021).
+  The script anticipated above now exists: `core/scripts/vendor-frontend.sh`. It performs both steps,
+  hard-fails if the checkout is not this ADR's pinned commit, and proves the result with a real
+  `pub get` across all six `core/` packages rather than assuming. Verified from an empty
+  `core/frontend/`.
 - The three edited `pubspec.yaml` files are the first actual modifications to vendored upstream
   source in this fork (everything before this was unmodified vendoring). Each carries an inline
   "DCDart fork note" comment pointing back to this ADR.

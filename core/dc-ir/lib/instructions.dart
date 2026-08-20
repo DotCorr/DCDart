@@ -143,6 +143,71 @@ final class IMul extends DCInstruction {
   DCValue? get result => dest;
 }
 
+/// Integer division (`/`) and remainder (`%`).
+///
+/// NO `Overflow` field, and that is not an oversight: division does not
+/// overflow the way `+`/`-`/`*` do, so there is no `llvm.*.with.overflow.*`
+/// intrinsic for it and nothing for an `Overflow` flag to select. Division
+/// has a DIFFERENT failure mode -- a zero divisor, which is undefined
+/// behaviour in LLVM (`udiv i64 %a, 0` is `poison`, not a fault you can
+/// rely on). The backend therefore emits an explicit compare-and-trap
+/// against zero before the divide, so `x / u64(0)` halts deterministically
+/// instead of silently producing poison. See ADR-0036.
+///
+/// Signedness comes from the operands' own `DCInt.signed`, selecting
+/// `udiv`/`sdiv` (and `urem`/`srem`) in the backend -- the same mechanism
+/// `IShr` already uses to pick `lshr` vs `ashr`, rather than splitting one
+/// concept across two instruction classes.
+final class IDiv extends DCInstruction {
+  final DCValue dest;
+  final DCValue lhs;
+  final DCValue rhs;
+  const IDiv({required this.dest, required this.lhs, required this.rhs});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Integer remainder. See [IDiv] -- same zero-divisor trap, same
+/// signedness rule (`urem`/`srem`).
+final class IRem extends DCInstruction {
+  final DCValue dest;
+  final DCValue lhs;
+  final DCValue rhs;
+  const IRem({required this.dest, required this.lhs, required this.rhs});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Explicit integer width conversion (`.toU8()`, `.toU16()`, `.toU32()`,
+/// `.toU64()`), per DCDART_SPEC.md §4.1: "No implicit widening or
+/// narrowing. `u8 -> u32` requires `.toU32()`. Explicit is the entire
+/// point."
+///
+/// ONE instruction, not three (`zext`/`sext`/`trunc`), because the choice is
+/// fully determined by the two types already present on `source` and `dest`:
+/// a wider dest zero- or sign-extends depending on the SOURCE's signedness,
+/// a narrower dest truncates, and equal widths are a no-op. Splitting it
+/// would let a caller pass a combination that contradicts the types, which
+/// is not a state worth being able to represent. Same reasoning as `IShr`
+/// deriving `lshr` vs `ashr` from its operand rather than being two
+/// instructions.
+///
+/// Narrowing TRUNCATES and does not trap. That is deliberate and matches
+/// the spec: the explicit `.toU8()` call at the source level IS the safety
+/// mechanism -- the programmer said the word "narrow", so the discarded high
+/// bits are the stated intent, unlike an arithmetic overflow which is
+/// always an accident.
+final class IConvert extends DCInstruction {
+  final DCValue dest;
+  final DCValue source;
+  const IConvert({required this.dest, required this.source});
+
+  @override
+  DCValue? get result => dest;
+}
+
 /// Bitwise AND. `lhs`, `rhs`, `dest` must share the same `DCInt` type (no
 /// implicit widening, same rule as arithmetic, spec §4.1). No `Overflow`
 /// field -- bitwise ops don't have DCDart's arithmetic overflow-trap

@@ -97,12 +97,45 @@ String emitModule(DCModule module, {String? targetTriple = 'x86_64-unknown-none-
     buffer.writeln(decl);
   }
   if (declaredIntrinsics.isNotEmpty) buffer.writeln();
+
+  // (ADR-0038) External C-ABI symbols. LLVM's textual IR requires a
+  // `declare` for any callee — verified, not assumed: an emitted `call
+  // @foo` with no `declare @foo` is rejected by clang outright ("use of
+  // undefined value '@foo'"), so this loop is what makes an extern call
+  // assemble at all. The resulting object carries a real undefined symbol
+  // with a real relocation, which is exactly what the linker needs and
+  // exactly what `nm -u` reports.
+  //
+  // NO `#0` (`nounwind`) HERE, unlike every `define` this file emits.
+  // `nounwind` on a `define` is a claim about code we compiled and can
+  // check. On a `declare` it would be a claim about somebody else's object
+  // file — if that C function does unwind, the attribute makes the
+  // optimizer's assumption wrong rather than the program merely slow.
+  // Omitting it costs nothing here (`-fno-exceptions`/`-fno-unwind-tables`
+  // are already passed to clang, compile.dart) and keeps the IR honest.
+  if (module.externFunctions.isNotEmpty) {
+    for (final extern in module.externFunctions) {
+      buffer.writeln(_emitExternDeclaration(extern));
+    }
+    buffer.writeln();
+  }
+
   for (final fnText in functionBuffers) {
     buffer.write(fnText);
     buffer.writeln();
   }
   buffer.writeln('attributes #0 = { nounwind }');
   return buffer.toString();
+}
+
+/// One `declare <ret> @name(<params>)` line for an external C-ABI symbol
+/// (ADR-0038). Parameter names are omitted — a `declare` carries types only.
+String _emitExternDeclaration(DCExternFunction extern) {
+  final retType = _llvmType(extern.returnType, context: extern.linkName);
+  final params = extern.paramTypes
+      .map((t) => _llvmType(t, context: extern.linkName))
+      .join(', ');
+  return 'declare $retType @${extern.linkName}($params)';
 }
 
 /// LLVM label for a DC-IR block. Block 0 keeps the "entry" label M0/M1's
@@ -276,6 +309,12 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
       _emitArith('sub', instruction.dest, instruction.lhs, instruction.rhs, instruction.overflow, e, context);
     case IMul():
       _emitArith('mul', instruction.dest, instruction.lhs, instruction.rhs, instruction.overflow, e, context);
+    case IDiv():
+      _emitDivRem('div', instruction.dest, instruction.lhs, instruction.rhs, e, context);
+    case IRem():
+      _emitDivRem('rem', instruction.dest, instruction.lhs, instruction.rhs, e, context);
+    case IConvert():
+      _emitConvert(instruction, e, context);
     case IAnd():
       _emitBitwise('and', instruction.dest, instruction.lhs, instruction.rhs, e, context);
     case IOr():
@@ -461,6 +500,114 @@ void _emitArith(
   // it dominates okLabel (the only successor that reaches later uses), so
   // later instructions in okLabel referencing %v<idx> are valid SSA.
 }
+
+/// `IDiv`/`IRem` -> an explicit zero-divisor check, then `udiv`/`sdiv` or
+/// `urem`/`srem`.
+///
+/// WHY THE CHECK IS NOT OPTIONAL. In LLVM, division by zero is not a
+/// hardware fault you can lean on -- `udiv iN %a, 0` is immediate UB and
+/// the optimizer is free to delete the surrounding code entirely. DCDart
+/// traps by default (spec §4.1), so this emits the compare and the branch
+/// itself rather than inheriting whatever the target CPU happens to do.
+///
+/// Block-splitting invariant (ADR-0028): this splits one DC-IR block into
+/// three real LLVM blocks, so any later `phi` naming this block as a
+/// predecessor must name the FINAL label (`okLabel`), not the DC-IR block's
+/// nominal label. `_FunctionEmitter.startBlock` is what tracks that, which
+/// is exactly why the split goes through it -- the same latent bug ADR-0028
+/// fixed for `Alloc`/`Release`/`WeakLoad` would otherwise reappear here.
+void _emitDivRem(
+  String kind,
+  DCValue dest,
+  DCValue lhs,
+  DCValue rhs,
+  _FunctionEmitter e,
+  String context,
+) {
+  final destType = dest.type;
+  if (destType is! DCInt) {
+    throw BackendError(
+      '"$context": $kind on non-DCInt dest $destType (${destType.runtimeType})',
+    );
+  }
+  final type = _llvmType(destType, context: context);
+
+  // Signed division has a SECOND trapping case beyond a zero divisor:
+  // INT_MIN / -1 overflows and is UB in LLVM too. Every sized-int type the
+  // prelude exposes today is unsigned, so that path is unreachable; it is
+  // rejected outright rather than emitted without its guard, so a future
+  // signed type cannot silently inherit incorrect codegen (GAP-0024).
+  if (destType.signed) {
+    throw BackendError(
+      '"$context": signed $kind is not implemented. It needs an INT_MIN/-1 '
+      'overflow guard in addition to the zero-divisor trap (see '
+      'docs/known-gaps.md GAP-0024); emitting it without one would be UB.',
+    );
+  }
+
+  final isZero = e.freshName('divzero');
+  final trapLabel = e.freshLabel('divtrap');
+  final okLabel = e.freshLabel('divok');
+
+  e.line('%$isZero = icmp eq $type %v${rhs.id.index}, 0');
+  e.terminate('br i1 %$isZero, label %$trapLabel, label %$okLabel');
+
+  e.startBlock(trapLabel);
+  declareTrapIntrinsic(e.declaredIntrinsics);
+  e.line('call void @llvm.trap()');
+  e.terminate('unreachable');
+
+  // The divide itself lands in okLabel, so it is only ever reached with a
+  // non-zero divisor -- unlike _emitArith, where the value is computed
+  // BEFORE the branch and the trap only rejects it afterwards.
+  e.startBlock(okLabel);
+  final op = kind == 'div' ? 'udiv' : 'urem';
+  e.line('%v${dest.id.index} = $op $type %v${lhs.id.index}, %v${rhs.id.index}');
+}
+
+/// `IConvert` -> `zext` / `sext` / `trunc`, chosen from the two types.
+///
+/// The source's own signedness decides extension: widening a signed value
+/// must `sext` to preserve its value, while an unsigned one must `zext`.
+/// Getting that backwards is invisible until a negative number is widened,
+/// which is why it reads the type rather than taking a flag.
+void _emitConvert(IConvert instruction, _FunctionEmitter e, String context) {
+  final srcType = instruction.source.type;
+  final dstType = instruction.dest.type;
+  if (srcType is! DCInt || dstType is! DCInt) {
+    throw BackendError(
+      '"$context": integer conversion between non-DCInt types '
+      '($srcType -> $dstType)',
+    );
+  }
+  final src = _llvmType(srcType, context: context);
+  final dst = _llvmType(dstType, context: context);
+  final srcBits = _intBits(srcType, context: context);
+  final dstBits = _intBits(dstType, context: context);
+
+  if (srcBits == dstBits) {
+    // Same width: nothing to convert. Emitted as an `add 0` rather than
+    // skipped entirely, because `dest` still has to be a defined SSA name
+    // that later instructions can reference.
+    e.line('%v${instruction.dest.id.index} = add $dst %v${instruction.source.id.index}, 0');
+    return;
+  }
+  final op = dstBits > srcBits ? (srcType.signed ? 'sext' : 'zext') : 'trunc';
+  e.line(
+    '%v${instruction.dest.id.index} = $op $src %v${instruction.source.id.index} to $dst',
+  );
+}
+
+/// Bit width of a `DCInt`. `usize`/`isize` are 64 here because every target
+/// in the registry (ADR-0033) is 64-bit; a 32-bit target would have to make
+/// this target-dependent rather than a constant.
+int _intBits(DCInt type, {required String context}) => switch (type.width) {
+      IntWidth.w8 => 8,
+      IntWidth.w16 => 16,
+      IntWidth.w32 => 32,
+      IntWidth.w64 => 64,
+      IntWidth.wSize => 64,
+    };
 
 /// `MakeStruct` -> a chain of `insertvalue`, starting from `undef`, one per
 /// field, matching how LLVM itself expects an aggregate built from scratch

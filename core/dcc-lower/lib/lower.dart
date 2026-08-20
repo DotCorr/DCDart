@@ -66,14 +66,55 @@ Future<DCModule> lowerToDCModule(
 
     final structLayouts = _StructLayouts(preludeUri);
     final heapLayouts = _HeapLayouts(preludeUri);
+
+    // (ADR-0038) External C-ABI symbols FIRST, before any function body is
+    // lowered, for two reasons: a call site needs to know the target was
+    // really declared (not merely annotated somewhere unreachable), and a
+    // signature this backend cannot honestly express must fail at the
+    // DECLARATION, naming it, rather than at whichever call site happens to
+    // be lowered first.
+    final externFunctions = _collectExternDeclarations(
+      targetLibrary,
+      preludeUri: preludeUri,
+      heapLayouts: heapLayouts,
+    );
+    final externNames = {for (final e in externFunctions) e.linkName};
+
     final functions = <DCFunction>[];
     for (final proc in targetLibrary.procedures) {
       if (!_hasMarkerAnnotation(proc.annotations, '_Bare', preludeUri)) continue;
-      functions.add(_BareFunctionLowerer(proc, preludeUri, structLayouts, heapLayouts).lower());
+      if (proc.isExternal) {
+        // `@bare external` is the one genuinely ambiguous shape: it has no
+        // body to lower, but `@bare` means "lower this as a function". Say
+        // so, rather than crashing later on a null body.
+        throw DccLowerError(
+          '"${proc.name.text}" is declared `@bare external` — a body-less '
+          'declaration of a symbol defined elsewhere is `@extern`, not '
+          '`@bare` (docs/decisions/0038-extern-symbols-and-linking.md)',
+        );
+      }
+      functions.add(
+        _BareFunctionLowerer(proc, preludeUri, structLayouts, heapLayouts, externNames).lower(),
+      );
     }
 
     if (functions.isEmpty) {
       throw DccLowerError('no @bare top-level function found in $dartSourcePath');
+    }
+
+    // A symbol cannot be both defined here and imported from elsewhere. The
+    // link would resolve to this module's own definition and silently ignore
+    // the declaration, which is the kind of quiet disagreement extern
+    // declarations exist to prevent.
+    final definedNames = {for (final f in functions) f.linkName};
+    for (final name in externNames) {
+      if (definedNames.contains(name)) {
+        throw DccLowerError(
+          '"$name" is declared `@extern` but this compilation unit also '
+          'defines a `@bare` function with that name — one symbol cannot be '
+          'both imported and exported by the same object file',
+        );
+      }
     }
 
     // (ADR-0022) Synthesize one destructor DCFunction per HeapObject
@@ -93,7 +134,11 @@ Future<DCModule> lowerToDCModule(
     // GAP-0017 item 2's correction.
     final elidedFunctions = functions.map(elideRedundantRetainReleasePairs).toList();
 
-    return DCModule(name: dartSourcePath, functions: elidedFunctions);
+    return DCModule(
+      name: dartSourcePath,
+      functions: elidedFunctions,
+      externFunctions: externFunctions,
+    );
   } finally {
     compileResult.dispose();
   }
@@ -139,6 +184,152 @@ DCFunction _buildDestructor(String linkName, List<_StructField> fields) {
     mode: DCMode.bare,
     blocks: [DCBasicBlock(id: BlockId(0), params: [selfValue], body: instructions)],
   );
+}
+
+/// Collects every `@extern external` declaration in [library] as a
+/// [DCExternFunction] (DCDART_SPEC.md §9,
+/// docs/decisions/0038-extern-symbols-and-linking.md).
+///
+/// This function's OUTPUT is load-bearing beyond codegen: it is the exact set
+/// of undefined symbols the emitted object file is permitted to carry, which
+/// `dcc` writes out as a manifest and `scripts/verify-freestanding.sh` checks
+/// `nm -u` against (CLAUDE.md rule 1,
+/// docs/escalations/0003-extern-c-calls-vs-freestanding.md). Every rejection
+/// below is therefore a rejection of a symbol that would otherwise have to be
+/// permitted, not merely a codegen limitation.
+List<DCExternFunction> _collectExternDeclarations(
+  Library library, {
+  required Uri preludeUri,
+  required _HeapLayouts heapLayouts,
+}) {
+  final result = <DCExternFunction>[];
+  final seen = <String>{};
+
+  for (final proc in library.procedures) {
+    if (!_hasMarkerAnnotation(proc.annotations, '_Extern', preludeUri)) continue;
+    final name = proc.name.text;
+
+    // `external` is Dart's own "declared here, defined elsewhere" keyword,
+    // and front_end already guarantees such a declaration has no body.
+    // Requiring it means the SOURCE reads as a declaration to a human too,
+    // not just to dcc-lower — an `@extern` on something with a body would be
+    // a function whose body is silently discarded.
+    if (!proc.isExternal) {
+      throw DccLowerError(
+        '"$name" is annotated `@extern` but is not declared `external` — an '
+        'external C symbol has no body here. Write: '
+        '`@extern external <type> $name(...);`',
+      );
+    }
+    if (proc.function.body != null) {
+      throw DccLowerError(
+        '"$name" is `@extern external` but still carries a body in Kernel IR '
+        '— dcc-lower will not silently discard it',
+      );
+    }
+    if (_hasMarkerAnnotation(proc.annotations, '_Bare', preludeUri)) {
+      throw DccLowerError(
+        '"$name" is annotated both `@extern` and `@bare` — a symbol is either '
+        'defined by this compilation unit (`@bare`) or imported from another '
+        'object file (`@extern`), never both',
+      );
+    }
+    if (!proc.isStatic || proc.kind != ProcedureKind.Method) {
+      throw DccLowerError(
+        '"$name" is `@extern` but is not a plain top-level function '
+        '(kind ${proc.kind}) — getters, setters, operators and instance '
+        'members have no C-ABI spelling',
+      );
+    }
+    if (!seen.add(name)) {
+      throw DccLowerError('"$name" is declared `@extern` more than once');
+    }
+
+    final fn = proc.function;
+    if (fn.namedParameters.isNotEmpty || fn.requiredParameterCount != fn.positionalParameters.length) {
+      throw DccLowerError(
+        '"$name": an `@extern` C symbol takes positional, required '
+        'parameters only — C has no named or optional parameters',
+      );
+    }
+    if (fn.typeParameters.isNotEmpty) {
+      throw DccLowerError(
+        '"$name": an `@extern` C symbol cannot be generic — C symbols are '
+        'monomorphic by construction',
+      );
+    }
+
+    final paramTypes = <DCType>[];
+    for (final param in fn.positionalParameters) {
+      paramTypes.add(
+        _externSignatureType(
+          param.type,
+          preludeUri: preludeUri,
+          heapLayouts: heapLayouts,
+          context: '"$name" param ${param.name}',
+          allowVoid: false,
+        ),
+      );
+    }
+    final returnType = _externSignatureType(
+      fn.returnType,
+      preludeUri: preludeUri,
+      heapLayouts: heapLayouts,
+      context: '"$name" return type',
+      allowVoid: true,
+    );
+
+    result.add(
+      DCExternFunction(linkName: name, paramTypes: paramTypes, returnType: returnType),
+    );
+  }
+
+  return result;
+}
+
+/// [_lowerSignatureType] plus the two refusals that are specific to a symbol
+/// crossing OUT of DCDart into code the compiler cannot see.
+///
+/// `HeapObject` and `Weak<T>` are rejected on purpose. They are ARC-managed
+/// (spec §3.1): handing one to a C function raises an ownership question —
+/// does the callee consume the reference, borrow it, or retain it? — that
+/// nothing in this project has decided. `@owned` (ADR-0021) answers it for
+/// DCDart-to-DCDart calls precisely because both sides are compiled here;
+/// neither side of that machinery exists for C. Picking a convention silently
+/// would be a memory-model decision made by an implementation unit, which
+/// CLAUDE.md rule 4 forbids. Recorded as a sub-item of GAP-0019 instead.
+///
+/// NOTE the asymmetry with `c_header.dart` (ADR-0034), which DOES map a
+/// `DCHeapPointer` — to an opaque `DCHeapRef` that C is told never to
+/// dereference or free. That direction is safe because the DCDart side still
+/// owns the object and C merely holds a token. Inbound, C would be the one
+/// receiving something it might store, free or race on.
+DCType _externSignatureType(
+  DartType type, {
+  required Uri preludeUri,
+  required _HeapLayouts heapLayouts,
+  required String context,
+  required bool allowVoid,
+}) {
+  if (type is VoidType) {
+    if (allowVoid) return const DCVoid();
+    throw DccLowerError('$context: void is not a parameter type');
+  }
+  final lowered = _lowerSignatureType(
+    type,
+    preludeUri: preludeUri,
+    heapLayouts: heapLayouts,
+    context: context,
+  );
+  if (lowered is DCHeapPointer || lowered is DCWeakPointer) {
+    throw DccLowerError(
+      '$context: an ARC-managed HeapObject/Weak<T> cannot appear in an '
+      '`@extern` C signature — the ownership convention across that boundary '
+      'is undecided (docs/known-gaps.md GAP-0019, CLAUDE.md rule 4). Pass a '
+      'plain sized integer or a Pointer<T> instead',
+    );
+  }
+  return lowered;
 }
 
 bool _hasMarkerAnnotation(List<Expression> annotations, String className, Uri preludeUri) {
@@ -437,7 +628,23 @@ class _BareFunctionLowerer {
   // exit.
   final List<VariableDeclaration> _weakLocals = [];
 
-  _BareFunctionLowerer(this.proc, this.preludeUri, this.structLayouts, this.heapLayouts);
+  /// The link names of every `@extern` declaration collected at module scope
+  /// (ADR-0038). A call site checks membership here rather than trusting the
+  /// annotation on the resolved target alone: Kernel IR will happily resolve
+  /// a `StaticInvocation` to an `@extern` procedure in a DIFFERENT library
+  /// (an import), which this module never scanned and therefore never
+  /// declared, never emitted a `declare` for, and never put in the manifest
+  /// `verify-freestanding.sh` reads. That would be an undefined symbol
+  /// nobody accounted for — the exact failure the manifest exists to prevent.
+  final Set<String> externNames;
+
+  _BareFunctionLowerer(
+    this.proc,
+    this.preludeUri,
+    this.structLayouts,
+    this.heapLayouts,
+    this.externNames,
+  );
 
   ValueId _allocId() => ValueId(_nextValueIndex++);
   BlockId _allocBlockId() => BlockId(_nextBlockIndex++);
@@ -723,13 +930,42 @@ class _BareFunctionLowerer {
           _addInstr(PortOut(port: port, value: value));
           return;
         }
+
+        // (ADR-0038) A call, as a statement, to a `@bare` sibling or an
+        // `@extern` C symbol. This is where a void-returning callee is
+        // finally reachable in general — ADR-0018 recorded the gap, ADR-0029
+        // opened a single hardcoded hole in it for `Port.outb`, and `void`
+        // being the single most common C return type is what made the
+        // general case worth building.
+        //
+        // VOID ONLY, deliberately. Discarding a non-void result is legal
+        // Dart, but a discarded `HeapObject` return is a leak under this
+        // project's naive release policy (ADR-0016: only values bound to a
+        // tracked local are ever released), and silently leaking is worse
+        // than refusing. Scalar discards are refused too, for one rule
+        // instead of two — bind the result to a local, which costs nothing.
+        final isBare = _hasMarkerAnnotation(target.annotations, '_Bare', preludeUri);
+        final isExtern = _hasMarkerAnnotation(target.annotations, '_Extern', preludeUri);
+        if (isBare || isExtern) {
+          if (target.function.returnType is! VoidType) {
+            throw DccLowerError(
+              '"$context": "${target.name.text}" returns a value, but its '
+              'result is discarded here — bind it to a local '
+              '(`final _unused = ${target.name.text}(...);`). Only '
+              'void-returning calls may stand alone as a statement',
+            );
+          }
+          _lowerCallTo(expr, target, allowVoid: true);
+          return;
+        }
       }
       throw DccLowerError(
         '"$context": unsupported expression statement $expr '
         '(${expr.runtimeType}) — M1 only understands `pointer.value = x;`, '
         '`structInstance.field = x;`, `heapInstance.field = x;` (scalar '
-        'fields only), scalar local reassignment (`x = <expr>;`), and '
-        '`Port.outb(port, value);`',
+        'fields only), scalar local reassignment (`x = <expr>;`), '
+        '`Port.outb(port, value);`, and a call to a `@bare` or `@extern` '
+        'function as a statement',
       );
     }
 
@@ -1182,36 +1418,6 @@ class _BareFunctionLowerer {
     if (expr is StaticInvocation) {
       final target = expr.target;
 
-      if (target.isExtensionTypeMember &&
-          target.name.text == 'u64|+' &&
-          target.enclosingLibrary.importUri == preludeUri) {
-        return _lowerU64Binary(expr, (dest, lhs, rhs) {
-          _addInstr(IAdd(dest: dest, lhs: lhs, rhs: rhs, overflow: Overflow.trapping));
-        }, DCInt.u64);
-      }
-
-      if (target.isExtensionTypeMember &&
-          target.name.text == 'u64|<' &&
-          target.enclosingLibrary.importUri == preludeUri) {
-        // DCBool assigned directly, same as u64|+ assigns DCInt.u64 directly
-        // -- never consult front_end's inferred (real, unbound-under
-        // --no-link-platform) `bool` type. See ADR-0014.
-        return _lowerU64Binary(expr, (dest, lhs, rhs) {
-          _addInstr(ICmp(dest: dest, predicate: ICmpPredicate.ult, lhs: lhs, rhs: rhs));
-        }, const DCBool());
-      }
-
-      if (target.isExtensionTypeMember &&
-          target.name.text == 'u64|-' &&
-          target.enclosingLibrary.importUri == preludeUri) {
-        // (M2, ADR-0026) ISub already existed and had real backend codegen
-        // since M0 -- only the source-level `-` operator and this
-        // recognition were missing.
-        return _lowerU64Binary(expr, (dest, lhs, rhs) {
-          _addInstr(ISub(dest: dest, lhs: lhs, rhs: rhs, overflow: Overflow.trapping));
-        }, DCInt.u64);
-      }
-
       // Bitwise ops (`&`/`|`/`^`/`<<`/`>>`) for u8/u16/u32/u64 -- added for
       // oscortex_core's interrupts milestone (IDT/PIC/UART register
       // manipulation). One generalized check rather than 20 near-identical
@@ -1235,16 +1441,80 @@ class _BareFunctionLowerer {
             _ => null,
           };
           final op = target.name.text.substring(sep + 1);
+
+          // The DEST type is not always the operand width: a comparison
+          // consumes two ints and produces a DCBool. Getting this wrong is
+          // silent -- the ICmp would be emitted with an integer dest type
+          // and `llvm_emit` would print `icmp` into an iN slot -- so the
+          // dest type is chosen per-op here, alongside the instruction,
+          // rather than defaulted from `widthType` (ADR-0035).
+          //
+          // DCBool is assigned DIRECTLY, never read from front_end's
+          // inferred `bool` type: under --no-link-platform that type is a
+          // real but unbound platform node that crashes on inspection.
+          // Same discipline ADR-0014 established for Result.
+          final destType = switch (op) {
+            '&' || '|' || '^' || '<<' || '>>' => widthType,
+            '+' || '-' || '*' || '~/' || '%' => widthType,
+            '<' || '<=' || '>' || '>=' => const DCBool(),
+            _ => null,
+          };
+
+          // Every sized-int type the prelude exposes is UNSIGNED (spec
+          // §4.1's signed i8..i64 have no prelude support yet), so the
+          // unsigned predicates are the correct choice. `llvm_emit` prints
+          // `predicate.name` verbatim and derives NO signedness of its own,
+          // so a signed type landing here later must select the `s`-prefixed
+          // predicates at THIS site, not downstream.
           final emit = switch (op) {
             '&' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IAnd(dest: dest, lhs: lhs, rhs: rhs)),
             '|' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IOr(dest: dest, lhs: lhs, rhs: rhs)),
             '^' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IXor(dest: dest, lhs: lhs, rhs: rhs)),
             '<<' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IShl(dest: dest, lhs: lhs, rhs: rhs)),
             '>>' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IShr(dest: dest, lhs: lhs, rhs: rhs)),
+            // Arithmetic traps on overflow (spec §4.1). `*` needed no new
+            // DC-IR node or backend work: IMul has existed with real
+            // codegen since M0 and simply had no operator wired to it.
+            '+' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IAdd(dest: dest, lhs: lhs, rhs: rhs, overflow: Overflow.trapping)),
+            '-' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(ISub(dest: dest, lhs: lhs, rhs: rhs, overflow: Overflow.trapping)),
+            '*' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IMul(dest: dest, lhs: lhs, rhs: rhs, overflow: Overflow.trapping)),
+            // `~/` and `%` carry no Overflow flag -- their failure mode is a
+            // zero divisor, trapped explicitly in the backend (ADR-0036).
+            '~/' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IDiv(dest: dest, lhs: lhs, rhs: rhs)),
+            '%' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(IRem(dest: dest, lhs: lhs, rhs: rhs)),
+            '<' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(ICmp(dest: dest, predicate: ICmpPredicate.ult, lhs: lhs, rhs: rhs)),
+            '<=' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(ICmp(dest: dest, predicate: ICmpPredicate.ule, lhs: lhs, rhs: rhs)),
+            '>' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(ICmp(dest: dest, predicate: ICmpPredicate.ugt, lhs: lhs, rhs: rhs)),
+            '>=' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(ICmp(dest: dest, predicate: ICmpPredicate.uge, lhs: lhs, rhs: rhs)),
             _ => null,
           };
-          if (widthType != null && emit != null) {
-            return _lowerU64Binary(expr, emit, widthType);
+          if (widthType != null && emit != null && destType != null) {
+            return _lowerU64Binary(expr, emit, destType);
+          }
+
+          // Explicit width conversions (`.toU8()`/`.toU16()`/`.toU32()`/
+          // `.toU64()`, spec §4.1, ADR-0037). UNARY, unlike every operator
+          // above: an extension-type method call passes only the receiver
+          // positionally, so this cannot go through `_lowerU64Binary`.
+          final convertTo = switch (op) {
+            'toU8' => DCInt.u8,
+            'toU16' => DCInt.u16,
+            'toU32' => DCInt.u32,
+            'toU64' => DCInt.u64,
+            _ => null,
+          };
+          if (widthType != null && convertTo != null) {
+            final args = expr.arguments.positional;
+            if (args.length != 1) {
+              throw DccLowerError(
+                '"$context": ${target.name.text} with ${args.length} '
+                'arguments, expected 1 (the receiver)',
+              );
+            }
+            final source = _lowerExpression(args.single);
+            final dest = DCValue(_allocId(), convertTo);
+            _addInstr(IConvert(dest: dest, source: source));
+            return dest;
           }
         }
       }
@@ -1278,15 +1548,29 @@ class _BareFunctionLowerer {
         };
         if (sizedIntType != null) {
           final arg = expr.arguments.positional.single;
-          if (arg is! IntLiteral) {
+          // A named `const int` is NOT an IntLiteral by the time it reaches
+          // us: the CFE has already evaluated it and replaced the reference
+          // with a `ConstantExpression` wrapping an `IntConstant`. Both
+          // spellings mean the same compile-time integer, so both are
+          // accepted -- otherwise `const stride = 4;` is rejected while a
+          // bare `4` works, which is a confusing distinction with no
+          // reason behind it (found by writing examples/demo-stats, ADR-0037).
+          final int bits;
+          if (arg is IntLiteral) {
+            bits = arg.value;
+          } else if (arg is ConstantExpression &&
+              arg.constant is IntConstant) {
+            bits = (arg.constant as IntConstant).value;
+          } else {
             throw DccLowerError(
               '"$context": a $sizedIntType literal constructed from a '
-              'non-literal expression $arg (${arg.runtimeType}) — only '
-              'integer-literal arguments are handled',
+              'non-constant expression $arg (${arg.runtimeType}) — the '
+              'argument must be an integer literal or a compile-time '
+              'integer constant',
             );
           }
           final dest = DCValue(_allocId(), sizedIntType);
-          _addInstr(ConstInt(dest: dest, bits: arg.value));
+          _addInstr(ConstInt(dest: dest, bits: bits));
           return dest;
         }
       }
@@ -1329,6 +1613,16 @@ class _BareFunctionLowerer {
       // function declared later in the source works the same as one
       // declared earlier).
       if (_hasMarkerAnnotation(target.annotations, '_Bare', preludeUri)) {
+        return _lowerBareCall(expr, target);
+      }
+
+      // (ADR-0038) A call to an `@extern` C-ABI symbol. Recognized in the
+      // same last position and lowered through the SAME `Call` instruction
+      // as the `@bare` case above — the two are indistinguishable at the
+      // call site by design (see DCExternFunction's doc comment); the only
+      // difference is that the backend emits a `declare` instead of a
+      // `define` for the callee.
+      if (_hasMarkerAnnotation(target.annotations, '_Extern', preludeUri)) {
         return _lowerBareCall(expr, target);
       }
     }
@@ -1437,10 +1731,77 @@ class _BareFunctionLowerer {
       }
     }
 
+    // `a == b` and `a != b` on sized ints (ADR-0035).
+    //
+    // These CANNOT go through the `"<width>|<op>"` StaticInvocation path
+    // every other operator uses, because Dart refuses to let an extension
+    // type declare `operator ==` at all ("This extension member conflicts
+    // with Object member '=='"). So there is no `u64|==` procedure for the
+    // prelude to declare or for lowering to match on. Instead the CFE emits
+    // a distinct node: `a == b` becomes an `EqualsCall` bound to
+    // `dart:core::Object::==`, and `a != b` becomes `Not(EqualsCall)`.
+    //
+    // Matching on the LOWERED operand types rather than on front_end's
+    // inferred static types is deliberate, and follows ADR-0014's rule: an
+    // inferred `bool`/`Object` type here is a real but unbound platform
+    // node under `--no-link-platform` and crashes on inspection. The DC-IR
+    // values we just produced carry the width we actually need.
+    if (expr is EqualsCall) {
+      return _lowerIntEquality(expr, negated: false);
+    }
+    if (expr is Not) {
+      final operand = expr.operand;
+      if (operand is EqualsCall) {
+        return _lowerIntEquality(operand, negated: true);
+      }
+      // A general boolean `!` needs a NOT on an i1, which DC-IR has no
+      // instruction for. `!=` is handled above as a single `icmp ne` rather
+      // than "compare then invert", so nothing needs it yet; a real `!`
+      // operator is left unimplemented instead of faked (GAP-0023).
+      throw DccLowerError(
+        '"$context": `!` is only supported as part of `!=` on sized ints; '
+        'a general boolean NOT has no DC-IR instruction yet (GAP-0023)',
+      );
+    }
+
     throw DccLowerError(
       '"$context": unsupported expression $expr (${expr.runtimeType}) — see '
       'core/dcc-lower/README.md for exactly what is handled',
     );
+  }
+
+  /// `a == b` / `a != b` where both sides are the same sized-int type.
+  ///
+  /// Rejects mismatched widths rather than inserting an implicit
+  /// extension/truncation: DCDart has no implicit integer conversions
+  /// (spec §4.1), and silently widening one side here would be exactly the
+  /// kind of invisible conversion the sized-int model exists to prevent.
+  DCValue _lowerIntEquality(EqualsCall expr, {required bool negated}) {
+    final lhs = _lowerExpression(expr.left);
+    final rhs = _lowerExpression(expr.right);
+    final lhsType = lhs.type;
+    final rhsType = rhs.type;
+    if (lhsType is! DCInt || rhsType is! DCInt) {
+      throw DccLowerError(
+        '"$context": ${negated ? '!=' : '=='} is only supported between two '
+        'sized integers, got $lhsType and $rhsType',
+      );
+    }
+    if (lhsType.width != rhsType.width || lhsType.signed != rhsType.signed) {
+      throw DccLowerError(
+        '"$context": ${negated ? '!=' : '=='} between different integer '
+        'types ($lhsType vs $rhsType). DCDart has no implicit integer '
+        'conversions — convert one side explicitly.',
+      );
+    }
+    final dest = DCValue(_allocId(), const DCBool());
+    _addInstr(ICmp(
+      dest: dest,
+      predicate: negated ? ICmpPredicate.ne : ICmpPredicate.eq,
+      lhs: lhs,
+      rhs: rhs,
+    ));
+    return dest;
   }
 
   /// `siblingFn(args...)` -- a call to another `@bare` top-level function
@@ -1455,28 +1816,81 @@ class _BareFunctionLowerer {
   /// still has an independent, still-tracked reference to the same value
   /// (an existing local, a field read -- anything that isn't fresh), that
   /// reference needs its own retain to avoid the callee's release
-  /// under-counting it. A void-returning callee is deliberately NOT
-  /// handled here -- this method is only reached from expression contexts
-  /// that need a value back (`_lowerExpression`'s non-nullable return
-  /// type); calling a void function as a bare statement would need
-  /// separate `ExpressionStatement` handling that hasn't been written
-  /// because no conformance target has needed it yet.
+  /// under-counting it.
+  ///
+  /// (ADR-0038) Also lowers a call to an `@extern` C-ABI symbol — the same
+  /// `Call` instruction, deliberately: the two are identical at the call
+  /// site and differ only in whether the backend emits a `define` or a
+  /// `declare` for the callee.
   DCValue _lowerBareCall(StaticInvocation expr, Procedure target) {
+    final result = _lowerCallTo(expr, target, allowVoid: false);
+    if (result == null) {
+      throw DccLowerError(
+        '"$context": internal error — _lowerCallTo returned no value with '
+        'allowVoid: false (dcc-lower bug, not a source error)',
+      );
+    }
+    return result;
+  }
+
+  /// The call-lowering body shared by expression and statement context.
+  /// Returns `null` exactly when the callee returns void, which is only
+  /// reachable with [allowVoid] set — `_lowerExpression` has a non-nullable
+  /// return type and cannot represent "no value" (ADR-0018 recorded this;
+  /// ADR-0038 is where a real target — a `void` C function — finally needed
+  /// the statement side of it, closing the other half of the gap ADR-0029
+  /// opened for `Port.outb` alone).
+  DCValue? _lowerCallTo(
+    StaticInvocation expr,
+    Procedure target, {
+    required bool allowVoid,
+  }) {
     final calleeFn = target.function;
     final returnType = calleeFn.returnType;
-    if (returnType is VoidType) {
+    final isExtern = _hasMarkerAnnotation(target.annotations, '_Extern', preludeUri);
+    if (isExtern && !externNames.contains(target.name.text)) {
+      // See `externNames`'s doc comment: an `@extern` resolved from another
+      // library was never collected here, so it has no `declare` and is not
+      // in the manifest verify-freestanding.sh reads.
       throw DccLowerError(
-        '"$context": call to "${target.name.text}", which returns void -- '
-        'void-returning function calls are only supported as a top-level '
-        'statement, not implemented yet (this call is used as an '
-        'expression, which needs a value)',
+        '"$context": call to `@extern` symbol "${target.name.text}", which is '
+        'declared in ${target.enclosingLibrary.importUri}, not in this '
+        'compilation unit — declare it in this file so the symbol is recorded '
+        'in this object\'s extern manifest '
+        '(docs/decisions/0038-extern-symbols-and-linking.md)',
       );
+    }
+    if (returnType is VoidType) {
+      if (!allowVoid) {
+        throw DccLowerError(
+          '"$context": call to "${target.name.text}", which returns void -- '
+          'a void call has no value, so it can only appear as a statement '
+          'on its own line, not inside an expression',
+        );
+      }
+      _lowerCallArgs(expr, target, dest: null);
+      return null;
     }
     final calleeReturnType = _lowerType(
       returnType,
       context: '"${target.name.text}" return type (called from "$context")',
     );
 
+    final dest = DCValue(_allocId(), calleeReturnType);
+    _lowerCallArgs(expr, target, dest: dest);
+    return dest;
+  }
+
+  /// Lowers a call's arguments and emits the `Call`. Split out of
+  /// [_lowerCallTo] (ADR-0038) so the void case — which has no `dest` to
+  /// allocate — runs the identical argument path instead of a second copy of
+  /// it.
+  void _lowerCallArgs(
+    StaticInvocation expr,
+    Procedure target, {
+    required DCValue? dest,
+  }) {
+    final calleeFn = target.function;
     final calleeParams = calleeFn.positionalParameters;
     final callArgs = expr.arguments.positional;
     if (calleeParams.length != callArgs.length) {
@@ -1535,9 +1949,7 @@ class _BareFunctionLowerer {
       loweredArgs.add(arg);
     }
 
-    final dest = DCValue(_allocId(), calleeReturnType);
     _addInstr(Call(dest: dest, targetName: target.name.text, args: loweredArgs, argOwnership: argOwnership));
-    return dest;
   }
 
   DCValue _lowerU64Binary(
@@ -1868,7 +2280,22 @@ class _BareFunctionLowerer {
     return _lowerType(typeArgs.single, context: '$context Pointer type argument');
   }
 
-  DCType _lowerType(DartType type, {required String context}) {
+  /// Thin delegate to the shared [_lowerSignatureType]. Extracted (ADR-0038)
+  /// so extern DECLARATIONS — which have no `_BareFunctionLowerer` at all,
+  /// being collected at module scope before any function is lowered — map
+  /// their parameter and return types through the exact same code path a
+  /// defined function's signature does, rather than a second, drifting copy.
+  DCType _lowerType(DartType type, {required String context}) =>
+      _lowerSignatureType(type, preludeUri: preludeUri, heapLayouts: heapLayouts, context: context);
+}
+
+DCType _lowerSignatureType(
+  DartType type, {
+  required Uri preludeUri,
+  required _HeapLayouts heapLayouts,
+  required String context,
+}) {
+  if (true) {
     if (type is ExtensionType) {
       final decl = type.extensionTypeDeclaration;
       if (decl.enclosingLibrary.importUri == preludeUri) {

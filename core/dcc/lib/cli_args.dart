@@ -12,6 +12,10 @@
 // (`--mode`, input path, `-o`/`--output`). Extend as later milestones add
 // subcommands -- do not pre-build flags nothing calls yet.
 
+import 'dart:io' show Platform;
+
+import 'package:backend/targets.dart';
+
 /// The two compilation modes from DCDART_SPEC.md §2. `[LOAD-BEARING]` --
 /// do not add a third value or rename these without a spec change.
 enum BuildMode {
@@ -36,15 +40,29 @@ class BuildOptions {
   final String inputPath;
   final String outputPath;
 
+  /// Which machine/OS/object-format to emit for (ADR-0033). Orthogonal to
+  /// [mode] -- see backend/lib/targets.dart's header for why. Defaults to
+  /// [DCTarget.defaultTarget], so an invocation that predates `--target`
+  /// compiles exactly the object it always did.
+  final DCTarget target;
+
+  /// Where to write the generated C header, or null if `--emit-header` was
+  /// not passed (ADR-0034). Emitting a header does not replace the object
+  /// file; both are produced.
+  final String? headerPath;
+
   const BuildOptions({
     required this.mode,
     required this.inputPath,
     required this.outputPath,
+    this.target = DCTarget.defaultTarget,
+    this.headerPath,
   });
 
   @override
   String toString() =>
-      'dcc build --mode ${mode.name} $inputPath -o $outputPath';
+      'dcc build --mode ${mode.name} --target $target $inputPath '
+      '-o $outputPath${headerPath == null ? '' : ' --emit-header $headerPath'}';
 }
 
 /// Thrown for any argument-parsing problem: unknown command, missing
@@ -68,13 +86,20 @@ class CliHelpRequested implements Exception {
 }
 
 const String usage = '''
-Usage: dcc build --mode <bare|hosted> <input.dart> -o <output.o>
+Usage: dcc build --mode <bare|hosted> [--target <target>] <input.dart> -o <output.o>
 
 Commands:
   build     Compile a DCDart source file to a native object file.
 
 Options for build:
   --mode <bare|hosted>     Compilation mode (DCDART_SPEC.md §2). Required.
+  --target <target>        Machine/OS to emit for. Optional; defaults to
+                           bare-x86_64. Use "host" for the current machine.
+                           Orthogonal to --mode: a @bare object is a plain
+                           C-ABI object and links into an ordinary native
+                           program on any of these.
+  --emit-header <path>     Also write a C header declaring every exported
+                           function, so C/Rust/Python can FFI into it.
   -o, --output <path>      Output object file path. Required.
   <input.dart>             Positional. Path to the DCDart source file.
 
@@ -91,7 +116,11 @@ Exit codes:
 /// Parses the full `dcc <command> [args...]` invocation (argv without the
 /// program name). Only `build` exists at M0; anything else is a usage
 /// error, not a silently-ignored no-op.
-BuildOptions parseArgs(List<String> args) {
+BuildOptions parseArgs(
+  List<String> args, {
+  String? hostOsName,
+  String? hostArchName,
+}) {
   if (args.isEmpty) {
     throw CliUsageError('dcc: missing command\n\n$usage');
   }
@@ -104,13 +133,23 @@ BuildOptions parseArgs(List<String> args) {
     throw CliUsageError('dcc: unknown command "$command"\n\n$usage');
   }
 
-  return _parseBuildArgs(args.skip(1).toList());
+  return _parseBuildArgs(
+    args.skip(1).toList(),
+    hostOsName: hostOsName ?? Platform.operatingSystem,
+    hostArchName: hostArchName ?? Platform.version,
+  );
 }
 
-BuildOptions _parseBuildArgs(List<String> args) {
+BuildOptions _parseBuildArgs(
+  List<String> args, {
+  required String hostOsName,
+  required String hostArchName,
+}) {
   BuildMode? mode;
   String? outputPath;
   String? inputPath;
+  DCTarget? target;
+  String? headerPath;
 
   var i = 0;
   while (i < args.length) {
@@ -134,6 +173,40 @@ BuildOptions _parseBuildArgs(List<String> args) {
         );
       }
       mode = parsed;
+      i += 2;
+      continue;
+    }
+
+    if (arg == '--target') {
+      if (i + 1 >= args.length) {
+        throw CliUsageError(
+          'dcc build: --target requires a value\n\n${DCTarget.describeAll()}',
+        );
+      }
+      final value = args[i + 1];
+      try {
+        target = DCTarget.parse(
+          value,
+          hostOsName: hostOsName,
+          hostArchName: hostArchName,
+        );
+      } on UnsupportedTargetError catch (e) {
+        // A bad --target is a usage error like any other bad flag value, so
+        // it exits 64 rather than 1. The registry's own message already
+        // lists every supported target, so it is passed through unchanged.
+        throw CliUsageError('dcc build: ${e.message}');
+      }
+      i += 2;
+      continue;
+    }
+
+    if (arg == '--emit-header') {
+      if (i + 1 >= args.length) {
+        throw CliUsageError(
+          'dcc build: --emit-header requires a value (output .h path)',
+        );
+      }
+      headerPath = args[i + 1];
       i += 2;
       continue;
     }
@@ -176,5 +249,7 @@ BuildOptions _parseBuildArgs(List<String> args) {
     mode: mode!,
     inputPath: inputPath!,
     outputPath: outputPath!,
+    target: target ?? DCTarget.defaultTarget,
+    headerPath: headerPath,
   );
 }

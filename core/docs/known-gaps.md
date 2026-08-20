@@ -4,6 +4,158 @@ Work queue, not a confession log (`CLAUDE.md`). Every entry: what was worked aro
 
 ---
 
+## GAP-0026 — No signed sized-integer types, so a C `int` parameter has to be declared `u32`
+
+**Domain:** dcc-lower, runtime prelude (M1/M2, surfaced by ADR-0038's extern FFI)
+**Status:** OPEN — ABI-correct today, interpretation-incorrect for negative values
+
+`DCDART_SPEC.md` §4.1 `[LOAD-BEARING]` lists `i8 i16 i32 i64 isize` alongside the unsigned widths, and
+`dc-ir/lib/types.dart`'s `DCInt` already carries a `signed` flag the backend honours (`IShr` picks
+logical vs. arithmetic shift from it, ADR-0030). **The prelude implements only the unsigned half.**
+There is no way to write a signed sized integer in DCDart source at all.
+
+Harmless until ADR-0038, because nothing crossed an ABI boundary where the distinction was visible.
+It is visible now: `core/examples/ffi-extern/libc_calls.dart` declares `int ffs(int)` as
+`u32 ffs(u32)`. That is **ABI-correct** — `int` and `uint32_t` are the same 32-bit register operand on
+both SysV-AMD64 and AAPCS64, differing only in interpretation — and every value the conformance target
+uses is inside `0..2^31-1`, where the two interpretations agree. It would be **wrong** for a C
+function that returns a negative value (`strcmp`, `read`'s `-1`, any `errno`-style API), which DCDart
+would read as a huge unsigned number with no diagnostic anywhere.
+
+**Cost of the workaround:** the extern surface is honest only for non-negative values, and the ADR and
+the example both say so in a comment rather than leaving it as a trap. Any C API with a negative
+sentinel is currently un-declarable correctly. Fixing it is prelude + `_lowerSignatureType` work, not
+a backend change — `DCInt.signed` is already threaded through.
+
+---
+
+## GAP-0025 — `Pointer<T>` cannot appear in a function signature, which most real C APIs need
+
+**Domain:** dcc-lower (M1, surfaced by ADR-0038's extern FFI)
+**Status:** OPEN — pre-existing limit, not widened by ADR-0038, but now load-bearing
+
+`_lowerSignatureType` maps `u8`/`u16`/`u32`/`u64` (extension types), `Result`, `HeapObject`
+subclasses, and `Weak<T>`. It does **not** map `Pointer<T>`, in parameter or return position, and
+throws naming the type. `Pointer<T>` has worked since ADR-0010 only as a LOCAL: constructed via
+`Pointer<T>.fromAddress(...)`, read/written via `.value`, never passed or returned.
+
+Nothing before ADR-0038 needed it — every conformance target that used a pointer built it inside the
+function that used it. Extern FFI makes it immediately load-bearing, because most of libc takes one:
+`strlen`, `memcpy`, `write`, `read`, `fopen`, and every "out parameter" API. ADR-0038's conformance
+target routes around it by choosing three integer-only libc functions (`ffs`, `toupper`, `putchar`),
+which is enough to prove the mechanism but not enough to call an interesting C library.
+
+**Cost of the workaround:** the extern feature is real but its reach is narrow — integer-and-struct
+signatures only. `oscortex_core`'s likely first uses (an assembly helper taking a register value, an
+IDT-loading stub) fit inside that; a real C driver library would not. Extending
+`_lowerSignatureType` for `Pointer<T>` is a small, self-contained change once a target needs it;
+whoever does it should also decide whether `Pointer<Void>`/`void *` needs a spelling, which the
+prelude has no type for today.
+
+---
+
+## GAP-0024 — Signed integer division is rejected, not implemented (needs an INT_MIN/-1 guard)
+
+**Domain:** backend (M2)
+**Status:** OPEN — unreachable today; rejected loudly rather than emitted wrong
+
+`_emitDivRem` (ADR-0036) throws a specific `BackendError` if the dest type is a signed `DCInt`.
+Unsigned division needs one guard (zero divisor); signed division needs a second, because
+`INT_MIN / -1` overflows and is undefined behaviour in LLVM just as a zero divisor is. Only the first
+guard is implemented.
+
+This is unreachable right now: `runtime/dc-core-bare/prelude.dart` exposes only unsigned sized-int
+types, so no signed value can reach the emitter. It is rejected anyway so that adding signed types
+later cannot silently inherit codegen that is wrong in one corner.
+
+**Cost of the workaround:** none today. When signed types land, this must be implemented in the same
+change — as must the signed comparison predicates (ADR-0035 selects `ult`/`ule`/`ugt`/`uge`
+unconditionally at the recognition site in `dcc-lower`, NOT in the backend, so that is the place that
+has to learn about signedness). Both failures would be silent.
+
+---
+
+## GAP-0023 — No general boolean NOT; `!` works only as part of `!=`
+
+**Domain:** dc-ir, dcc-lower (M2)
+**Status:** OPEN
+
+DC-IR has no NOT instruction. `!=` does not need one — ADR-0035 lowers `a != b` to a single
+`icmp ne`, not to "compare then invert" — but a standalone `!flag`, or `!(a < b)`, has nothing to
+lower to. `_lowerExpression` now throws a specific error naming this gap instead of the generic
+"unsupported expression".
+
+Implementing it is small (`xor i1 %v, true`, or a dedicated `INot`), but it raises a question worth
+answering deliberately rather than by accident: DC-IR currently has no boolean-valued instruction
+other than `ICmp`, and `DCBool` values only ever flow into `CondBranch`. A general `!` is the first
+thing that would make booleans a real first-class value in the IR, which also affects whether
+`DCBool` can appear in a function signature (today it cannot — ADR-0034 rejects it at the C ABI).
+
+**Cost of the workaround:** invert the comparison by hand (`a >= b` instead of `!(a < b)`), or swap
+the `if`/`else` branches. Both always possible, both a real readability tax. `&&` and `||` are
+separately absent and are a larger question (short-circuit evaluation needs control flow, not an
+instruction).
+
+---
+
+## GAP-0022 — Generated C headers emit structs in signature order, which is not guaranteed to be valid C
+
+**Domain:** backend / FFI (M2)
+**Status:** OPEN — unbuildable in the language today
+
+`_collectStructs` in `backend/lib/c_header.dart` (ADR-0034) emits each distinct struct type in the
+order it is first seen across function signatures. If a struct had a field whose type is another
+struct, C would require the inner one to be defined first, and signature order does not guarantee
+that. The generated header would fail to compile.
+
+No DCDart program can build that shape: `@packed` structs hold scalars and pointers only. So this is
+a latent ordering bug with no reachable trigger, recorded rather than fixed speculatively. The fix
+when it becomes reachable is a topological sort over field types, which is also when a cycle (two
+structs pointing at each other) becomes a real case needing a forward declaration.
+
+**Cost of the workaround:** none today.
+
+---
+
+## GAP-0021 — A fresh clone of this repo could not build at all; the ignored vendor tree was not reproducible without undocumented manual steps
+
+**Domain:** frontend / build reproducibility (all milestones)
+**Status:** RESOLVED (2026-08-20) — `core/scripts/vendor-frontend.sh`
+
+Found by cloning this repo onto a clean machine (macOS/arm64) that had never built it. `core/frontend/`
+did not exist at all — `core/frontend/vendor/` is `.gitignore`'d by ADR-0005/0007's own decision (~212M
+working tree plus its own nested `.git`), and nothing else under `frontend/` is tracked. Because
+`dcc-lower` has a path dependency on the vendored `pkg/kernel`, **every package in the pipeline failed
+`dart pub get`**, so `dcc` could not run and not one of the sixteen conformance harnesses could execute.
+This was not a stale-artifact problem: it is the state of any fresh clone.
+
+Restoring it needed three things, only the first of which was mechanically written down:
+
+1. The sparse/shallow/partial clone command (ADR-0005) re-pinned to the `3.12.2` tag (ADR-0007) — the
+   only step recoverable by reading the ADRs.
+2. The workspace-detach pubspec edits (ADR-0007 decision item 2). These live **only** inside the
+   ignored tree, so a re-clone silently reverts them to upstream's `resolution: workspace` form and
+   `pub get` then demands all ~60 members of dart-lang/sdk's pub workspace be physically present.
+   ADR-0007's own Consequences section predicted exactly this ("the detach is not a one-time patch
+   that survives a re-clone... Worth a small script if re-vendoring becomes routine; not written now
+   since it's happened exactly once"). It has now happened a second time.
+3. A Dart SDK satisfying `^3.12.0-0`. The machine's `dart` was Flutter's bundled 3.11.0, which does
+   not satisfy it — a confusing failure, because `dart` was on PATH and looked fine.
+
+**Cost of the workaround (before the fix):** total, not partial. The project was unbuildable and every
+claim in `core/README.md` unverifiable on a new machine, despite all of that code being correct and
+committed. The private `dcdart-internal` repo exists specifically so this project survives a machine
+switch; it covered the process docs but not the one ignored directory the build actually needs.
+
+**Resolution:** `core/scripts/vendor-frontend.sh` reproduces the vendor end to end — clone at the
+ADR-0005 sparse spec, verify the checkout is exactly ADR-0007's pinned commit
+`d684a576a6aa954ae107a03b2b4e1d61c3bebe93` (hard-fail otherwise), rewrite all three pubspecs to their
+detached form, then prove the result by running `dart pub get` across all six `core/` packages instead
+of assuming. Idempotent; `--force` re-clones. Verified from a genuinely empty `core/frontend/` on
+macOS/arm64, after which all sixteen conformance harnesses pass in a `linux/amd64` container.
+
+---
+
 ## GAP-0020 — Heap- and weak-typed heap-object field stores rejected (undecided ownership policy)
 
 **Domain:** dcc-lower (M2)
@@ -32,10 +184,14 @@ once a real program needs mutable heap-typed fields, not speculatively now.
 ## GAP-0019 — No general inline asm / `@naked` / extern-to-external-symbol FFI; only the narrow `Port.outb`/`Port.inb` primitive exists
 
 **Domain:** dc-ir, backend, dcc-lower (M2, downstream: `oscortex_core`)
-**Status:** OPEN — `Port.outb`/`Port.inb` RESOLVED for the one narrow case that motivated them
-(`docs/decisions/0029-port-io.md`); bitwise operators (`&`/`|`/`^`/`<<`/`>>`) ALSO RESOLVED
-(`docs/decisions/0030-bitwise-operators.md`) — both were real prerequisites `oscortex_core`'s
-interrupts milestone surfaced, not the same gap as the asm/`@naked`/FFI items below, which remain
+**Status:** OPEN — three of its five sub-items are now RESOLVED:
+- `Port.outb`/`Port.inb` (`docs/decisions/0029-port-io.md`), the narrow case that motivated the entry;
+- bitwise operators `&`/`|`/`^`/`<<`/`>>` (`docs/decisions/0030-bitwise-operators.md`);
+- **extern-to-external-symbol FFI (`docs/decisions/0038-extern-symbols-and-linking.md`)** — see the
+  struck-through item below. `@extern external` declarations, real `declare`s and relocations, real
+  multi-object linking, verified by `tests/conformance/ffi-extern/run.sh`.
+
+General inline `asm`, `@naked`, `@interrupt` enforcement, `@linkName` and `@section` remain
 unimplemented, correctly deferred.
 
 `oscortex_core` (a from-scratch OS being developed alongside DCDart, its own project) needed x86 port
@@ -52,22 +208,43 @@ immediately motivated, verified against a real disassembly, but deliberately not
   about whether a dedicated instruction (like `PortOut`/`PortIn`) or a real general `asm` mechanism is
   the right call, the same way this gap was resolved.
 - `@naked` functions (no prologue/epilogue, needed for real interrupt/exception handler entry points).
-- Extern-to-external-symbol FFI — DCDart code calling a symbol not defined in its own Kernel IR
+- ~~Extern-to-external-symbol FFI — DCDart code calling a symbol not defined in its own Kernel IR
   compilation unit (e.g. a hand-written assembly helper in a companion `.S` file). `dcc` today only
   ever emits one self-contained relocatable object per compilation unit; resolving an external symbol
-  by name is a new architectural concept it doesn't have. `oscortex_core`'s own boot stub currently
-  avoids this entirely by calling INTO `@bare` DCDart code from assembly (the proven, already-working
-  direction — a plain C-ABI call, same as every M0-era conformance harness), never the reverse.
+  by name is a new architectural concept it doesn't have.~~ **RESOLVED, ADR-0038.** `@extern external`
+  + a module-level `DCModule.externFunctions` + an LLVM `declare` per symbol. `dcc` output is now one
+  object among several: `tests/conformance/ffi-extern/run.sh` links four objects freestanding
+  (`-nostdlib`) with zero undefined symbols left, links three natively and runs them, and calls real
+  libc (`ffs`/`toupper`/`putchar`) with the stdout bytes checked. `oscortex_core` no longer has to
+  route everything through the assembly-calls-DCDart direction.
+  **Two follow-ups this opened, tracked separately:** GAP-0025 (`Pointer<T>` cannot appear in a
+  signature, so most of libc is still un-declarable) and GAP-0026 (no signed sized-int types, so a C
+  `int` must be declared `u32`).
+  **Rule 1's meaning changed, and that change is RATIFIED:**
+  `docs/escalations/0003-extern-c-calls-vs-freestanding.md` was decided by the project owner (option
+  2) on 2026-08-20 — rule 1 becomes "zero undefined symbols *except ones the source explicitly
+  declared*, checked mechanically." The check still hard-fails any undefined symbol the source did not
+  declare, and `tests/conformance/ffi-extern/run.sh` step 3 asserts exactly that on every run.
 - `@interrupt` function safety enforcement (no allocation inside an interrupt handler, compiler-
   enforced) — mentioned in `CLAUDE.md`'s coding rules as a real requirement, not yet built at all.
+  **Whoever builds it also owes escalation 0003's second condition: `@extern` must be rejected inside
+  an `@interrupt` function.** That could not be built with ADR-0038 because `@interrupt` does not
+  exist; it is recorded here so it is not lost.
+- `@linkName` and `@section` (spec §6's linker-control row). ADR-0038 deliberately did not build them:
+  the Dart identifier is the C symbol name, which covers every symbol needed so far. `@linkName`
+  becomes necessary the moment a C symbol's name is not a legal Dart identifier (a leading underscore
+  at top level, a `$`, a C++-mangled name); `@section` is an outbound-direction property and belongs
+  with whoever needs `.text.boot`.
 - `@volatile` (GAP-0006, pre-existing) — whoever builds it needs to cover `PortOut`/`PortIn` too, not
   just `Load`/`Store`: both are genuine side effects that must never be reordered or elided once an
   optimizer exists.
 
 **Cost of the workaround:** none for the narrow `Port.outb`/`Port.inb` addition itself (resolved for
-real, verified against a real disassembly, not routed around). The cost is scope: `oscortex_core`'s
-next real milestone (interrupts) will likely need at least `@naked` and `@interrupt` enforcement, which
-don't exist yet — expect this gap to grow real sub-items as that work starts, not shrink.
+real, verified against a real disassembly, not routed around), and none for extern FFI (resolved for
+real, executed for real). The cost is scope: `oscortex_core`'s next real milestone (interrupts) still
+needs `@naked` and `@interrupt` enforcement, which don't exist — and ADR-0038's extern surface, while
+real, reaches only integer-and-struct signatures until GAP-0025 lands. Expect this entry to keep
+growing real sub-items as that work starts, not to close outright.
 
 ---
 

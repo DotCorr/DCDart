@@ -40,7 +40,12 @@ u64 collatzSteps(u64 start) {
 u64 sumCollatzSteps(u64 upTo) {
   var counter = StepCounter(u64(0));
   var i = u64(1);
-  while (i < upTo) {
+  // `1..upTo` is INCLUSIVE, per this function's doc comment above. DCDart has
+  // no `<=` operator yet (only ICmp's `<`, ADR-0013), so the inclusive bound is
+  // spelled `i < upTo + 1`. Writing the loop as `i < upTo` instead -- which is
+  // what it did originally -- silently summed `1..upTo-1` while main.c printed
+  // the result as `1..upTo`.
+  while (i < upTo + u64(1)) {
     counter.total = counter.total + collatzSteps(i);
     i = i + u64(1);
   }

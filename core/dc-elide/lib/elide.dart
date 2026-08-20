@@ -197,6 +197,8 @@ Set<int> referencedValueIds(DCInstruction instruction) {
     case IAdd(:final lhs, :final rhs):
     case ISub(:final lhs, :final rhs):
     case IMul(:final lhs, :final rhs):
+    case IDiv(:final lhs, :final rhs):
+    case IRem(:final lhs, :final rhs):
     case IAnd(:final lhs, :final rhs):
     case IOr(:final lhs, :final rhs):
     case IXor(:final lhs, :final rhs):
@@ -207,6 +209,8 @@ Set<int> referencedValueIds(DCInstruction instruction) {
       ref(rhs);
     case MakeStruct(:final fields):
       fields.forEach(ref);
+    case IConvert(:final source):
+      ref(source);
     case ExtractField(:final struct):
       ref(struct);
     case Load(:final pointer):

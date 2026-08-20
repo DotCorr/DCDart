@@ -32,3 +32,9 @@ Thumbs.db
 /DCDART_SPEC.md
 /ROADMAP.md
 /SKILL.md
+
+# Private sub-agent skill packages, copied in by dcdart-internal's sync.sh
+# (which writes them to mnt/user-data/outputs/dcdart/skills/). They are
+# tracked only in the private dcdart-internal repo; without this rule a
+# `git add -A` after a sync would publish them here.
+/mnt/
