@@ -103,6 +103,56 @@ clean run. The kernel side has offered to run exactly that.
 
 ---
 
+## GAP-0035 — M3's benchmark suite cannot be WRITTEN in DCDart; the gate is unblocked but not reachable
+
+**Domain:** language surface (M3)
+**Status:** OPEN — and it is the honest statement of where the project actually is
+
+ADR-0041 (volatile) and ADR-0042 (`-O2`) removed the two things that would have made an M3 measurement
+*wrong*. They did not make it *possible*. `ROADMAP.md` names the suite:
+
+> at minimum a JSON parser, a hashmap-heavy workload, a tree/graph traversal, a string-processing
+> pass, and a closure-heavy functional workload
+
+None of the five can be written today. Probed each prerequisite against the real compiler rather than
+inferring from the gaps file:
+
+| prerequisite | status | blocks |
+|---|---|---|
+| `null` / nullable heap refs | `unsupported expression NullLiteral` | trees, lists, anything optional |
+| heap-typed field **store** | rejected (GAP-0020) | every mutable data structure |
+| generics / monomorphization | `unsupported type TypeParameterType` (spec §4.2) | any container |
+| closures | `unsupported expression FunctionExpression` | the functional workload |
+| `String` | `unsupported expression StringLiteral` (spec §7) | JSON parser, string pass |
+| instance methods | not lowered; only top-level functions | idiomatic anything |
+| `for` loops | `unsupported statement ForStatement` | cosmetic — `while` works |
+
+Only `bool` locals passed.
+
+**So M3 is not one unit away. It is most of the remaining language.** That is worth stating plainly
+because "the gate is unblocked" reads as "the gate is next", and it is not — the benchmarks are
+downstream of features nobody has built.
+
+**The ordering point that matters most.** `CLAUDE.md` rule 4 freezes the memory model *after* M3. The
+heap-typed-field-store ownership policy (GAP-0020: does a store release the old value? retain the new
+one? take over an existing reference?) is precisely a memory-model decision — and it is a prerequisite
+of the tree/graph benchmark, which is a prerequisite of M3, which is what freezes it. **It must
+therefore be decided BEFORE M3, deliberately, rather than inherited from whatever the first
+implementation happened to do.** Deciding it under benchmark pressure is the worst possible timing.
+
+**Cheapest path to a REAL M3 number, if a partial gate is acceptable:** nullable heap references plus
+heap-typed field stores are one coherent unit — both are the same "a field holds a heap reference"
+question — and together they unlock the tree/graph traversal benchmark, which is the most
+ARC-intensive of the five and therefore the most informative single number. That would give a measured
+overhead on genuinely allocation-heavy code without strings, generics or closures. It would not be
+`ROADMAP.md`'s stated suite and should not be reported as passing M3.
+
+**Cost of the workaround:** there is no workaround. Any M3 number quoted today would be measured on
+arithmetic loops and pointer walks, which allocate nothing, exercise no ARC, and would report an
+overhead near zero — a meaningless pass.
+
+---
+
 ## GAP-0034 — Every `Pointer<T>` access is volatile, including bulk memory walks that do not need it
 
 **Domain:** runtime prelude, dcc-lower (M2/M3)
@@ -115,11 +165,28 @@ and hoisting, so a bulk walk loses the optimizations it would most benefit from.
 
 Correctness is unaffected in both directions: volatile is strictly more conservative.
 
-**Cost of the workaround:** none today, since `dcc` does not optimize at all (GAP-0032). It becomes
-real the moment `-O` lands, and it lands on exactly the array-traversal shape M3's benchmark suite
-measures. The fix is a separate non-volatile accessor — `Pointer<T>.load()`/`.store()` beside
-`.value`, or the inverse spelling with `.volatileValue` for MMIO. Not added speculatively: the right
-split depends on which is the common case in real code, and there is not enough real code yet to say.
+**Where the cost actually lands, which decides the fix.** It is not evenly spread, and this is worth
+settling before M3 numbers arrive and the pressure is to fix it quickly:
+
+- **`@bare` kernel code pays nothing.** Every `Pointer<T>` access `oscortex_core` makes genuinely IS
+  MMIO — UART, PIC, PIT, IDT, VGA at 0xB8000, PS/2 at 0x60. Blanket volatile costs it nothing because
+  it wanted volatile everywhere anyway.
+- **Hosted bulk traversal pays all of it**, and that is precisely the benchmark shape: walking an array
+  of scalars, which is what a JSON parser, a hashmap probe and a tree walk all reduce to.
+
+So the fix is probably NOT "make volatile opt-in" — that reintroduces the unsafe default ADR-0041
+rejected for good reason, and the failure mode is invisible. The better direction is **distinguishing
+device memory from ordinary memory at the TYPE level**: a `Pointer<T>` for ordinary memory and a
+distinct type (or a `@device` annotation on the pointer) for MMIO, with volatile following the type
+rather than the operation. The kernel side has said it would happily annotate, because it already
+knows exactly which of its pointers are device memory — the information exists in the programmer's head
+and simply has nowhere to be written down today.
+
+That also composes with GAP-0033 (no barriers): whatever type says "this is a device register" is the
+natural place to hang ordering requirements later.
+
+**Cost of the workaround:** measurable only under `-O` (which now exists, ADR-0042) and only on hosted
+traversal. If M3 comes in over budget, check this before concluding anything about ARC.
 
 ---
 
