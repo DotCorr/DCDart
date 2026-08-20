@@ -29,6 +29,47 @@ a backend change — `DCInt.signed` is already threaded through.
 
 ---
 
+## GAP-0032 — `dcc` never passes an optimization flag, so every DCDart program ships `-O0` code
+
+**Domain:** backend / dcc (M3 — this is the gate's single biggest lever)
+**Status:** OPEN
+
+`backend/lib/compile.dart` invokes `clang` with `-ffreestanding -fno-builtin -fno-stack-protector
+-fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables -c`. There is no `-O` anywhere, so
+LLVM runs at `-O0`: no register allocation to speak of, no constant folding, no strength reduction, no
+CSE, no unrolling.
+
+Measured on a non-allocating loop (`sum ^= *(u32*)(base + i*4)` over `count` elements), all three
+compiled for `x86_64-unknown-none-elf`:
+
+| build | instructions | shape |
+|---|---|---|
+| DCDart as `dcc` ships it | 54 | every local spilled to stack; `mulq` for `i*4`; constant 0 materialized as `xor`+`add` |
+| **the same DCDart IR at `-O2`** | **21** | values in registers; `xorl (%r9), %eax` direct memory operand; tight 8-instruction loop |
+| C at `-O2` | 36 | longer only because it unrolled 4x |
+
+**Why this entry matters more than its size.** M3 is the project's hard gate — geometric mean ARC
+overhead ≤10% vs C — and any measurement taken before this is closed measures the wrong thing. A
+benchmark run today would attribute to ARC what is actually the optimizer being switched off, and
+would fail the gate for a reason that has nothing to do with the memory model. Anyone reaching M3
+should close this FIRST, then measure.
+
+It also corrects a wrong conclusion that is easy to reach from reading the output: DCDart's emitted
+code looks nothing like C's, so it is tempting to infer that ARC or some runtime is responsible. It is
+not — the same IR through `-O2` is the same class of code as C. Verified separately: non-allocating
+programs emit **zero** ARC instructions (`m2-port`, `m1-pointer`, `m2-bitwise`, `demo-stats`,
+`m2-rodata` all report `alloc=0 retain=0 release=0`), and a `@bare` object has zero undefined symbols,
+so there is no runtime to call into.
+
+**Cost of the workaround:** nothing depends on `-O0`, so this is not load-bearing anywhere. But it is
+not a one-line change either, and that is worth saying: turning optimization on makes the red zone
+reachable (ADR-0039 already handles that), changes what `tests/conformance/no-red-zone/` actually
+exercises from a forward guard into a live check, and may expose latent UB in emitted IR that `-O0`
+currently hides. It should land as its own unit with the full suite re-run, not as a flag flipped in
+passing.
+
+---
+
 ## GAP-0031 — `@rodata` emitted homogeneous ARRAYS only, so a type descriptor's STRUCT was inexpressible
 
 **Domain:** dc-ir, backend, dcc-lower (M2)
