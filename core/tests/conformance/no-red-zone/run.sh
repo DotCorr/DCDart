@@ -16,7 +16,7 @@
 #   red-zone-using @bare object passes every behavioural test we own while
 #   being silently fatal in a kernel the moment interrupts are enabled.
 #
-# So a green suite provably cannot catch this (docs/known-gaps.md GAP-0025)
+# So a green suite provably cannot catch this (docs/known-gaps.md GAP-0027)
 # and the check has to look at instructions, not results.
 #
 # HONEST LIMIT OF THIS HARNESS, stated up front so nobody over-reads a pass:

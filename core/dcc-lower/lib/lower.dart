@@ -70,7 +70,7 @@ Future<DCModule> lowerToDCModule(
     // succeeded, the symbol simply was not in the output, and the generated
     // header did not mention it either. Splitting a program across files
     // quietly deleted half of its API — a function that vanishes with no
-    // diagnostic is strictly worse than a compile error (GAP-0026, reported
+    // diagnostic is strictly worse than a compile error (GAP-0028, reported
     // by oscortex_core, which worked around it with `part`/`part of`).
     //
     // This does not FIX multi-library compilation; it converts a silent trap
@@ -2405,7 +2405,7 @@ void _rejectBareFunctionsInImportedLibraries(
     '  ${dropped.join('\n  ')}\n'
     'dcc compiles ONE library per object file — only `${targetLibrary.importUri}` '
     'is lowered, and anything `@bare` in a library it imports is not compiled '
-    'at all (docs/known-gaps.md GAP-0026). Until multi-library compilation '
+    'at all (docs/known-gaps.md GAP-0028). Until multi-library compilation '
     'exists, put every `@bare` function in the file being compiled, or pull '
     'the others in with `part`/`part of` so they share one library.',
   );

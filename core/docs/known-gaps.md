@@ -29,7 +29,7 @@ a backend change — `DCInt.signed` is already threaded through.
 
 ---
 
-## GAP-0026 — `dcc` compiles ONE library per object file; `@bare` functions in imported libraries were silently dropped
+## GAP-0028 — `dcc` compiles ONE library per object file; `@bare` functions in imported libraries were silently dropped
 
 **Domain:** dcc-lower (all milestones)
 **Status:** OPEN — the silence is fixed, the limitation is not
@@ -86,7 +86,7 @@ prelude has no type for today.
 
 ---
 
-## GAP-0025 — The conformance suite structurally cannot catch bare-metal-only codegen defects
+## GAP-0027 — The conformance suite structurally cannot catch bare-metal-only codegen defects
 
 **Domain:** testing (all milestones)
 **Status:** OPEN — partially mitigated by `tests/conformance/no-red-zone/`

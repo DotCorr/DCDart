@@ -31,7 +31,7 @@ Worth stating separately, because it says something about the suite rather than 
 conformance harnesses link `@bare` objects into **ordinary hosted processes**, where the red zone is
 entirely legitimate and nothing ever writes below RSP. So a red-zone-using object passes every
 behavioural test the project owns while being fatal in the environment `@bare` exists to target. A
-green 21/21 was never evidence about this property. Filed as GAP-0025.
+green 21/21 was never evidence about this property. Filed as GAP-0027.
 
 ## Options
 
