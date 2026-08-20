@@ -103,6 +103,43 @@ clean run. The kernel side has offered to run exactly that.
 
 ---
 
+## GAP-0036 — Port I/O is optimization-safe by ACCIDENT, not by design (now tested)
+
+**Domain:** dc-ir, backend (M2, downstream: `oscortex_core`)
+**Status:** RESOLVED as a test gap (2026-08-21); the underlying accident remains
+
+ADR-0041 made `Pointer<T>` load/store volatile. It does not apply to `Port.outb`/`Port.inb` at all —
+those are `PortOut`/`PortIn`, a separate code path that lowers to LLVM `asm sideeffect` (ADR-0029).
+
+So port I/O survives `-O2` because of a decision made months earlier, for an unrelated reason, by
+someone not thinking about optimization. That is a real property with a real consequence:
+`oscortex_core`'s UART output polls the 16550 Line Status Register in a loop through `Port.inb`, and if
+that read were hoisted out of the loop the poll would spin forever on a stale value. **No wrong bytes,
+no crash, no diagnostic — the machine just stops.** Raised by the kernel side, who own the code that
+would hang.
+
+Until now, `tests/conformance/volatile/` asserted nothing about `PortIn`/`PortOut` at any optimization
+level. The property was load-bearing and untested.
+
+**Resolution (test side).** `examples/m2-port-poll/` plus step 4 of `tests/conformance/volatile/`:
+the emitted IR must contain `sideeffect`; a port read in a polling loop must remain loop-resident at
+-O0/-O1/-O2/-O3/-Os, verified by locating the read's address and requiring a backward branch to target
+at or before it; and three writes to the same port with different values must all survive, since each
+is a distinct side effect the hardware observes in order.
+
+**What is NOT resolved:** the safety is still incidental. Nothing in the design says "port I/O must be
+`sideeffect`" — an ADR says it, and a test now pins it, but the two are connected only by this gap
+entry. A future rework of port lowering that drops `sideeffect` would fail the test, which is the
+point, but the *reason* it matters lives in prose rather than in the type system.
+
+Honest limit of the test, recorded in the harness too: the IR-level assertion is the discriminator.
+Stripping `sideeffect` from the emitted IR fails it. The codegen half did NOT trip on that same
+stripped IR, because LLVM happened not to exploit the freedom — the read's result is used, so it was
+kept anyway. The codegen check is a backstop against an optimizer that does exploit it, not a test of
+the IR check.
+
+---
+
 ## GAP-0035 — M3's benchmark suite cannot be WRITTEN in DCDart; the gate is unblocked but not reachable
 
 **Domain:** language surface (M3)

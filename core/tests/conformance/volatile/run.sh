@@ -135,5 +135,118 @@ for OPT in 0 1 2 3 s; do
   echo "  -O$OPT: $STORES store(s), $LOADS load(s) through the MMIO pointer — access survived"
 done
 
-echo "VOLATILE: PASS — Pointer<T>.value emits volatile load/store, and the MMIO access survives -O0/-O1/-O2/-O3/-Os intact"
+# ---------------------------------------------------------------------------
+# Step 4 — PORT I/O, which ADR-0041 does NOT cover.
+#
+# `Port.outb`/`Port.inb` are a completely different code path from
+# `Load`/`Store`: they lower to LLVM `asm sideeffect` (ADR-0029), not to
+# volatile memory operations. So their safety under optimization is
+# INCIDENTAL — it falls out of a decision made for another reason, months
+# before anyone thought about enabling `-O`.
+#
+# That property is load-bearing in a real kernel and was untested until this
+# step existed. `oscortex_core`'s UART output polls the 16550 Line Status
+# Register in a loop through `Port.inb`; if that read were hoisted out of the
+# loop, the poll would spin forever on a stale value. The failure mode is the
+# worst available: no wrong bytes, no crash, no diagnostic — the machine just
+# stops. Raised by the kernel side, who own the code that would hang.
+#
+# HONEST LIMIT, so nobody over-reads a pass. Two checks run below and they
+# have different strengths:
+#
+#   4a (IR contains `sideeffect`) is the real discriminator. Verified by
+#      stripping the keyword from the emitted IR: this check fails.
+#   4b (codegen counts + the hoist check) did NOT trip on that same stripped
+#      IR, because LLVM happened not to exploit the freedom -- the read's
+#      result is used, so it kept it anyway at -O2. So 4b is a backstop
+#      against an optimizer that DOES exploit it, not a test of 4a.
+#
+# Both are worth having: 4a catches the lowering regression at its source, 4b
+# catches an optimizer change that reaches the same outcome by another route.
+# ---------------------------------------------------------------------------
+POLL_DIR="$CORE_DIR/examples/m2-port-poll"
+[[ -f "$POLL_DIR/poll.dart" ]] || setup_error "missing $POLL_DIR/poll.dart"
+
+PROBE="$CORE_DIR/dcc/bin/_volatile_probe.dart"
+cat > "$PROBE" <<'DART'
+import 'dart:io';
+import 'package:backend/llvm_emit.dart';
+import 'package:backend/targets.dart';
+import 'package:dcc_lower/lower.dart';
+
+Future<void> main(List<String> args) async {
+  final module = await lowerToDCModule(
+    args[0],
+    preludeUri: Platform.script.resolve('../../runtime/dc-core-bare/prelude.dart'),
+  );
+  final target = DCTarget.parse(args[1], hostOsName: 'linux', hostArchName: 'x64');
+  File(args[2]).writeAsStringSync(
+    emitModule(module, targetTriple: target.triple, noRedZone: target.forbidsRedZone),
+  );
+}
+DART
+( cd "$CORE_DIR" && dart dcc/bin/_volatile_probe.dart \
+    "$POLL_DIR/poll.dart" bare-x86_64 "$WORKDIR/poll.ll" ) \
+  >"$WORKDIR/emit2.log" 2>&1
+EMIT2=$?
+rm -f "$PROBE"
+[[ $EMIT2 -eq 0 ]] || { cat "$WORKDIR/emit2.log" >&2; fail "could not emit IR for poll.dart"; }
+
+grep -q 'sideeffect' "$WORKDIR/poll.ll" \
+  || fail "port I/O is not emitted as \`asm sideeffect\` (ADR-0029). Without it the optimizer may hoist a port read out of a polling loop, and the kernel's UART wait spins forever on a stale Line Status Register."
+echo "VOLATILE: step 4a ok — port I/O emits \`asm sideeffect\`"
+
+for OPT in 0 1 2 3 s; do
+  POBJ="$WORKDIR/poll_O$OPT.o"
+  clang --target=x86_64-unknown-none-elf -ffreestanding -mno-red-zone \
+    "-O$OPT" -c "$WORKDIR/poll.ll" -o "$POBJ" >"$WORKDIR/cc2.log" 2>&1 \
+    || { cat "$WORKDIR/cc2.log" >&2; fail "clang -O$OPT could not compile poll.ll"; }
+
+  PD="$("$OBJDUMP" -d "$POBJ" 2>/dev/null)"
+  [[ "$(grep -cE '^[[:space:]]+[0-9a-f]+:' <<<"$PD")" -ge 1 ]] \
+    || fail "$OBJDUMP produced no instructions for poll.o at -O$OPT; every count below would pass vacuously"
+
+  INS="$(grep -cE '[[:space:]]inb?[[:space:]]' <<<"$PD")"
+  OUTS="$(grep -cE '[[:space:]]outb?[[:space:]]' <<<"$PD")"
+
+  [[ "$INS" -ge 1 ]] \
+    || { echo "$PD" >&2; fail "-O$OPT eliminated the port READ entirely. A polling loop with no read never observes the hardware changing."; }
+  [[ "$OUTS" -ge 3 ]] \
+    || { echo "$PD" >&2; fail "-O$OPT emitted only $OUTS port writes, expected 3. Writes to the same port with different values are distinct side effects and may not be coalesced or dropped."; }
+
+  # THE HOIST CHECK. A port read inside a loop must stay inside it. Find the
+  # first `in` instruction's address, then look for a backward branch whose
+  # target is at or before it -- that is what makes it loop-resident. If the
+  # read were hoisted above the loop, every back edge would target an address
+  # AFTER it.
+  # THE HOIST CHECK. A port read inside a loop must stay inside it. Find the
+  # first `in` instruction's address, then look for a backward branch whose
+  # target is at or before it -- that is what makes the read loop-resident. If
+  # it were hoisted above the loop, every back edge would target an address
+  # AFTER it.
+  #
+  # Deliberately NOT awk's strtonum(): that is a gawk extension, absent from
+  # the awk macOS ships, where it silently yields 0 and makes every comparison
+  # pass or fail for the wrong reason. Plain bash $((16#..)) is portable.
+  IN_ADDR="$(grep -E '[[:space:]]inb?[[:space:]]' <<<"$PD" | head -1 | sed -E 's/^[[:space:]]*([0-9a-f]+):.*/\1/')"
+  [[ -n "$IN_ADDR" ]] || fail "could not locate the port read's address at -O$OPT"
+
+  LOOPED=no
+  while read -r line; do
+    cur="$(sed -E 's/^[[:space:]]*([0-9a-f]+):.*/\1/' <<<"$line")"
+    tgt="$(grep -oE '0x[0-9a-f]+' <<<"$line" | tail -1 | sed 's/^0x//')"
+    [[ -n "$cur" && -n "$tgt" ]] || continue
+    if (( 16#$tgt <= 16#$cur )) && (( 16#$tgt <= 16#$IN_ADDR )); then
+      LOOPED=yes
+      break
+    fi
+  done < <(grep -E '[[:space:]]j[a-z]+[[:space:]]+0x[0-9a-f]+' <<<"$PD")
+
+  [[ "$LOOPED" == "yes" ]] \
+    || { echo "$PD" >&2; fail "-O$OPT: no backward branch targets at or before the port read at 0x$IN_ADDR — the read appears to have been HOISTED OUT of the polling loop. A UART wait built on this spins forever on a stale status register."; }
+
+  echo "  -O$OPT: $INS port read(s) loop-resident, $OUTS port write(s) intact"
+done
+
+echo "VOLATILE: PASS — Pointer<T>.value emits volatile load/store and its MMIO access survives -O0/-O1/-O2/-O3/-Os; port I/O emits asm sideeffect, stays inside its polling loop and keeps every write"
 exit 0
