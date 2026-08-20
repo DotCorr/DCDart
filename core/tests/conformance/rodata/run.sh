@@ -113,13 +113,17 @@ check_size regionLength 0000000000000020 "4 x u64, elements only"
 check_size regionType   0000000000000010 "4 x u32, width from the declared type"
 check_size flags        0000000000000004 "4 x u8, tightest stride"
 check_size tableDirectory 0000000000000018 "3 x pointer, a relocation table"
+# { ptr(8) + u32(4) + pad(4) + ptr(8) } = 24 bytes, natural C layout. A packed
+# struct would be 20, and a wrong field order would change which words the
+# relocations land on.
+check_size regionDesc     0000000000000018 "{ptr,u32,ptr} record, natural C layout"
 
 # The directory must carry REAL relocations into .rodata -- three of them,
 # one per referenced table. Without these the words would be zeroes and every
 # dereference through the directory would fault or read garbage.
 RELOC_COUNT="$("$OBJDUMP" -r "$WORKDIR/rodata.o" 2>/dev/null | awk '/RELOCATION RECORDS FOR \[.rodata\]/{f=1;next} /^RELOCATION RECORDS/{f=0} f && /R_X86_64_64|ARM64_RELOC/{n++} END{print n+0}')"
-[[ "$RELOC_COUNT" -ge 3 ]] \
-  || fail "expected at least 3 relocations inside .rodata for tableDirectory, found $RELOC_COUNT — a table of Ref() must produce real linker relocations, not zero words"
+[[ "$RELOC_COUNT" -ge 5 ]] \
+  || fail "expected at least 5 relocations inside .rodata (3 for tableDirectory + 2 for regionDesc), found $RELOC_COUNT — Ref() must produce real linker relocations, not zero words"
 echo "  layout ok: $RELOC_COUNT internal relocations emitted into .rodata"
 
 # The two u64 tables must be at DIFFERENT offsets. Identical-looking data

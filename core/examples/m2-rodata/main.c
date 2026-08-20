@@ -67,6 +67,13 @@ int main(void) {
     ck("viaDirectory(0,3)", viaDirectory(0, 3), 0x800000);
     ck("viaDirectory(1,3)", viaDirectory(1, 3), 0x1000000);
 
+    /* The descriptor RECORD: { ptr bases, u32 count, ptr lengths }. Word 1
+     * carries the u32 count in its low half (natural C layout puts 4 bytes
+     * of padding after it), and both pointer words are linker-filled. */
+    ck("descWord(1) low half", (uint32_t)descWord(1), 4);
+    ck("viaDescriptor(0)", viaDescriptor(0), 0x100000);
+    ck("viaDescriptor(3)", viaDescriptor(3), 0x800000);
+
     printf(fails ? "RODATA: %d FAILURES\n" : "RODATA: all correct\n", fails);
     return fails != 0;
 }

@@ -778,6 +778,21 @@ String _emitConstant(DCConstant constant, {required String context}) {
       // `[N x T] [T a, T b, ...]` -- each element repeats its own type, which
       // is LLVM's required form for an array constant, not redundancy.
       return '[${elements.length} x $elemType] [$body]';
+    case DCConstStruct(fields: final fields):
+      // `{ T1, T2 } { T1 a, T2 b }` -- TYPE then VALUE, the same shape the
+      // array case emits. Omitting the leading type gives LLVM's unhelpful
+      // "expected '}' at end of struct", because it parses the value as a
+      // type. Unpacked, so LLVM applies natural field alignment, matching
+      // what a C struct of the same fields does; a @packed equivalent would
+      // need `<{ }>`, which no source construct asks for yet.
+      final body = fields
+          .map((f) => _emitConstant(f, context: context))
+          .join(', ');
+      final parts = fields
+          .map((f) => _constantTypeText(f, DCInt.u64, context: context))
+          .join(', ');
+      final typeText = '{ $parts }';
+      return '$typeText { $body }';
     case DCConstAddrOf(globalName: final name, offsetBytes: final offset):
       // Unreachable from source today (see DCConstAddrOf's doc comment); the
       // dc-ir unit tests construct it directly so this path is exercised.
@@ -801,6 +816,11 @@ String _constantTypeText(
       return _llvmType(type, context: context);
     case DCConstAddrOf():
       return 'ptr';
+    case DCConstStruct(fields: final fields):
+      final parts = fields
+          .map((f) => _constantTypeText(f, fallback, context: context))
+          .join(', ');
+      return '{ $parts }';
     case DCConstArray(elements: final elements, elementType: final elementType):
       final inner = elements.isEmpty
           ? _llvmType(elementType, context: context)

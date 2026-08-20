@@ -113,16 +113,14 @@ void main() {
   });
 
   test('a MIXED array is rejected -- an LLVM array is homogeneous', () {
-    // This is the shape a real type descriptor wants:
-    //     { ptr name, i64 fieldCount, ptr fields }
-    // That is a STRUCT, not an array, and struct constants are not
-    // implemented (known-gaps GAP-0031). Rejected here with a specific
-    // message rather than handed to clang to refuse with a worse one.
+    // A mixed aggregate is a STRUCT, not an array. Rejected here with a
+    // specific message rather than handed to clang to refuse with a worse
+    // one; DCConstStruct is how the shape is actually expressed.
     expect(
       () => emitModule(
         moduleWith([
           DCGlobal(
-            linkName: 'descriptor',
+            linkName: 'bad',
             initializer: const DCConstArray(DCInt.u64, [
               DCConstAddrOf('names'),
               DCConstInt(DCInt.u64, 1),
@@ -132,6 +130,33 @@ void main() {
         ]),
       ),
       throwsA(isA<BackendError>()),
+    );
+  });
+
+  test('a descriptor STRUCT emits type-then-value with mixed fields', () {
+    // The real reflection shape: { ptr name, i32 fieldCount, ptr fields }.
+    // Inexpressible as an array at any width, which is why DCConstStruct
+    // exists (GAP-0031).
+    final ll = emitModule(
+      moduleWith([
+        DCGlobal(
+          linkName: 'pointDesc',
+          initializer: const DCConstStruct([
+            DCConstAddrOf('nameBytes'),
+            DCConstInt(DCInt.u32, 2),
+            DCConstAddrOf('fieldOffsets'),
+          ]),
+          alignBytes: 8,
+        ),
+      ]),
+    );
+    // TYPE then VALUE. Omitting the leading type gives LLVM's unhelpful
+    // "expected '}' at end of struct", because it parses the value as a type.
+    expect(
+      ll,
+      contains(
+        '{ ptr, i32, ptr } { ptr @nameBytes, i32 2, ptr @fieldOffsets }',
+      ),
     );
   });
 

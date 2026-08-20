@@ -29,10 +29,10 @@ a backend change — `DCInt.signed` is already threaded through.
 
 ---
 
-## GAP-0031 — `@rodata` emits homogeneous ARRAYS only; a type descriptor is a STRUCT and cannot be expressed
+## GAP-0031 — `@rodata` emitted homogeneous ARRAYS only, so a type descriptor's STRUCT was inexpressible
 
 **Domain:** dc-ir, backend, dcc-lower (M2)
-**Status:** OPEN — rejected loudly, not silently
+**Status:** RESOLVED (2026-08-20) — `DCConstStruct`, a const class instance as the source form
 
 ADR-0040 emits `[N x iW]` arrays and, via `Ref('name')`, `[N x ptr]` relocation arrays. An LLVM array
 is **homogeneous**, so a mixed aggregate is not expressible. The shape a real type descriptor wants is
@@ -54,9 +54,37 @@ node plus the `{...}` emission, with the same name-based relocation leaf already
 Note the interaction with GAP-0022: the C header emitter already orders structs by first appearance,
 which is not guaranteed to be valid C definition order once structs can nest.
 
-**Cost of the workaround:** parallel arrays (one array per field, indexed in lockstep) express the same
-information and are what `examples/m2-rodata/` uses. They cost an index-correctness invariant the
-compiler does not check, which is precisely what a struct would enforce.
+**Resolution.** `DCConstStruct` plus a const class instance as the source form:
+
+```dart
+class TypeDesc {
+  final Ref name;
+  final u32 fieldCount;
+  final Ref fields;
+  const TypeDesc(this.name, this.fieldCount, this.fields);
+}
+
+@rodata final TypeDesc pointDesc =
+    const TypeDesc(Ref('nameBytes'), u32(2), Ref('fieldOffsets'));
+```
+
+Emits `{ ptr, i32, ptr } { ptr @nameBytes, i32 2, ptr @fieldOffsets }` — 24 bytes with natural C
+layout (ptr, u32, 4 bytes padding, ptr) and two real relocations. Verified by dereferencing it: the
+name pointer reaches its bytes, the fields pointer reaches its offsets.
+
+Field WIDTHS come from the class's declared field types, not from the values — an `InstanceConstant`'s
+field values are bare `IntConstant`s with every extension type erased, exactly as list elements are.
+Field ORDER follows the class's declaration order rather than the constant's map order, because that
+order IS the emitted layout. A bare `int` field is rejected for the same reason `List<int>` is.
+
+Two things that were nearly wrong: the emitted text must be TYPE then VALUE (`{ ptr, i32 } { ... }`) —
+omitting the leading type produces LLVM's unhelpful "expected '}' at end of struct" because it parses
+the value as a type; and the struct is unpacked, so LLVM applies natural field alignment matching what
+C would do for the same fields. A `@packed` equivalent would need `<{ }>` and has no source form yet.
+
+**Cost of the workaround (historical):** parallel arrays, one per field, indexed in lockstep. They
+express the same information at the cost of an index-correctness invariant nothing checks — precisely
+what the struct now enforces.
 
 ---
 

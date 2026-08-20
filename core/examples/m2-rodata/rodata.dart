@@ -51,6 +51,20 @@ final List<Ref> tableDirectory = const [
   Ref('regionType'),
 ];
 
+/// A RECORD -- the shape a type descriptor wants, mixing a relocation with
+/// an integer. Not expressible as an array at any width, because an LLVM
+/// array is homogeneous (GAP-0031).
+class RegionDesc {
+  final Ref bases;
+  final u32 count;
+  final Ref lengths;
+  const RegionDesc(this.bases, this.count, this.lengths);
+}
+
+@rodata
+final RegionDesc regionDesc =
+    const RegionDesc(Ref('regionBase'), u32(4), Ref('regionLength'));
+
 const int _u64Stride = 8;
 const int _u32Stride = 4;
 const int _u8Stride = 1;
@@ -123,6 +137,30 @@ u64 viaDirectory(u64 tableIndex, u64 elementIndex) {
   final slot = Pointer<u64>.fromAddress(
     Rodata.addressOf(tableDirectory) + tableIndex * u64(_u64Stride),
   );
+  final target = Pointer<u64>.fromAddress(
+    slot.value + elementIndex * u64(_u64Stride),
+  );
+  return target.value;
+}
+
+/// Reads a word of the descriptor record. Word 0 is the relocated pointer to
+/// `regionBase`, word 1 packs the u32 count with its padding, word 2 is the
+/// relocated pointer to `regionLength` -- natural C layout for
+/// `{ptr, u32, ptr}`.
+@bare
+u64 descWord(u64 i) {
+  final p = Pointer<u64>.fromAddress(
+    Rodata.addressOf(regionDesc) + i * u64(_u64Stride),
+  );
+  return p.value;
+}
+
+/// Follows the descriptor's FIRST relocated pointer and reads through it,
+/// proving the relocation resolved to `regionBase` rather than merely being
+/// a non-zero word.
+@bare
+u64 viaDescriptor(u64 elementIndex) {
+  final slot = Pointer<u64>.fromAddress(Rodata.addressOf(regionDesc));
   final target = Pointer<u64>.fromAddress(
     slot.value + elementIndex * u64(_u64Stride),
   );

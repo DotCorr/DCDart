@@ -172,6 +172,23 @@ final class DCConstArray extends DCConstant {
   const DCConstArray(this.elementType, this.elements);
 }
 
+/// A heterogeneous record — `{ T1 a, T2 b, ... }`.
+///
+/// Separate from [DCConstArray] because an LLVM array is HOMOGENEOUS. The
+/// shape a type descriptor wants — `{ ptr name, i64 fieldCount, ptr fields }`
+/// — mixes a relocation with an integer and cannot be an array at any width.
+/// That limit was found by the backend's own homogeneity check rejecting a
+/// unit test which had modelled a descriptor as an array (known-gaps
+/// GAP-0031, now closed).
+///
+/// Field ORDER is the declaration order of the source class and is
+/// load-bearing: it is the struct's layout, which a C consumer or a raw
+/// pointer walk depends on.
+final class DCConstStruct extends DCConstant {
+  final List<DCConstant> fields;
+  const DCConstStruct(this.fields);
+}
+
 /// The ADDRESS of another global, plus a byte offset — a relocation.
 ///
 /// UNREACHABLE FROM SOURCE TODAY, and present on purpose. `@rodata` requires

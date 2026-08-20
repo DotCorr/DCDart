@@ -2502,6 +2502,112 @@ void _rejectBareFunctionsInImportedLibraries(
   );
 }
 
+/// Builds a struct global from a const class instance (ADR-0040).
+///
+/// Field WIDTHS come from the class's declared field types, not from the
+/// values: an `InstanceConstant`'s field values are bare `IntConstant`s with
+/// every sized-int extension type erased, exactly as list elements are. The
+/// class node is safe to inspect here — unlike `dart:core`'s `List`, a class
+/// declared in the file being compiled is fully bound.
+///
+/// Field ORDER follows the class's declaration order rather than the
+/// constant's map iteration order, because that order IS the emitted layout
+/// and a consumer walks it by offset.
+DCGlobal _rodataStructGlobal(
+  InstanceConstant constant,
+  String name,
+  Uri preludeUri,
+) {
+  final cls = constant.classNode;
+  final fields = <DCConstant>[];
+  var maxAlign = 1;
+
+  for (final classField in cls.fields) {
+    if (classField.isStatic) continue;
+    final value = constant.fieldValues[classField.fieldReference];
+    if (value == null) {
+      throw DccLowerError(
+        '"$name": field "${classField.name.text}" of ${cls.name} has no '
+        'constant value',
+      );
+    }
+
+    final declared = classField.type;
+    if (declared is InterfaceType &&
+        declared.classReference.canonicalName?.name == 'Ref') {
+      if (value is! InstanceConstant) {
+        throw DccLowerError(
+          '"$name": field "${classField.name.text}" is a Ref but its value is '
+          'a ${value.runtimeType}',
+        );
+      }
+      final values = value.fieldValues.values.toList();
+      final symbol = values.length == 1 ? values.single : null;
+      if (symbol is! StringConstant) {
+        throw DccLowerError(
+          '"$name": Ref must hold a single constant string naming another '
+          '`@rodata` declaration',
+        );
+      }
+      fields.add(DCConstAddrOf(symbol.value));
+      maxAlign = maxAlign < 8 ? 8 : maxAlign;
+      continue;
+    }
+
+    final width = _sizedIntOf(declared);
+    if (width == null) {
+      throw DccLowerError(
+        '"$name": field "${classField.name.text}" has type $declared. A '
+        '`@rodata` record\'s fields must be sized integers (u8/u16/u32/u64) '
+        'or `Ref`. A bare `int` is rejected for the same reason `List<int>` '
+        'is: the constant erases the width, so the declared type is the only '
+        'thing that can decide the layout.',
+      );
+    }
+    if (value is! IntConstant) {
+      throw DccLowerError(
+        '"$name": field "${classField.name.text}" is declared $declared but '
+        'its constant is a ${value.runtimeType}',
+      );
+    }
+    fields.add(DCConstInt(width, value.value));
+    final w = _byteWidthOfInt(width);
+    if (w > maxAlign) maxAlign = w;
+  }
+
+  if (fields.isEmpty) {
+    throw DccLowerError(
+      '"$name": ${cls.name} has no instance fields, so there is nothing to '
+      'emit. An empty record is not a useful global.',
+    );
+  }
+
+  return DCGlobal(
+    linkName: name,
+    initializer: DCConstStruct(fields),
+    // A struct's alignment is its widest field's, matching what C would do
+    // for the same fields.
+    alignBytes: maxAlign,
+  );
+}
+
+/// The `DCInt` a declared sized-int type maps to, or null if it is not one.
+DCInt? _sizedIntOf(DartType declared) {
+  if (declared is ExtensionType) {
+    switch (declared.extensionTypeDeclaration.name) {
+      case 'u8':
+        return DCInt.u8;
+      case 'u16':
+        return DCInt.u16;
+      case 'u32':
+        return DCInt.u32;
+      case 'u64':
+        return DCInt.u64;
+    }
+  }
+  return null;
+}
+
 /// Walks a constant tree and rejects any [DCConstAddrOf] naming something
 /// that is not a `@rodata` global in this compilation unit.
 void _checkRelocationTargets(
@@ -2515,6 +2621,10 @@ void _checkRelocationTargets(
     case DCConstArray(elements: final elements):
       for (final element in elements) {
         _checkRelocationTargets(element, owner, knownGlobals);
+      }
+    case DCConstStruct(fields: final fields):
+      for (final field in fields) {
+        _checkRelocationTargets(field, owner, knownGlobals);
       }
     case DCConstAddrOf(globalName: final target):
       if (!knownGlobals.contains(target)) {
@@ -2583,13 +2693,22 @@ List<DCGlobal> _collectRodataGlobals(
       );
     }
 
-    final elementType = _rodataElementType(field.type, name);
     final constant = initializer.constant;
+
+    // A const class instance is a STRUCT global -- the descriptor shape,
+    // `{ ptr name, u32 count, ptr fields }`, which cannot be an array
+    // because an LLVM array is homogeneous (ADR-0040, GAP-0031).
+    if (constant is InstanceConstant) {
+      globals.add(_rodataStructGlobal(constant, name, preludeUri));
+      continue;
+    }
+
+    final elementType = _rodataElementType(field.type, name);
     if (constant is! ListConstant) {
       throw DccLowerError(
         '"$name" is `@rodata` but its constant is a '
-        '${constant.runtimeType}, not a list. Only `List<uN>` tables are '
-        'supported today (ADR-0040).',
+        '${constant.runtimeType}. Supported shapes are a `List<uN>` table, a '
+        '`List<Ref>` address table, or a const class instance (a record).',
       );
     }
 

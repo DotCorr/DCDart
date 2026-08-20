@@ -52,8 +52,17 @@ object identity does not.
 
 ## Decision
 
-`@rodata final List<uN> name = const [...]` for scalar tables, and
-`@rodata final List<Ref> name = const [Ref('other')]` for a table of addresses.
+Three shapes, all `@rodata final X = const ...`:
+
+| source | emits | for |
+|---|---|---|
+| `List<uN>` of `uN(...)` | `[N x iW]` | scalar tables (a memory map) |
+| `List<Ref>` of `Ref('name')` | `[N x ptr]` + relocations | a directory of other tables |
+| a const class instance | `{ T1, T2, … }` + relocations | a RECORD — the descriptor shape |
+
+The third exists because an LLVM array is homogeneous, so `{ ptr name, u32 count, ptr fields }` is not
+an array at any width (GAP-0031). Field widths come from the class's declared field types and field
+order from its declaration order, since that order is the emitted layout.
 
 Both halves of the spelling are load-bearing. The `const` **initializer** makes contents compile-time
 known, so they can be emitted with no initializer machinery, no init order and nothing to run at
