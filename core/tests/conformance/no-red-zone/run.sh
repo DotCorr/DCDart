@@ -108,8 +108,20 @@ for dir in "$EXAMPLES_DIR"/*/; do
 
   checked=$((checked + 1))
 
+  # VACUOUS-PASS GUARD. Every check below concludes from the ABSENCE of a
+  # pattern, so an empty disassembly would "pass" everything. That is not
+  # hypothetical: an objdump that cannot read the format, or one that fails
+  # silently under `2>/dev/null`, produces exactly that. Two empty outputs
+  # also compare equal, which is how a section-comparison check in the
+  # oscortex_core kernel gave a confident wrong answer before sizes were
+  # checked. Prove there is something to look at first.
+  DISASM="$("$OBJDUMP" -d "$obj" 2>/dev/null)"
+  if [[ "$(grep -cE '^[[:space:]]+[0-9a-f]+:' <<<"$DISASM")" -lt 1 ]]; then
+    fail "$OBJDUMP produced no instructions for $name — every check below concludes from the ABSENCE of a pattern, so an empty disassembly would pass all of them vacuously"
+  fi
+
   # Any access at a negative displacement from %rsp is a red-zone access.
-  if bad=$("$OBJDUMP" -d "$obj" 2>/dev/null | grep -nE '\-0x[0-9a-f]+\(%rsp\)'); then
+  if bad=$(grep -nE '\-0x[0-9a-f]+\(%rsp\)' <<<"$DISASM"); then
     echo "NO-RED-ZONE: FAIL — $name accesses memory below %rsp (the red zone):" >&2
     echo "$bad" | head -5 >&2
     violations=$((violations + 1))
@@ -119,8 +131,8 @@ for dir in "$EXAMPLES_DIR"/*/; do
   # allocated. `push %rbp; mov %rsp,%rbp` with no `sub` means %rbp == %rsp,
   # so -0x8(%rbp) is also below the stack pointer -- this is exactly the shape
   # the oscortex_core kernel disassembly showed.
-  if "$OBJDUMP" -d "$obj" 2>/dev/null | grep -qE '\-0x[0-9a-f]+\(%rbp\)'; then
-    if ! "$OBJDUMP" -d "$obj" 2>/dev/null | grep -qE 'sub.*%rsp'; then
+  if grep -qE '\-0x[0-9a-f]+\(%rbp\)' <<<"$DISASM"; then
+    if ! grep -qE 'sub.*%rsp' <<<"$DISASM"; then
       echo "NO-RED-ZONE: FAIL — $name uses %rbp-relative locals with no stack allocation (red zone via %rbp)" >&2
       violations=$((violations + 1))
     fi

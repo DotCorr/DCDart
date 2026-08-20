@@ -124,9 +124,16 @@ layout and should not conclude anything is wrong.
 
 ## What this does NOT do
 
-**It does not unblock the kernel's memory map.** Of `oscortex_core`'s nine externs, exactly one falls
-to read-only data. Three need *mutable* static storage and five are privileged instructions that stay
-in assembly forever. The memory map's contents are unknowable at compile time — it is `.bss` filled at
+**It does not unblock the kernel's memory map, and it deletes ZERO of its externs today.** Of
+`oscortex_core`'s nine externs, one is read-only data *by category* — `isr_stub_table`. But it is not
+achievable, because its entries are the addresses of ASSEMBLY symbols, and address-of-extern does not
+exist (ADR-0038 gave extern *calls* only; GAP-0019). `Ref('isr_stubs')` is correctly rejected by name.
+So the honest count is: **zero externs removable now**, one removable once address-of-extern lands,
+three needing *mutable* static storage, and five privileged instructions that stay in assembly
+forever. Confirmed by the kernel's own first-consumer adoption, which eliminated none of them.
+
+An earlier draft said "exactly one falls to read-only data", which is true by category and reads as
+"one can be deleted", which is false. The memory map's contents are unknowable at compile time — it is `.bss` filled at
 runtime — so it can never be `.rodata` in any form, and the free-frame bitmap behind it is 4 KiB of
 mutable static minimum. This unit unblocks the reflection substrate and one kernel table. Saying
 "static data landed" without this paragraph would imply otherwise.

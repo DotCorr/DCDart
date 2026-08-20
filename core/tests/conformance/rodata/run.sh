@@ -137,7 +137,13 @@ echo "  layout ok: distinct tables at distinct offsets ($BASE_OFF vs $LEN_OFF)"
 
 # And nothing may be unnamed_addr / mergeable: a mergeable section would let
 # the linker collapse byte-identical globals to one address.
-if grep -qE "\.rodata\.cst|\.rodata\.str" <<<"$("$OBJDUMP" -h "$WORKDIR/rodata.o" 2>/dev/null)"; then
+#
+# VACUOUS-PASS GUARD: this concludes from the ABSENCE of a section name, so
+# an empty section table would pass it without checking anything.
+SECTIONS="$("$OBJDUMP" -h "$WORKDIR/rodata.o" 2>/dev/null)"
+grep -qE "\.rodata" <<<"$SECTIONS" \
+  || fail "$OBJDUMP listed no .rodata section at all — the mergeable-section check below concludes from an ABSENCE and would pass vacuously on empty input"
+if grep -qE "\.rodata\.cst|\.rodata\.str" <<<"$SECTIONS"; then
   fail "a mergeable .rodata.cst*/.rodata.str* section was emitted; globals must not be unnamed_addr (the linker may merge byte-identical ones, destroying identity)"
 fi
 echo "  layout ok: no mergeable sections — identical globals cannot be collapsed"
