@@ -1307,9 +1307,11 @@ class _BareFunctionLowerer {
   ///   - `while` only, not `for`/`do-while` (different Kernel AST shapes,
   ///     no target needs them yet).
   ///   - No `break`/`continue` (no BreakStatement lowering exists).
-  ///   - No nested loops — `_collectLoopCarriedCandidates` throws explicitly
-  ///     rather than silently scoping the carried-variable analysis to the
-  ///     wrong loop.
+  ///   - Nested loops ARE supported (ADR-0044). The carried-variable
+  ///     analysis recurses into an inner loop's body, and the
+  ///     `_values.containsKey` filter below keeps only variables declared
+  ///     BEFORE this loop — so an inner loop's own locals are excluded while
+  ///     an outer variable the inner loop assigns is correctly carried.
   ///   - No heap- or weak-typed local may be declared anywhere in the loop
   ///     body. The naive release policy (ADR-0016/0017) releases tracked
   ///     locals before each `return` — a loop's back edge is NOT a
@@ -1438,7 +1440,18 @@ class _BareFunctionLowerer {
       return;
     }
     if (stmt is WhileStatement) {
-      throw DccLowerError('"$context": nested while-loops are not supported yet');
+      // (ADR-0044) Recurse into a nested loop's body rather than refusing.
+      //
+      // The original refusal worried about "silently scoping the analysis to
+      // the wrong loop". That concern is already handled one level up:
+      // `_lowerWhile` keeps only candidates already present in `_values`,
+      // i.e. declared BEFORE this loop began. A variable declared inside the
+      // inner body is not in `_values` when the OUTER header is built, so it
+      // is excluded automatically — while a variable declared outside and
+      // assigned by the inner loop genuinely IS carried by the outer loop
+      // and must be collected here.
+      _collectLoopCarriedCandidates(stmt.body, out);
+      return;
     }
     // Anything else (VariableDeclaration, ReturnStatement, a non-VariableSet
     // ExpressionStatement) can't itself carry a VariableSet target this

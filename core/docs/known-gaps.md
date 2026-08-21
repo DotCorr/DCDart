@@ -103,6 +103,37 @@ clean run. The kernel side has offered to run exactly that.
 
 ---
 
+## GAP-0037 — Every "not supported yet" refusal in `dcc-lower` deserves re-examination; at least one was already safe
+
+**Domain:** dcc-lower (process, not a single defect)
+**Status:** OPEN — one instance found and fixed (ADR-0044), the rest unaudited
+
+ADR-0028 refused to lower nested `while` loops, with a comment explaining that recursing would
+"silently scope the carried-variable analysis to the wrong loop". It read as considered, and it was
+wrong: `_lowerWhile` already filtered candidates to variables present in `_values`, which is exactly
+the scoping guarantee the comment wanted. Enabling nesting was one line, and every hard case —
+an inner loop assigning an outer variable, triple nesting, an early return out of both — worked
+immediately.
+
+It sat for eleven ADRs and was found by `oscortex_core` hitting it twice in one milestone, not by
+this repo.
+
+**The generalizable part.** A crash gets investigated. A deliberate, well-commented refusal naming a
+plausible hazard reads as a decision someone already made, and is therefore *less* likely to be
+re-examined — the comment does the work of discouraging the next person. That is an unusual failure
+mode: the better the comment, the longer the wrong refusal survives.
+
+`dcc-lower` contains several more of these — `break`/`continue`, heap locals in loop bodies,
+getters/setters on `HeapObject` (ADR-0043), heap-typed field stores (escalation 0006). Some are
+genuinely unresolved design questions; at least one was not. They have never been audited as a group.
+
+**Cost of the workaround:** each refusal is individually honest, so nothing is being hidden. The cost
+is that downstream consumers discover which ones were merely untested, in the middle of building
+something else. An audit pass over every `not supported yet` in `dcc-lower`, asking only "is the
+stated hazard actually still real?", is cheap and has already paid once.
+
+---
+
 ## GAP-0036 — Port I/O is optimization-safe by ACCIDENT, not by design (now tested)
 
 **Domain:** dc-ir, backend (M2, downstream: `oscortex_core`)
