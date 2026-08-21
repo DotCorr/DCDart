@@ -133,6 +133,15 @@ correct, and is it?"** — NOT "is the stated hazard still real?". The second in
 comment, which is the thing that misled everyone. The first forces reconstructing the argument from
 the code, which is where the answer actually was.
 
+**Third instance, and it makes this a class (2026-08-21).** `u64(first - 1)` was rejected with "the
+argument must be an integer literal or a compile-time integer constant" while being exactly that
+(ADR-0046). The common thread across all three is now clear and is more useful than the individual
+fixes: **each refusal was written as a SHAPE check — matching AST node types — while its message
+described a SEMANTIC rule.** A shape check documented in semantic language drifts from its own
+documentation the moment a new shape expresses the same meaning. Note ADR-0037 had already widened
+this same check once, by adding a shape rather than by evaluating; widening a pattern-match is what
+invited the identical bug a second time.
+
 **First audit run, `break`/`continue` (2026-08-21).** Applying that question produced a better result
 than a yes/no:
 

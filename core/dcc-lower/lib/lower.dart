@@ -1731,12 +1731,10 @@ class _BareFunctionLowerer {
           // accepted -- otherwise `const stride = 4;` is rejected while a
           // bare `4` works, which is a confusing distinction with no
           // reason behind it (found by writing examples/demo-stats, ADR-0037).
+          final folded = _tryFoldConstInt(arg);
           final int bits;
-          if (arg is IntLiteral) {
-            bits = arg.value;
-          } else if (arg is ConstantExpression &&
-              arg.constant is IntConstant) {
-            bits = (arg.constant as IntConstant).value;
+          if (folded != null) {
+            bits = folded;
           } else {
             throw DccLowerError(
               '"$context": a $sizedIntType literal constructed from a '
@@ -2779,6 +2777,74 @@ void _checkRelocationTargets(
         );
       }
   }
+}
+
+/// Evaluates a compile-time integer expression, or returns null if it is not
+/// one (ADR-0046).
+///
+/// Handles the three shapes a constant integer actually arrives in:
+///
+///   `4`                  IntLiteral
+///   `someConstInt`       ConstantExpression(IntConstant) -- the CFE has
+///                        already inlined and evaluated it
+///   `someConstInt - 1`   InstanceInvocation -- NOT pre-folded, because an
+///                        argument position is not a const context
+///
+/// The third is why this exists. `u64(first - 1)` used to be rejected with
+/// "the argument must be an integer literal or a compile-time integer
+/// constant" while being exactly that: the check pattern-matched node shapes
+/// and never evaluated anything, so its own error message described a rule it
+/// did not implement (known-gaps GAP-0037).
+///
+/// Reads `expr.name.text` rather than `interfaceTarget`. The operator belongs
+/// to `dart:core`'s `int`, an unbound reference under `--no-link-platform`
+/// that throws on inspection; the invoked NAME is a plain `Name` on the node
+/// itself and is always safe. Same unbound-platform-node trap ADR-0014 and
+/// ADR-0040 both hit.
+///
+/// Deliberately NOT a general constant evaluator: integer arithmetic on
+/// operands that are themselves foldable, and nothing else. Division by zero
+/// returns null (treated as non-constant) rather than throwing -- a
+/// compile-time division by zero deserves a diagnostic of its own, not a
+/// crash inside the folder.
+int? _tryFoldConstInt(Expression expr) {
+  if (expr is IntLiteral) return expr.value;
+  if (expr is ConstantExpression) {
+    final constant = expr.constant;
+    return constant is IntConstant ? constant.value : null;
+  }
+  if (expr is InstanceInvocation) {
+    final args = expr.arguments.positional;
+    if (args.length != 1) return null;
+    final lhs = _tryFoldConstInt(expr.receiver);
+    final rhs = _tryFoldConstInt(args.single);
+    if (lhs == null || rhs == null) return null;
+    switch (expr.name.text) {
+      case '+':
+        return lhs + rhs;
+      case '-':
+        return lhs - rhs;
+      case '*':
+        return lhs * rhs;
+      case '~/':
+        return rhs == 0 ? null : lhs ~/ rhs;
+      case '%':
+        return rhs == 0 ? null : lhs % rhs;
+      case '<<':
+        return (rhs < 0 || rhs > 63) ? null : lhs << rhs;
+      case '>>':
+        return (rhs < 0 || rhs > 63) ? null : lhs >> rhs;
+      case '&':
+        return lhs & rhs;
+      case '|':
+        return lhs | rhs;
+      case '^':
+        return lhs ^ rhs;
+      default:
+        return null;
+    }
+  }
+  return null;
 }
 
 /// The emitted symbol name for an instance method (ADR-0043).

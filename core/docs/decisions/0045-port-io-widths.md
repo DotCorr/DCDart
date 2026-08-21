@@ -57,8 +57,13 @@ ring-0-only instructions that trap in a normal process. Real end-to-end proof ha
 
 ## Consequences
 
-- `oscortex_core` can delete `portio.S` entirely and four `@extern` declarations with it. That is a
-  clean way to measure this change: the extern count drops from 12 to 8 and a `.S` file disappears.
+- `oscortex_core` can delete `portio.S` entirely and four `@extern` declarations with it: its
+  `kmain.o` goes from **29 declared externs to 25**, and a `.S` file disappears.
+
+  (An earlier draft of this ADR said "12 to 8", relayed from the kernel side before either of us had
+  checked. Their agent read `verify-freestanding`'s actual output and corrected it. Recorded rather
+  than silently fixed, because a measured claim that turns out to be someone's recollection is worth
+  noticing — the number was wrong in the flattering direction.)
 - PCI enumeration becomes expressible in DCDart rather than in donated assembly.
 - The three-width table is now the complete x86 port surface. Nothing further is needed here, unlike
   most gaps this project closes partially.
