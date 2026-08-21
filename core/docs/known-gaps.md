@@ -133,6 +133,14 @@ correct, and is it?"** — NOT "is the stated hazard still real?". The second in
 comment, which is the thing that misled everyone. The first forces reconstructing the argument from
 the code, which is where the answer actually was.
 
+**Fourth instance, and the sharpest (2026-08-21).** `_collectLoopCarriedCandidates` fell off its end
+SILENTLY for unrecognized statements. `continue` wraps a loop body in a `LabeledStatement`, which it
+did not know, so it collected nothing, the loop header got no phi parameters, and the emitted code
+branched to itself — a hang with no diagnostic (ADR-0047). This is the worst version of the pattern
+because the consequence of a missed shape is *wrong code* rather than a refusal: nothing downstream is
+malformed, so nothing downstream can report it. The walker is now exhaustive and throws on anything
+unlisted.
+
 **Third instance, and it makes this a class (2026-08-21).** `u64(first - 1)` was rejected with "the
 argument must be an integer literal or a compile-time integer constant" while being exactly that
 (ADR-0046). The common thread across all three is now clear and is more useful than the individual

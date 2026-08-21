@@ -682,6 +682,16 @@ class _BareFunctionLowerer {
 
   /// The receiver value when lowering an instance method (ADR-0043).
   DCValue? _thisValue;
+
+  /// Where a `break`/`continue` targeting a given label must branch to, and
+  /// which loop-carried variables that edge has to carry (ADR-0047).
+  ///
+  /// Kernel spells BOTH as `BreakStatement`; they differ only in which
+  /// `LabeledStatement` is the target. A label wrapping the WHILE means
+  /// `break` (jump past the loop); a label wrapping the loop's BODY means
+  /// `continue` (jump to the header). Nothing else distinguishes them.
+  final Map<LabeledStatement, ({BlockId target, List<VariableDeclaration> vars})>
+      _labelTargets = {};
   final List<DCBasicBlock> _finishedBlocks = [];
   List<DCInstruction> _currentInstructions = [];
   List<DCValue> _currentBlockParams = const [];
@@ -1107,6 +1117,39 @@ class _BareFunctionLowerer {
       return;
     }
 
+    // (ADR-0047) A label wrapping a `while` is the `break` target. Pass it
+    // down so `_lowerWhile` can register it against its exit block; a label
+    // wrapping anything else has no loop to bind to and is just lowered
+    // through.
+    if (stmt is LabeledStatement) {
+      final body = stmt.body;
+      if (body is WhileStatement) {
+        _lowerWhile(body, breakLabel: stmt);
+        return;
+      }
+      _lowerStatement(body);
+      return;
+    }
+
+    if (stmt is BreakStatement) {
+      final entry = _labelTargets[stmt.target];
+      if (entry == null) {
+        throw DccLowerError(
+          '"$context": `break`/`continue` targets a label that is not a '
+          'loop this function is lowering. Labelled `break` to an arbitrary '
+          'statement is not supported (ADR-0047).',
+        );
+      }
+      // Carry the CURRENT values of the loop variables across the edge --
+      // the whole reason the exit block needs parameters at all.
+      _addInstr(Branch(
+        target: entry.target,
+        args: [for (final v in entry.vars) _values[v]!],
+      ));
+      _finishBlock();
+      return;
+    }
+
     if (stmt is WhileStatement) {
       _lowerWhile(stmt);
       return;
@@ -1331,7 +1374,7 @@ class _BareFunctionLowerer {
   ///     docs/known-gaps.md. Enforced by checking `_heapLocals`/
   ///     `_weakLocals` didn't grow across the body, rather than guessing a
   ///     policy no one has decided.
-  void _lowerWhile(WhileStatement stmt) {
+  void _lowerWhile(WhileStatement stmt, {LabeledStatement? breakLabel}) {
     final candidates = <VariableDeclaration>{};
     _collectLoopCarriedCandidates(stmt.body, candidates);
 
@@ -1378,15 +1421,41 @@ class _BareFunctionLowerer {
         'dcc-lower bug, front_end should have required a real bool here',
       );
     }
+    // (ADR-0047) The exit block now takes the loop variables as parameters.
+    // Before `break` existed it needed none: the exit was reachable through
+    // exactly one edge -- the header's false branch -- so the header's own
+    // phi params still dominated it. A `break` adds a second predecessor
+    // carrying DIFFERENT values (a body that assigns a loop variable then
+    // breaks), and without parameters the exit would read the pre-body
+    // value. That single-predecessor assumption was never written down;
+    // known-gaps GAP-0037 records how it was found.
+    final exitParams = [
+      for (final v in loopVars) DCValue(_allocId(), _values[v]!.type),
+    ];
+    final condExitArgs = [for (final v in loopVars) _values[v]!];
     _addInstr(
-      CondBranch(cond: cond, trueTarget: bodyBlockId, trueArgs: const [], falseTarget: exitBlockId, falseArgs: const []),
+      CondBranch(cond: cond, trueTarget: bodyBlockId, trueArgs: const [], falseTarget: exitBlockId, falseArgs: condExitArgs),
     );
     _finishBlock();
+
+    // Register both label kinds before lowering the body, since a `break` or
+    // `continue` inside it resolves through this map.
+    if (breakLabel != null) {
+      _labelTargets[breakLabel] = (target: exitBlockId, vars: loopVars);
+    }
+    final body = stmt.body;
+    if (body is LabeledStatement) {
+      // A label wrapping the loop BODY is `continue`: branch to the header,
+      // which is exactly what the back edge below does.
+      _labelTargets[body] = (target: condBlockId, vars: loopVars);
+    }
 
     _startBlock(bodyBlockId, const []);
     final heapLocalsBeforeBody = _heapLocals.length;
     final weakLocalsBeforeBody = _weakLocals.length;
-    _lowerBranchBody(stmt.body);
+    // Unwrap the continue-label if present: it was registered above, and
+    // what actually needs lowering is the statement inside it.
+    _lowerBranchBody(body is LabeledStatement ? body.body : body);
     if (_heapLocals.length != heapLocalsBeforeBody || _weakLocals.length != weakLocalsBeforeBody) {
       throw DccLowerError(
         '"$context": a heap- or weak-typed local was declared inside a '
@@ -1405,16 +1474,14 @@ class _BareFunctionLowerer {
       _finishBlock();
     }
 
-    // What's live at the exit block is the header's OWN phi params — not
-    // whatever the body last computed, which does not dominate the exit
-    // (the exit is only reachable via the header's false edge, never
-    // through the body). Same restore-after-branch reasoning as
-    // `_lowerIf`'s `_values` handling (ADR-0027), specialized to a loop
-    // header instead of an if/else merge.
+    // (ADR-0047) What's live after the loop is the EXIT block's own
+    // parameters, not the header's. The header's params were correct while
+    // the exit had a single predecessor; now that a `break` can reach it
+    // with different values, only a real phi at the exit is right.
+    _startBlock(exitBlockId, exitParams);
     for (var i = 0; i < loopVars.length; i++) {
-      _values[loopVars[i]] = condParams[i];
+      _values[loopVars[i]] = exitParams[i];
     }
-    _startBlock(exitBlockId, const []);
   }
 
   /// Pure Kernel-IR-AST walk collecting every `VariableSet` target
@@ -1446,6 +1513,12 @@ class _BareFunctionLowerer {
       }
       return;
     }
+    if (stmt is LabeledStatement) {
+      // (ADR-0047) A `continue` wraps the loop BODY in a LabeledStatement.
+      // Missing this case is what produced the silent hang described below.
+      _collectLoopCarriedCandidates(stmt.body, out);
+      return;
+    }
     if (stmt is WhileStatement) {
       // (ADR-0044) Recurse into a nested loop's body rather than refusing.
       //
@@ -1460,11 +1533,37 @@ class _BareFunctionLowerer {
       _collectLoopCarriedCandidates(stmt.body, out);
       return;
     }
-    // Anything else (VariableDeclaration, ReturnStatement, a non-VariableSet
-    // ExpressionStatement) can't itself carry a VariableSet target this
-    // project's lowering recognizes — ignored, not an error, since
-    // `_lowerBranchBody` will report a real problem with it on its own if
-    // it's genuinely unsupported.
+    // ANYTHING ELSE IS A HARD ERROR, and that is the point (ADR-0047).
+    //
+    // This used to fall off the end silently, on the reasoning that anything
+    // unrecognized "can't itself carry a VariableSet target". That reasoning
+    // was wrong in exactly one way and it cost a silent miscompilation:
+    // `LabeledStatement` — which is how `continue` arrives — wraps the ENTIRE
+    // loop body, so falling through here collected NOTHING. The header got no
+    // phi parameters, the condition compared the variable's entry value
+    // forever, and the emitted loop branched to itself. No diagnostic, no
+    // wrong answer: a hang.
+    //
+    // A missed assignment cannot be reported later either, because there is
+    // nothing malformed downstream to report — the IR is well-formed and just
+    // means something else. So the walk must be exhaustive, and the
+    // statements below are listed because they genuinely cannot contain a
+    // loop-carried assignment, not because they were the ones that happened
+    // to show up.
+    if (stmt is ReturnStatement ||
+        stmt is BreakStatement ||
+        stmt is EmptyStatement ||
+        stmt is VariableDeclaration ||
+        stmt is ExpressionStatement) {
+      return;
+    }
+    throw DccLowerError(
+      '"$context": loop-carried-variable analysis met an unhandled statement '
+      '${stmt.runtimeType} inside a loop body. Refusing rather than skipping '
+      'it: a missed assignment emits a loop whose header never updates that '
+      'variable, which is a silent hang rather than an error '
+      '(docs/decisions/0047-break-and-continue.md).',
+    );
   }
 
   void _lowerReturn(ReturnStatement stmt) {
