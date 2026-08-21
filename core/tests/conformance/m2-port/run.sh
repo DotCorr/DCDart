@@ -90,6 +90,17 @@ fi
 DISASM="$(llvm-objdump -d "$OBJ")"
 OUTB_COUNT="$(grep -c $'\t''outb'$'\t' <<<"$DISASM" || true)"
 INB_COUNT="$(grep -c $'\t''inb'$'\t' <<<"$DISASM" || true)"
+# (ADR-0045) Word and doubleword port access. The mnemonic AND the
+# accumulator register are both checked: `outl` paired with `%ax` would be a
+# width bug the mnemonic alone would not catch.
+OUTL_COUNT="$(grep -c $'\t''outl'$'\t''%eax, %dx' <<<"$DISASM" || true)"
+INL_COUNT="$(grep -c $'\t''inl'$'\t''%dx, %eax' <<<"$DISASM" || true)"
+OUTW_COUNT="$(grep -c $'\t''outw'$'\t''%ax, %dx' <<<"$DISASM" || true)"
+INW_COUNT="$(grep -c $'\t''inw'$'\t''%dx, %ax' <<<"$DISASM" || true)"
+[[ "$OUTL_COUNT" -eq 1 ]] || fail "expected 1 'outl %eax, %dx', found $OUTL_COUNT (PCI config space is decoded for doublewords only -- a narrower access reads the wrong register)"
+[[ "$INL_COUNT" -eq 1 ]] || fail "expected 1 'inl %dx, %eax', found $INL_COUNT"
+[[ "$OUTW_COUNT" -eq 1 ]] || fail "expected 1 'outw %ax, %dx', found $OUTW_COUNT"
+[[ "$INW_COUNT" -eq 1 ]] || fail "expected 1 'inw %dx, %ax', found $INW_COUNT"
 
 if [[ "$OUTB_COUNT" -ne 7 ]]; then
   echo "$DISASM" >&2
@@ -100,5 +111,5 @@ if [[ "$INB_COUNT" -ne 1 ]]; then
   fail "expected 1 'inb' instruction in the disassembly, found $INB_COUNT"
 fi
 
-echo "M2-port: PASS — dcc build -> verify-freestanding pass -> disassembly confirms 7 real outb + 1 real inb instruction, correct opcodes, not executed (privileged instructions, see docs/decisions/0029-port-io.md)"
+echo "M2-port: PASS — dcc build -> verify-freestanding pass -> disassembly confirms 7 real outb + 1 real inb, plus outl/inl/outw/inw at the correct widths with the correct accumulator registers (ADR-0045), correct opcodes, not executed (privileged instructions, see docs/decisions/0029-port-io.md)"
 exit 0

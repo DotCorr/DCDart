@@ -26,3 +26,20 @@ void initCom1() {
 u8 readLineStatus() {
   return Port.inb(u16(0x3FD));
 }
+
+/// PCI configuration space access (ADR-0045). The motivating case for
+/// doubleword port I/O: config space is only decoded for 32-bit accesses, so
+/// `outl`/`inl` are not a convenience here -- a byte or word access simply
+/// does not return the register you asked for.
+@bare
+u32 pciConfigRead(u32 address) {
+  Port.outl(u16(0x0CF8), address);
+  return Port.inl(u16(0x0CFC));
+}
+
+/// Word-width access, for completeness of the three x86 port widths.
+@bare
+u16 readWord(u16 port) {
+  Port.outw(u16(0x0060), u16(0));
+  return Port.inw(port);
+}

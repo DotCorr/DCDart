@@ -1031,7 +1031,9 @@ class _BareFunctionLowerer {
         final target = expr.target;
         if (target.isStatic &&
             target.enclosingClass?.name == 'Port' &&
-            target.name.text == 'outb' &&
+            (target.name.text == 'outb' ||
+                target.name.text == 'outw' ||
+                target.name.text == 'outl') &&
             target.enclosingLibrary.importUri == preludeUri) {
           final args = expr.arguments.positional;
           final port = _lowerExpression(args[0]);
@@ -1042,10 +1044,15 @@ class _BareFunctionLowerer {
               'expected u16',
             );
           }
-          if (value.type != DCInt.u8) {
+          final expectedValueType = switch (target.name.text) {
+            'outw' => DCInt.u16,
+            'outl' => DCInt.u32,
+            _ => DCInt.u8,
+          };
+          if (value.type != expectedValueType) {
             throw DccLowerError(
-              '"$context": Port.outb\'s value argument has type '
-              '${value.type}, expected u8',
+              '"$context": Port.${target.name.text}\'s value argument has '
+              'type ${value.type}, expected $expectedValueType',
             );
           }
           _addInstr(PortOut(port: port, value: value));
@@ -1759,7 +1766,9 @@ class _BareFunctionLowerer {
       // actually need).
       if (target.isStatic &&
           target.enclosingClass?.name == 'Port' &&
-          target.name.text == 'inb' &&
+          (target.name.text == 'inb' ||
+              target.name.text == 'inw' ||
+              target.name.text == 'inl') &&
           target.enclosingLibrary.importUri == preludeUri) {
         final port = _lowerExpression(expr.arguments.positional.single);
         if (port.type != DCInt.u16) {
@@ -1768,7 +1777,14 @@ class _BareFunctionLowerer {
             'expected u16',
           );
         }
-        final dest = DCValue(_allocId(), DCInt.u8);
+        // Result width follows the mnemonic (ADR-0045). PCI config space is
+        // decoded for doublewords only, which is why `inl` exists at all.
+        final resultType = switch (target.name.text) {
+          'inw' => DCInt.u16,
+          'inl' => DCInt.u32,
+          _ => DCInt.u8,
+        };
+        final dest = DCValue(_allocId(), resultType);
         _addInstr(PortIn(dest: dest, port: port));
         return dest;
       }

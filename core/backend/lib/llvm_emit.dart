@@ -399,20 +399,26 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
       final vol = instruction.isVolatile ? 'volatile ' : '';
       e.line('store $vol$type %v${instruction.value.id.index}, ptr %v${instruction.pointer.id.index}');
     case PortOut():
-      // AT&T `outb %al, %dx` -- verified against a real disassembly (not
-      // guessed) before wiring this in: value into {al} ($0), port into
-      // {dx} ($1), matching the asm string's operand order exactly.
+      // AT&T `out{b,w,l} %reg, %dx` -- value into the accumulator ($0), port
+      // into {dx} ($1), matching the asm string's operand order exactly. The
+      // byte form was verified against a real disassembly before being wired
+      // in (ADR-0029); the wider forms follow the identical shape with the
+      // mnemonic suffix and accumulator register chosen by width (ADR-0045).
+      final outSpec = _portSpec(instruction.value.type, context: context);
       e.line(
-        'call void asm sideeffect "outb \$0, \$1", "{al},{dx}"'
-        '(i8 %v${instruction.value.id.index}, i16 %v${instruction.port.id.index})',
+        'call void asm sideeffect "out${outSpec.suffix} \$0, \$1", '
+        '"{${outSpec.reg}},{dx}"'
+        '(${outSpec.llvmType} %v${instruction.value.id.index}, i16 %v${instruction.port.id.index})',
       );
     case PortIn():
-      // AT&T `inb %dx, %al` -- one output ({al}, numbered $0 per LLVM's
-      // "outputs numbered first" rule) and one input ({dx}, $1), so the
-      // asm string reads "inb $1, $0" to put the source (port) first and
-      // the destination (result) second, matching real AT&T syntax.
+      // AT&T `in{b,w,l} %dx, %reg` -- one output (the accumulator, numbered
+      // $0 per LLVM's "outputs numbered first" rule) and one input ({dx},
+      // $1), so the asm string reads "in $1, $0" to put the source (port)
+      // first and the destination second, matching real AT&T syntax.
+      final inSpec = _portSpec(instruction.dest.type, context: context);
       e.line(
-        '%v${instruction.dest.id.index} = call i8 asm sideeffect "inb \$1, \$0", "={al},{dx}"'
+        '%v${instruction.dest.id.index} = call ${inSpec.llvmType} asm sideeffect '
+        '"in${inSpec.suffix} \$1, \$0", "={${inSpec.reg}},{dx}"'
         '(i16 %v${instruction.port.id.index})',
       );
     case Call():
@@ -831,6 +837,37 @@ String _constantTypeText(
           : _constantTypeText(elements.first, elementType, context: context);
       return '[${elements.length} x $inner]';
   }
+}
+
+/// The x86 mnemonic suffix, accumulator register and LLVM type for a port
+/// access of a given operand width (ADR-0045).
+///
+/// Port I/O is defined for byte, word and doubleword only — there is no
+/// `outq`. A 64-bit operand is rejected here rather than emitted as
+/// something clang would refuse later with a worse message.
+({String suffix, String reg, String llvmType}) _portSpec(
+  DCType type, {
+  required String context,
+}) {
+  if (type is DCInt) {
+    switch (type.width) {
+      case IntWidth.w8:
+        return (suffix: 'b', reg: 'al', llvmType: 'i8');
+      case IntWidth.w16:
+        return (suffix: 'w', reg: 'ax', llvmType: 'i16');
+      case IntWidth.w32:
+        return (suffix: 'l', reg: 'eax', llvmType: 'i32');
+      case IntWidth.w64:
+      case IntWidth.wSize:
+        throw BackendError(
+          '"$context": port I/O at 64-bit width. x86 defines port access for '
+          'byte, word and doubleword only — there is no `outq`/`inq`.',
+        );
+    }
+  }
+  throw BackendError(
+    '"$context": port I/O on a non-integer operand ($type)',
+  );
 }
 
 /// The M2 ARC arena's global state (docs/decisions/0015): a fixed array of

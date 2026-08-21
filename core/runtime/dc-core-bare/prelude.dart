@@ -471,6 +471,23 @@ class Rodata {
 class Port {
   static void outb(u16 port, u8 value) => throw UnimplementedError('dcc-lower substitutes real codegen for this');
   static u8 inb(u16 port) => throw UnimplementedError('dcc-lower substitutes real codegen for this');
+
+  /// Word (16-bit) and doubleword (32-bit) port I/O (ADR-0045).
+  ///
+  /// Added because PCI configuration space is only decoded for DOUBLEWORD
+  /// accesses -- a byte or word read of CONFIG_DATA does not return what you
+  /// want, so `inl`/`outl` are not a convenience there, they are the only
+  /// thing that works. `oscortex_core` had a hand-written `portio.S` supplying
+  /// exactly these four instructions and nothing else; this deletes it.
+  ///
+  /// No new DC-IR instruction: `PortOut`/`PortIn` already carry typed
+  /// operands, so the width comes from `u8`/`u16`/`u32` and the backend
+  /// picks the mnemonic and register constraint from it. Same narrowness
+  /// ADR-0029 chose -- fixed inline asm shapes, not general `asm`.
+  static void outw(u16 port, u16 value) => throw UnimplementedError('dcc-lower substitutes real codegen for this');
+  static u16 inw(u16 port) => throw UnimplementedError('dcc-lower substitutes real codegen for this');
+  static void outl(u16 port, u32 value) => throw UnimplementedError('dcc-lower substitutes real codegen for this');
+  static u32 inl(u16 port) => throw UnimplementedError('dcc-lower substitutes real codegen for this');
 }
 
 /// Pointer<T> (DCDART_SPEC.md §6). M1 minimal surface: `.fromAddress` and
