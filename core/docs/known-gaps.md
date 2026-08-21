@@ -127,10 +127,47 @@ mode: the better the comment, the longer the wrong refusal survives.
 getters/setters on `HeapObject` (ADR-0043), heap-typed field stores (escalation 0006). Some are
 genuinely unresolved design questions; at least one was not. They have never been audited as a group.
 
-**Cost of the workaround:** each refusal is individually honest, so nothing is being hidden. The cost
-is that downstream consumers discover which ones were merely untested, in the middle of building
-something else. An audit pass over every `not supported yet` in `dcc-lower`, asking only "is the
-stated hazard actually still real?", is cheap and has already paid once.
+**How to run the audit, which is not the obvious way.** The `oscortex_core` side sharpened the
+question and the improvement is real: ask **"what would have to be true for this refusal to be
+correct, and is it?"** — NOT "is the stated hazard still real?". The second invites re-reading the
+comment, which is the thing that misled everyone. The first forces reconstructing the argument from
+the code, which is where the answer actually was.
+
+**First audit run, `break`/`continue` (2026-08-21).** Applying that question produced a better result
+than a yes/no:
+
+- `continue` is a branch to the loop header with the current loop-variable values, which is
+  *byte-identical to the back edge `_lowerWhile` already emits*. Genuinely free.
+- `break` is a branch to `exitBlockId` — and the finding is not "break is missing". It is that
+  **`exitBlockId` carries an unstated single-predecessor assumption.** It is created with NO block
+  parameters, and the exit restores values from the header's phi params. That is correct *only
+  because* the exit is reachable through exactly one edge (the header's false branch). Add a `break`
+  and a body that assigns a loop variable then breaks would read the pre-body value at the exit.
+
+That precondition was nowhere in the code or the comments. So the refusal was right, for a reason
+nobody had written down and which the stated reason did not mention.
+
+**The invariant that audit exposed, recorded here because it is upheld everywhere and stated
+nowhere:** *a DC-IR block needs parameters if and only if it has more than one predecessor.* Checked
+against every block-creation site in `dcc-lower`:
+
+| block | params? | predecessors |
+|---|---|---|
+| `thenBlockId`, `elseBlockId` | no | 1 (a `CondBranch` edge) |
+| `bodyBlockId` | no | 1 (the header's true edge) |
+| `errBlockId`, `okBlockId` (`Result.propagate`) | no | 1 each |
+| `exitBlockId` | no | 1 today — **2+ the moment `break` exists** |
+| `mergeBlockId` (if/else) | **yes** | 2 |
+| `condBlockId` (loop header) | **yes** | 2 (entry + back edge) |
+
+The rule holds in all six existing cases. `break` is the first thing that would break it, and it
+would do so silently — the emitted IR is still well-formed, the values are just wrong.
+
+**Cost of the workaround:** each refusal is individually honest, so nothing is hidden. The cost is
+that downstream consumers discover which ones were merely untested, mid-way through building
+something else. The remaining unaudited refusals: heap locals in loop bodies (ARC policy — genuinely
+unresolved, belongs with escalation 0006), getters/setters on `HeapObject` (ADR-0043 — untested, not
+unresolved), and heap-typed field stores (escalation 0006).
 
 ---
 
