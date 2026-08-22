@@ -267,16 +267,19 @@ inferring from the gaps file:
 
 | prerequisite | status | blocks |
 |---|---|---|
-| `null` / nullable heap refs | `unsupported expression NullLiteral` | trees, lists, anything optional |
-| heap-typed field **store** | rejected (GAP-0020) | every mutable data structure |
 | generics / monomorphization | `unsupported type TypeParameterType` (spec §4.2) | any container |
 | closures | `unsupported expression FunctionExpression` | the functional workload |
 | `String` | `unsupported expression StringLiteral` (spec §7) | JSON parser, string pass |
 | instance methods | **RESOLVED 2026-08-21 (ADR-0043)** | — |
-| `for` loops | `unsupported statement ForStatement` | cosmetic — `while` works |
+| `null` / nullable heap refs | **RESOLVED 2026-08-22 (ADR-0049)** | — |
+| heap-typed field **store** | **RESOLVED 2026-08-22 (ADR-0048)** | — |
+| `for` loops | **RESOLVED 2026-08-22 (ADR-0050)** | — |
 
-Only `bool` locals passed. Instance methods have since been implemented (ADR-0043); the other six
-remain.
+Only `bool` locals passed at the time. Since then: instance methods (ADR-0043), nested loops
+(ADR-0044), `break`/`continue` (ADR-0047), nullable heap references (ADR-0049), heap-typed field
+stores (ADR-0048) and `for` loops (ADR-0050) have all landed. **Two prerequisites remain: generics
+and `String`.** A tree/graph traversal benchmark is now writable; a JSON parser and a hashmap
+workload are not.
 
 **So M3 is not one unit away. It is most of the remaining language.** That is worth stating plainly
 because "the gate is unblocked" reads as "the gate is next", and it is not — the benchmarks are

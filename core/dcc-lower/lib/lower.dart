@@ -1137,6 +1137,26 @@ class _BareFunctionLowerer {
       return;
     }
 
+    // (ADR-0050) `for (init; cond; update) body` desugars to the `while`
+    // machinery rather than getting its own lowering:
+    //
+    //     init;  while (cond) { body; update; }
+    //
+    // Everything `_lowerWhile` already handles then applies unchanged --
+    // loop-carried variables, nesting (ADR-0044), break/continue (ADR-0047),
+    // heap-typed locals (ADR-0048). Writing a second loop lowering would have
+    // meant re-deriving all of that and getting one of them subtly different.
+    //
+    // NOTE the update goes at the END of the body, which is where `continue`
+    // makes the difference: Dart's `continue` in a `for` runs the update
+    // before re-testing, and appending it to the body preserves that only
+    // because `continue` targets the body's own label, which sits OUTSIDE
+    // this appended block. Verified by test rather than by reasoning.
+    if (stmt is ForStatement) {
+      _lowerFor(stmt);
+      return;
+    }
+
     // (ADR-0047) A label wrapping a `while` is the `break` target. Pass it
     // down so `_lowerWhile` can register it against its exit block; a label
     // wrapping anything else has no loop to bind to and is just lowered
@@ -1145,6 +1165,12 @@ class _BareFunctionLowerer {
       final body = stmt.body;
       if (body is WhileStatement) {
         _lowerWhile(body, breakLabel: stmt);
+        return;
+      }
+      if (body is ForStatement) {
+        // (ADR-0050) A `for` gets the same label treatment as a `while` --
+        // the CFE wraps both when the loop contains a `break`.
+        _lowerFor(body, breakLabel: stmt);
         return;
       }
       _lowerStatement(body);
@@ -1394,9 +1420,47 @@ class _BareFunctionLowerer {
   ///     docs/known-gaps.md. Enforced by checking `_heapLocals`/
   ///     `_weakLocals` didn't grow across the body, rather than guessing a
   ///     policy no one has decided.
-  void _lowerWhile(WhileStatement stmt, {LabeledStatement? breakLabel}) {
+  /// (ADR-0050) `for (init; cond; update) body` -> the `while` machinery.
+  ///
+  ///     init;  while (cond) { body; update; }
+  ///
+  /// Desugared rather than given its own lowering so that loop-carried
+  /// variables, nesting (ADR-0044), break/continue (ADR-0047) and heap-typed
+  /// locals (ADR-0048) all apply unchanged. A second loop lowering would have
+  /// meant re-deriving every one of those and getting one subtly different.
+  void _lowerFor(ForStatement stmt, {LabeledStatement? breakLabel}) {
+    if (stmt.condition == null) {
+      throw DccLowerError(
+        '"$context": `for (;;)` with no condition is not supported -- the '
+        'desugaring needs a condition expression, and an always-true loop '
+        'has no target that has been tested',
+      );
+    }
+    for (final v in stmt.variables) {
+      _lowerStatement(v);
+    }
+    _lowerWhile(
+      WhileStatement(stmt.condition!, stmt.body),
+      breakLabel: breakLabel,
+      updates: [for (final u in stmt.updates) ExpressionStatement(u)],
+    );
+  }
+
+  void _lowerWhile(
+    WhileStatement stmt, {
+    LabeledStatement? breakLabel,
+    List<Statement> updates = const [],
+  }) {
     final candidates = <VariableDeclaration>{};
     _collectLoopCarriedCandidates(stmt.body, candidates);
+    // (ADR-0050) A `for` loop's update clause is where its induction variable
+    // is almost always assigned -- `i = i + 1` lives there, not in the body.
+    // Missing it produces a header with no phi for `i`, so the condition
+    // compares the initial value forever: the same silent hang ADR-0047 hit
+    // through `LabeledStatement`, reached by a different route.
+    for (final u in updates) {
+      _collectLoopCarriedCandidates(u, candidates);
+    }
 
     // Only variables already tracked BEFORE the loop starts are genuinely
     // "carried" across iterations — a variable declared (and possibly
@@ -1426,6 +1490,14 @@ class _BareFunctionLowerer {
     final condBlockId = _allocBlockId();
     final bodyBlockId = _allocBlockId();
     final exitBlockId = _allocBlockId();
+    // (ADR-0050) A `for` loop's update clause gets its OWN block, because
+    // `continue` in a `for` must RUN the update before re-testing -- Dart
+    // semantics, and the reason the update cannot simply be appended to the
+    // body. `continue` targets this block; the body falls through to it; it
+    // branches to the header. A `while` has no updates and this block is not
+    // created, so its lowering is byte-identical to before.
+    final updateBlockId = updates.isEmpty ? null : _allocBlockId();
+    final continueTarget = updateBlockId ?? condBlockId;
 
     final entryArgs = [for (final v in loopVars) _values[v]!];
     _addInstr(Branch(target: condBlockId, args: entryArgs));
@@ -1471,7 +1543,7 @@ class _BareFunctionLowerer {
     if (body is LabeledStatement) {
       // A label wrapping the loop BODY is `continue`: branch to the header,
       // which is exactly what the back edge below does.
-      _labelTargets[body] = (target: condBlockId, vars: loopVars);
+      _labelTargets[body] = (target: continueTarget, vars: loopVars);
     }
 
     _startBlock(bodyBlockId, const []);
@@ -1494,8 +1566,31 @@ class _BareFunctionLowerer {
     // always returns before completing a second iteration.
     if (_blockOpen) {
       final backArgs = [for (final v in loopVars) _values[v]!];
-      _addInstr(Branch(target: condBlockId, args: backArgs));
+      _addInstr(Branch(target: continueTarget, args: backArgs));
       _finishBlock();
+    }
+
+    // The update block: lower the update expressions, then close the loop.
+    // Its parameters carry the loop variables in, because `continue` may
+    // branch here from anywhere in the body with different values.
+    if (updateBlockId != null) {
+      final updateParams = [
+        for (final v in loopVars) DCValue(_allocId(), _values[v]!.type),
+      ];
+      _startBlock(updateBlockId, updateParams);
+      for (var i = 0; i < loopVars.length; i++) {
+        _values[loopVars[i]] = updateParams[i];
+      }
+      for (final u in updates) {
+        _lowerStatement(u);
+      }
+      if (_blockOpen) {
+        _addInstr(Branch(
+          target: condBlockId,
+          args: [for (final v in loopVars) _values[v]!],
+        ));
+        _finishBlock();
+      }
     }
 
     // (ADR-0047) What's live after the loop is the EXIT block's own
@@ -1534,6 +1629,16 @@ class _BareFunctionLowerer {
       final otherwise = stmt.otherwise;
       if (otherwise != null) {
         _collectLoopCarriedCandidates(otherwise, out);
+      }
+      return;
+    }
+    if (stmt is ForStatement) {
+      // (ADR-0050) A nested `for` inside a loop body: collect from its body
+      // AND its updates, since `i = i + 1` in the update clause is exactly a
+      // loop-carried assignment.
+      _collectLoopCarriedCandidates(stmt.body, out);
+      for (final u in stmt.updates) {
+        if (u is VariableSet) out.add(u.variable);
       }
       return;
     }
