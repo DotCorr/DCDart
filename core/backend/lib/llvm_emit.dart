@@ -335,6 +335,11 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
       _emitDivRem('div', instruction.dest, instruction.lhs, instruction.rhs, e, context);
     case IRem():
       _emitDivRem('rem', instruction.dest, instruction.lhs, instruction.rhs, e, context);
+    case NullRef():
+      // LLVM's `null` constant. Materialized through a no-op GEP so the
+      // result is a real SSA name other instructions can reference, matching
+      // how every other value in this backend is produced.
+      e.line('%v${instruction.dest.id.index} = getelementptr i8, ptr null, i64 0');
     case IConvert():
       _emitConvert(instruction, e, context);
     case AddressOfGlobal():
@@ -955,6 +960,17 @@ void _emitAlloc(Alloc instruction, _FunctionEmitter e, String context) {
 /// version (not pressured by the M2 leak test; a real implementation would
 /// want overflow protection on the count itself).
 void _emitRetain(Retain instruction, _FunctionEmitter e, String context) {
+  // (ADR-0049) NULL-SAFE. A nullable heap reference may legitimately hold
+  // null, and retaining it would read the object header 16 bytes BEFORE
+  // address 0 -- a wild read, not a clean fault. Retaining null is a no-op,
+  // matching every refcounting runtime that permits null references.
+  final isNull = e.freshName('retainnull');
+  final doLabel = e.freshLabel('retainDo');
+  final doneLabel = e.freshLabel('retainDone');
+  e.line('%$isNull = icmp eq ptr %v${instruction.object.id.index}, null');
+  e.terminate('br i1 %$isNull, label %$doneLabel, label %$doLabel');
+
+  e.startBlock(doLabel);
   final header = e.freshName('hdr');
   final strong = e.freshName('strong');
   final newStrong = e.freshName('newstrong');
@@ -962,6 +978,9 @@ void _emitRetain(Retain instruction, _FunctionEmitter e, String context) {
   e.line('%$strong = load i32, ptr %$header');
   e.line('%$newStrong = add i32 %$strong, 1');
   e.line('store i32 %$newStrong, ptr %$header');
+  e.terminate('br label %$doneLabel');
+
+  e.startBlock(doneLabel);
 }
 
 /// Pushes the arena slot containing `headerVar` (a `ptr` SSA name, no `%`
@@ -1016,6 +1035,14 @@ void _emitRelease(Release instruction, _FunctionEmitter e, String context) {
   final freeLabel = e.freshLabel('releaseFree');
   final doneLabel = e.freshLabel('releaseDone');
 
+  // (ADR-0049) NULL-SAFE, same reasoning as `_emitRetain`: releasing null is
+  // a no-op rather than a wild read of memory before address 0.
+  final relNull = e.freshName('releasenull');
+  final liveLabel = e.freshLabel('releaseLive');
+  e.line('%$relNull = icmp eq ptr %v${instruction.object.id.index}, null');
+  e.terminate('br i1 %$relNull, label %$doneLabel, label %$liveLabel');
+
+  e.startBlock(liveLabel);
   e.line('%$header = getelementptr i8, ptr %v${instruction.object.id.index}, i64 -$_headerSizeBytes');
   e.line('%$strong = load i32, ptr %$header');
   e.line('%$newStrong = sub i32 %$strong, 1');

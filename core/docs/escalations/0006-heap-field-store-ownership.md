@@ -1,6 +1,12 @@
 # Escalation 0006: ARC semantics for storing a heap reference into a field
 
-**Status:** escalated, not decided. Per `CLAUDE.md`: write it, recommend, then continue on other work.
+**Status: RESOLVED 2026-08-22 by explicit owner delegation — see ADR-0048.** The owner was shown
+this escalation, chose not to adjudicate it item by item, and instructed that the decision be taken
+and reviewed afterwards rather than blocked on. The recommendation below (option 2) is what was
+implemented; the ADR records the risk that made it worth a human's minute, and the exact two call
+sites to change if the review reverses it.
+
+Original status was: escalated, not decided. Per `CLAUDE.md`: write it, recommend, then continue on other work.
 Nothing is blocked on the answer — the unblocked M3 prerequisites (instance methods, `for` loops,
 generics) are being worked in the meantime.
 

@@ -227,6 +227,8 @@ Set<int> referencedValueIds(DCInstruction instruction) {
       ref(value);
     case PortIn(:final port):
       ref(port);
+    case NullRef():
+      break; // a constant; no operands
     case AddressOfGlobal():
       break; // names a symbol, not a value; no operands
     case Alloc():

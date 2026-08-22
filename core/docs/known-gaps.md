@@ -103,6 +103,32 @@ clean run. The kernel side has offered to run exactly that.
 
 ---
 
+## GAP-0038 — Nullable heap references have no null SAFETY; a null dereference faults at runtime
+
+**Domain:** dcc-lower (M2)
+**Status:** OPEN — and it sits against `CLAUDE.md` rule 3 rather than merely being unimplemented
+
+ADR-0049 made `null` expressible and made `Retain`/`Release` null-safe, so a null reference can be
+stored, compared and passed around. It did **not** make dereferencing one safe: `cur.value` where
+`cur` is null reads the object at address 0 and faults.
+
+Dart's type system already carries the distinction — `Node` and `Node?` are different types, and
+front_end enforces it before dcc-lower ever runs. **DCDart currently discards that information.**
+`_lowerType` maps both to the same `DCHeapPointer`, so a program that would not compile as Dart is
+accepted, and a program that Dart proved safe gets no benefit from the proof.
+
+That matters more here than it would elsewhere. `CLAUDE.md` rule 3 says sound null safety is "our main
+advantage over C and C++" and forbids `!` and `late` to preserve it. Accepting a null dereference is
+the compiler failing to uphold the rule its own source is held to.
+
+**Cost of the workaround:** the programmer checks `!= null` before every dereference, and nothing
+verifies they did. The fix is to carry nullability on `DCHeapPointer` and reject a dereference of a
+nullable value that has not been narrowed — which needs flow-sensitive narrowing (`if (x != null) {
+x.f }` must know `x` is non-null inside the branch). Kernel already records the static type at each
+node, so the information is available; nothing reads it yet.
+
+---
+
 ## GAP-0037 — Every "not supported yet" refusal in `dcc-lower` deserves re-examination; at least one was already safe
 
 **Domain:** dcc-lower (process, not a single defect)

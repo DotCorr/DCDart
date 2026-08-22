@@ -1012,6 +1012,26 @@ class _BareFunctionLowerer {
             '"$context": assignment to unrecognized variable "${variable.name}"',
           );
         }
+        // (ADR-0048) Reassigning a HEAP-typed local is an ownership
+        // transfer, and takes exactly the same policy as a heap-typed field
+        // store: retain the new value unless it is already a fresh +1,
+        // then release the old one. Retain-before-release so `x = x` cannot
+        // free the object between the two steps.
+        if (oldValue.type is DCHeapPointer) {
+          final newValue = _lowerExpression(expr.value);
+          if (newValue.type is! DCHeapPointer) {
+            throw DccLowerError(
+              '"$context": assigning ${newValue.type} to heap-typed local '
+              '"${variable.name}"',
+            );
+          }
+          if (!_isFreshHeapOwnership(expr.value)) {
+            _addInstr(Retain(object: newValue));
+          }
+          _addInstr(Release(object: oldValue));
+          _values[variable] = newValue;
+          return;
+        }
         if (oldValue.type is! DCInt) {
           throw DccLowerError(
             '"$context": reassigning "${variable.name}" (type ${oldValue.type}) '
@@ -1389,12 +1409,16 @@ class _BareFunctionLowerer {
     ];
     for (final v in loopVars) {
       final current = _values[v]!;
-      if (current.type is! DCInt) {
+      // (ADR-0048) Heap-typed loop-carried variables ARE supported: a
+      // reassignment inside the body retains the new value and releases the
+      // old one, so the count stays balanced across every iteration, and the
+      // header's phi carries whichever reference is live. That is what makes
+      // `head = Node(i, head)` — building a list in a loop — expressible.
+      if (current.type is! DCInt && current.type is! DCHeapPointer) {
         throw DccLowerError(
           '"$context": loop-carried variable "${v.name}" has type '
-          '${current.type} — only scalar (u8/u32/u64) locals can be '
-          'reassigned inside a loop body, same rule as ADR-0027\'s '
-          'straight-line reassignment',
+          '${current.type} — only scalar (u8/u16/u32/u64) and heap-typed '
+          'locals can be reassigned inside a loop body',
         );
       }
     }
@@ -2048,6 +2072,21 @@ class _BareFunctionLowerer {
       }
     }
 
+    // (ADR-0049) `null` as a heap reference.
+    if (expr is NullLiteral) {
+      final dest = DCValue(_allocId(), const DCHeapPointer(DCVoid()));
+      _addInstr(NullRef(dest: dest));
+      return dest;
+    }
+
+    // (ADR-0049) `x == null` / `x != null`. Kernel gives these their OWN node
+    // -- `EqualsNull`, not the `EqualsCall` that ADR-0035 handles for sized
+    // ints -- so this is a separate case rather than a wider type check on
+    // the existing one. `!= null` arrives as `Not(EqualsNull)`.
+    if (expr is EqualsNull) {
+      return _lowerNullCheck(expr.expression, negated: false);
+    }
+
     // (ADR-0043) `this` inside an instance method is param 0.
     if (expr is ThisExpression) {
       final self = _thisValue;
@@ -2103,6 +2142,9 @@ class _BareFunctionLowerer {
       if (operand is EqualsCall) {
         return _lowerIntEquality(operand, negated: true);
       }
+      if (operand is EqualsNull) {
+        return _lowerNullCheck(operand.expression, negated: true);
+      }
       // A general boolean `!` needs a NOT on an i1, which DC-IR has no
       // instruction for. `!=` is handled above as a single `icmp ne` rather
       // than "compare then invert", so nothing needs it yet; a real `!`
@@ -2117,6 +2159,30 @@ class _BareFunctionLowerer {
       '"$context": unsupported expression $expr (${expr.runtimeType}) — see '
       'core/dcc-lower/README.md for exactly what is handled',
     );
+  }
+
+  /// `x == null` / `x != null` on a heap reference (ADR-0049).
+  ///
+  /// Compared as pointers, which is the only comparison a heap reference
+  /// supports: there is no structural equality and no `operator ==` to call.
+  DCValue _lowerNullCheck(Expression operand, {required bool negated}) {
+    final value = _lowerExpression(operand);
+    if (value.type is! DCHeapPointer) {
+      throw DccLowerError(
+        '"$context": comparing ${value.type} against null. Only heap '
+        'references can be null.',
+      );
+    }
+    final nullValue = DCValue(_allocId(), value.type);
+    _addInstr(NullRef(dest: nullValue));
+    final dest = DCValue(_allocId(), const DCBool());
+    _addInstr(ICmp(
+      dest: dest,
+      predicate: negated ? ICmpPredicate.ne : ICmpPredicate.eq,
+      lhs: value,
+      rhs: nullValue,
+    ));
+    return dest;
   }
 
   /// `a == b` / `a != b` where both sides are the same sized-int type.
@@ -2555,13 +2621,13 @@ class _BareFunctionLowerer {
   /// rather than guessing at a policy nobody has designed yet.
   void _lowerHeapFieldStore(InstanceSet expr, Class heapClass) {
     final field = _findHeapField(heapClass, expr.interfaceTarget.name.text);
-    if (field.type is! DCInt) {
+    if (field.type is DCWeakPointer) {
       throw DccLowerError(
-        '"$context": storing to "${heapClass.name}.${field.name}" (type '
-        '${field.type}) is not supported -- only scalar (u8/u16/u32/u64) '
-        'heap-object fields can be reassigned; heap- and weak-typed field '
-        'stores need a real ownership policy this project has not '
-        'designed yet, see docs/known-gaps.md',
+        '"$context": storing to the weak field '
+        '"${heapClass.name}.${field.name}" is not supported. The strong-field '
+        'policy (ADR-0048) does not transfer: a weak store must adjust the '
+        'WEAK count and interacts with the zombie-slot semantics of ADR-0023, '
+        'which is a separate decision nobody has made.',
       );
     }
     final objectPtr = _lowerExpression(expr.receiver);
@@ -2575,6 +2641,32 @@ class _BareFunctionLowerer {
         'implicit widening (same rule as arithmetic)',
       );
     }
+
+    // (ADR-0048) A STRONG heap-typed field store is an ownership transfer.
+    // Three operations, and the ORDER is load-bearing:
+    //
+    //   1. retain the new value  (unless it is already a fresh +1)
+    //   2. load the old value
+    //   3. store the new value
+    //   4. release the old value
+    //
+    // Retain-before-release, never the reverse: `a.next = a.next` would
+    // otherwise release the object between the two steps and store a
+    // dangling pointer. The retain is skipped when the right-hand side is a
+    // fresh-ownership source (`a.next = Node(...)`), because `Alloc` already
+    // produced the +1 this store is taking over -- the same rule ADR-0021
+    // applies to an `@owned` parameter, reusing the same predicate.
+    if (field.type is DCHeapPointer) {
+      if (!_isFreshHeapOwnership(expr.value)) {
+        _addInstr(Retain(object: value));
+      }
+      final oldValue = DCValue(_allocId(), field.type);
+      _addInstr(Load(dest: oldValue, pointer: fieldPtr));
+      _addInstr(Store(pointer: fieldPtr, value: value));
+      _addInstr(Release(object: oldValue));
+      return;
+    }
+
     _addInstr(Store(pointer: fieldPtr, value: value));
   }
 

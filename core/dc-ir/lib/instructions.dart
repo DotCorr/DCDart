@@ -180,6 +180,23 @@ final class IRem extends DCInstruction {
   DCValue? get result => dest;
 }
 
+/// The null heap reference (ADR-0049).
+///
+/// A distinct instruction rather than a `ConstInt` with a pointer dest,
+/// because `ConstInt` emits `add <type> N, 0` — valid for an integer, not for
+/// a pointer. This emits LLVM's `null` constant directly.
+///
+/// `dest.type` is the `DCHeapPointer` of the nullable field or local being
+/// initialized. `Retain`/`Release` are null-safe (ADR-0049), so a null may
+/// flow through ARC without a guard at every use site.
+final class NullRef extends DCInstruction {
+  final DCValue dest;
+  const NullRef({required this.dest});
+
+  @override
+  DCValue? get result => dest;
+}
+
 /// Explicit integer width conversion (`.toU8()`, `.toU16()`, `.toU32()`,
 /// `.toU64()`), per DCDART_SPEC.md §4.1: "No implicit widening or
 /// narrowing. `u8 -> u32` requires `.toU32()`. Explicit is the entire
