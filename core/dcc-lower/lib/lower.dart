@@ -116,9 +116,18 @@ Future<DCModule> lowerToDCModule(
       _checkRelocationTargets(global.initializer, global.linkName, globalNames);
     }
 
+    // (ADR-0052) Monomorphization queue: mangled name -> what to specialize.
+    final pendingSpecializations = <String, _Specialization>{};
+    final emittedSpecializations = <String>{};
+
     final functions = <DCFunction>[];
     for (final proc in targetLibrary.procedures) {
       if (!_hasMarkerAnnotation(proc.annotations, '_Bare', preludeUri)) continue;
+      // (ADR-0052) A generic function is a TEMPLATE, not a function. It has
+      // no single machine representation -- `T` has no size -- so nothing is
+      // emitted for it here. One specialization per distinct type argument is
+      // emitted instead, discovered from call sites below.
+      if (proc.function.typeParameters.isNotEmpty) continue;
       if (proc.isExternal) {
         // `@bare external` is the one genuinely ambiguous shape: it has no
         // body to lower, but `@bare` means "lower this as a function". Say
@@ -130,7 +139,9 @@ Future<DCModule> lowerToDCModule(
         );
       }
       functions.add(
-        _BareFunctionLowerer(proc, preludeUri, structLayouts, heapLayouts, externNames, globalNames).lower(),
+        _BareFunctionLowerer(proc, preludeUri, structLayouts, heapLayouts, externNames,
+                globalNames, null, pendingSpecializations, const {})
+            .lower(),
       );
     }
 
@@ -167,7 +178,35 @@ Future<DCModule> lowerToDCModule(
           externNames,
           globalNames,
           entry.key.enclosingClass,
+          pendingSpecializations,
+          const {},
         ).lower(linkNameOverride: entry.value),
+      );
+    }
+
+    // (ADR-0052) Drain the monomorphization queue. Lowering a specialization
+    // can discover further ones (a generic calling another generic), so this
+    // loops until nothing new appears rather than making a single pass.
+    // `_pendingSpecializations` is keyed by mangled name, so each distinct
+    // (function, type arguments) pair is emitted exactly once no matter how
+    // many call sites request it.
+    while (pendingSpecializations.isNotEmpty) {
+      final entry = pendingSpecializations.entries.first;
+      pendingSpecializations.remove(entry.key);
+      if (emittedSpecializations.contains(entry.key)) continue;
+      emittedSpecializations.add(entry.key);
+      functions.add(
+        _BareFunctionLowerer(
+          entry.value.proc,
+          preludeUri,
+          structLayouts,
+          heapLayouts,
+          externNames,
+          globalNames,
+          null,
+          pendingSpecializations,
+          entry.value.substitution,
+        ).lower(linkNameOverride: entry.key),
       );
     }
 
@@ -750,6 +789,15 @@ class _BareFunctionLowerer {
   /// statically, exactly as ADR-0022 observed for destructors.
   final Class? receiverClass;
 
+  /// (ADR-0052) Where newly-discovered specializations are queued, keyed by
+  /// mangled name so each distinct (function, type arguments) pair is emitted
+  /// exactly once however many call sites ask for it.
+  final Map<String, _Specialization> pendingSpecializations;
+
+  /// (ADR-0052) `T` -> the concrete type, when lowering a specialization.
+  /// Empty for an ordinary function.
+  final Map<String, DartType> typeSubstitution;
+
   _BareFunctionLowerer(
     this.proc,
     this.preludeUri,
@@ -758,6 +806,8 @@ class _BareFunctionLowerer {
     this.externNames,
     this.globalNames, [
     this.receiverClass,
+    this.pendingSpecializations = const {},
+    this.typeSubstitution = const {},
   ]);
 
   ValueId _allocId() => ValueId(_nextValueIndex++);
@@ -2325,6 +2375,70 @@ class _BareFunctionLowerer {
     return dest;
   }
 
+  /// (ADR-0052) Lowers a type appearing in a CALLEE's signature.
+  ///
+  /// A generic callee's signature mentions its own type parameters, so it
+  /// must be resolved against the call site's type arguments rather than
+  /// against this function's substitution. Getting this wrong produces
+  /// "type parameter T has no binding" at the CALLER, which is a confusing
+  /// place to see it.
+  DCType _lowerCalleeType(
+    DartType type,
+    StaticInvocation expr,
+    Procedure target, {
+    required String context,
+  }) {
+    final typeParams = target.function.typeParameters;
+    if (typeParams.isEmpty) return _lowerType(type, context: context);
+
+    DartType resolved = type;
+    if (type is TypeParameterType) {
+      final paramName = type.parameter.name;
+      final index = typeParams.indexWhere((p) => p.name == paramName);
+      if (index < 0 || index >= expr.arguments.types.length) {
+        throw DccLowerError(
+          '"$context": could not bind type parameter "$paramName" from the '
+          'call site\'s type arguments',
+        );
+      }
+      // The call site's argument may ITSELF be a type parameter, when a
+      // generic calls another generic -- resolve that through OUR
+      // substitution before handing it on.
+      resolved = _resolveTypeParameter(expr.arguments.types[index]);
+    }
+    return _lowerSignatureType(resolved,
+        preludeUri: preludeUri, heapLayouts: heapLayouts, context: context);
+  }
+
+  /// (ADR-0052) The link name for a call target, specializing it if generic.
+  ///
+  /// Queueing happens HERE rather than in a separate discovery pass, because
+  /// which specializations exist is only knowable by walking call sites --
+  /// and walking them twice (once to discover, once to lower) would mean two
+  /// implementations of the same traversal that could disagree.
+  String _targetLinkName(StaticInvocation expr, Procedure target) {
+    final typeParams = target.function.typeParameters;
+    if (typeParams.isEmpty) return target.name.text;
+
+    final typeArgs = expr.arguments.types
+        .map(_resolveTypeParameter)
+        .toList(growable: false);
+    if (typeArgs.length != typeParams.length) {
+      throw DccLowerError(
+        '"$context": call to generic "${target.name.text}" with '
+        '${typeArgs.length} type arguments, expected ${typeParams.length}',
+      );
+    }
+    final mangled = specializationLinkName(target.name.text, typeArgs);
+    if (!pendingSpecializations.containsKey(mangled)) {
+      pendingSpecializations[mangled] = _Specialization(target, {
+        for (var i = 0; i < typeParams.length; i++)
+          typeParams[i].name!: typeArgs[i],
+      });
+    }
+    return mangled;
+  }
+
   /// `siblingFn(args...)` -- a call to another `@bare` top-level function
   /// (docs/decisions/0018-function-calls.md). `_lowerType` (reused here for
   /// the CALLEE's signature, not just this function's own) resolves scalar
@@ -2392,8 +2506,14 @@ class _BareFunctionLowerer {
       _lowerCallArgs(expr, target, dest: null);
       return null;
     }
-    final calleeReturnType = _lowerType(
+    // (ADR-0052) A generic callee's signature mentions ITS type parameters,
+    // which the caller's own substitution knows nothing about. Resolve them
+    // with the CALL SITE's type arguments instead -- the caller's map is for
+    // the caller's own parameters.
+    final calleeReturnType = _lowerCalleeType(
       returnType,
+      expr,
+      target,
       context: '"${target.name.text}" return type (called from "$context")',
     );
 
@@ -2430,8 +2550,10 @@ class _BareFunctionLowerer {
     // otherwise.
     final argOwnership = <bool>[];
     for (var i = 0; i < calleeParams.length; i++) {
-      final expectedType = _lowerType(
+      final expectedType = _lowerCalleeType(
         calleeParams[i].type,
+        expr,
+        target,
         context: '"${target.name.text}" param ${calleeParams[i].name} (called from "$context")',
       );
       final arg = _lowerExpression(callArgs[i]);
@@ -2470,7 +2592,12 @@ class _BareFunctionLowerer {
       loweredArgs.add(arg);
     }
 
-    _addInstr(Call(dest: dest, targetName: target.name.text, args: loweredArgs, argOwnership: argOwnership));
+    _addInstr(Call(
+      dest: dest,
+      targetName: _targetLinkName(expr, target),
+      args: loweredArgs,
+      argOwnership: argOwnership,
+    ));
   }
 
   DCValue _lowerU64Binary(
@@ -2832,8 +2959,31 @@ class _BareFunctionLowerer {
   /// being collected at module scope before any function is lowered — map
   /// their parameter and return types through the exact same code path a
   /// defined function's signature does, rather than a second, drifting copy.
-  DCType _lowerType(DartType type, {required String context}) =>
-      _lowerSignatureType(type, preludeUri: preludeUri, heapLayouts: heapLayouts, context: context);
+  DCType _lowerType(DartType type, {required String context}) {
+    // (ADR-0052) Inside a specialization, `T` resolves to the concrete type
+    // it was specialized at. This is the ONLY place monomorphization has to
+    // touch: once `T` is a real type here, every downstream pass sees an
+    // ordinary function and needs no knowledge of generics at all.
+    final resolved = _resolveTypeParameter(type);
+    return _lowerSignatureType(resolved,
+        preludeUri: preludeUri, heapLayouts: heapLayouts, context: context);
+  }
+
+  DartType _resolveTypeParameter(DartType type) {
+    if (type is TypeParameterType) {
+      final concrete = typeSubstitution[type.parameter.name];
+      if (concrete == null) {
+        throw DccLowerError(
+          '"$context": type parameter "${type.parameter.name}" has no '
+          'binding. A generic function is only lowered as a specialization '
+          'reached from a call site (ADR-0052); this one was reached some '
+          'other way, which is a dcc-lower bug.',
+        );
+      }
+      return concrete;
+    }
+    return type;
+  }
 }
 
 DCType _lowerSignatureType(
@@ -3218,6 +3368,33 @@ int? _tryFoldConstInt(Expression expr) {
     }
   }
   return null;
+}
+
+/// A generic function plus the concrete types to specialize it at
+/// (ADR-0052).
+final class _Specialization {
+  final Procedure proc;
+  final Map<String, DartType> substitution;
+  const _Specialization(this.proc, this.substitution);
+}
+
+/// The emitted symbol name for a monomorphized generic (ADR-0052).
+///
+/// `pick$u64`. The `$` cannot appear in a Dart identifier, so a specialization
+/// can never collide with a hand-written function name -- which matters
+/// because `linkName` is emitted verbatim (spec §9) with no mangling
+/// downstream.
+String specializationLinkName(String base, List<DartType> typeArgs) {
+  final parts = typeArgs.map(_typeArgMangle).join('\$');
+  return '$base\$$parts';
+}
+
+String _typeArgMangle(DartType type) {
+  if (type is ExtensionType) return type.extensionTypeDeclaration.name;
+  if (type is InterfaceType) {
+    return type.classReference.canonicalName?.name ?? 'T';
+  }
+  return type.toString().replaceAll(RegExp(r'[^A-Za-z0-9_]'), '');
 }
 
 /// The emitted symbol name for an instance method (ADR-0043).

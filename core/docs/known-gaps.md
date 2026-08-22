@@ -103,6 +103,32 @@ clean run. The kernel side has offered to run exactly that.
 
 ---
 
+## GAP-0040 — Generic CLASSES are not monomorphized, only generic functions
+
+**Domain:** dcc-lower (M2/M3)
+**Status:** OPEN
+
+ADR-0052 monomorphizes generic FUNCTIONS. A generic class — `Box<T>`, and therefore every container
+M3's hashmap benchmark would want — is not implemented.
+
+The reason it is a separate unit rather than more of the same: a generic function's specialization
+only needs its signature types resolved, and `_lowerType` does that in one place. A generic class
+needs **per-instantiation field layout**, which means `_HeapLayouts` must key layouts by
+(class, type arguments) rather than by class, and the destructor cascade (ADR-0022) must synthesize
+one destructor per instantiation rather than one per class. Both are reachable; neither is a
+one-line change, and both touch code the ARC targets depend on.
+
+Also unguarded and worth knowing before that work starts: **recursion through a type parameter** —
+`f<T>` calling `f<Box<T>>` — would queue specializations forever. It is unreachable today because
+generic classes do not exist to build the infinite type with, so it is recorded rather than guarded
+speculatively. Whoever adds generic classes must add a depth or set bound at the same time.
+
+**Cost of the workaround:** a container is written concretely per element type, which is what C does
+and what the kernel already does. Fine for a handful of types, and exactly the duplication generics
+exist to remove.
+
+---
+
 ## GAP-0039 — Mutable statics have no concurrency story
 
 **Domain:** dc-ir, backend (M2, downstream: `oscortex_core`)
@@ -176,6 +202,12 @@ mode: the better the comment, the longer the wrong refusal survives.
 `dcc-lower` contains several more of these — `break`/`continue`, heap locals in loop bodies,
 getters/setters on `HeapObject` (ADR-0043), heap-typed field stores (escalation 0006). Some are
 genuinely unresolved design questions; at least one was not. They have never been audited as a group.
+
+**A SECOND question, added 2026-08-22.** The audit question below assumes the thing being audited is
+a refusal. Two of ADR-0050's silent hangs had no refusal at all: the loop-carried walker was correct,
+complete, and simply *not reached* — the update clause was never handed to it. So ask both:
+**"is this refusal still real?"** AND **"is this safeguard actually on the path?"** An exhaustive
+visitor does not protect you from not calling it. (Framing sharpened by the `oscortex_core` side.)
 
 **How to run the audit, which is not the obvious way.** The `oscortex_core` side sharpened the
 question and the improvement is real: ask **"what would have to be true for this refusal to be
@@ -291,7 +323,7 @@ inferring from the gaps file:
 
 | prerequisite | status | blocks |
 |---|---|---|
-| generics / monomorphization | `unsupported type TypeParameterType` (spec §4.2) | any container |
+| generics / monomorphization | **RESOLVED 2026-08-22 (ADR-0052)** — functions only | generic CLASSES remain, GAP-0040 |
 | closures | `unsupported expression FunctionExpression` | the functional workload |
 | `String` | `unsupported expression StringLiteral` (spec §7) | JSON parser, string pass |
 | instance methods | **RESOLVED 2026-08-21 (ADR-0043)** | — |
