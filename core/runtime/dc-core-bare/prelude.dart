@@ -421,6 +421,52 @@ class Ref {
   const Ref(this.symbol);
 }
 
+/// Marks a top-level `final` field as MUTABLE zero-initialized static
+/// storage — `.bss` (ADR-0051).
+///
+/// The same `final` + `const` initializer shape `@rodata` uses, and for the
+/// same two reasons: the `const` initializer makes the SIZE known at compile
+/// time, and `final` keeps the declaration's identity and its name at use
+/// sites.
+///
+/// ```dart
+/// @bss final Bss tickCounter = const Bss(bytes: 8);
+/// @bss final Bss idt = const Bss(bytes: 4096, align: 4096);
+/// ```
+///
+/// WHAT THIS MAY HOLD, and why the restriction is the whole justification.
+/// Zero-initialized bytes, read and written through `Pointer<T>`. A mutable
+/// static may NOT hold a `HeapObject` or `Weak<T>` reference, and that is
+/// enforced by the compiler rather than by convention: a global holding an
+/// ARC-managed reference becomes an ARC root, which needs retain/release
+/// semantics, a defined lifetime and eventually thread-safety — all of which
+/// are `DCDART_SPEC.md` §3 memory-model questions that `CLAUDE.md` rule 4
+/// freezes. Restricted to scalars and raw pointers, none of those questions
+/// arise, which is exactly what makes this decidable now.
+class _Bss {
+  const _Bss();
+}
+
+/// See [_Bss].
+const bss = _Bss();
+
+/// The declaration of a block of mutable zero-initialized storage.
+///
+/// [bytes] is its size; [align] its required alignment, which matters for
+/// hardware structures — an IDT at the wrong alignment is a fault, not a
+/// slowdown, and page tables need 4096.
+class Bss {
+  final int bytes;
+  final int align;
+  const Bss({required this.bytes, this.align = 8});
+
+  /// The address of a `@bss` block's first byte. Compose with
+  /// `Pointer<T>.fromAddress` to read or write it, exactly as with
+  /// [Rodata.addressOf].
+  static u64 addressOf(Object storage) =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
+}
+
 /// See [_Rodata].
 const rodata = _Rodata();
 

@@ -1894,7 +1894,8 @@ class _BareFunctionLowerer {
       // field; anything else cannot have an address.
       if (target.isStatic &&
           target.name.text == 'addressOf' &&
-          target.enclosingClass?.name == 'Rodata' &&
+          (target.enclosingClass?.name == 'Rodata' ||
+              target.enclosingClass?.name == 'Bss') &&
           target.enclosingLibrary.importUri == preludeUri) {
         final args = expr.arguments.positional;
         if (args.length != 1) {
@@ -3028,6 +3029,80 @@ DCGlobal _rodataStructGlobal(
   );
 }
 
+/// Builds a mutable zero-initialized global from a `@bss` field (ADR-0051).
+///
+/// THE RESTRICTION IS THE JUSTIFICATION, so it is enforced here rather than
+/// documented. A `@bss` block is raw bytes — it may not hold a `HeapObject`
+/// or `Weak<T>` reference, because a global holding an ARC-managed reference
+/// becomes an ARC root and needs retain/release semantics, a defined lifetime
+/// and thread-safety, which are `DCDART_SPEC.md` §3 questions `CLAUDE.md`
+/// rule 4 freezes. Restricted to bytes, none of those arise. If this check
+/// were a convention rather than code, the frozen decision would get made by
+/// accident.
+DCGlobal _bssGlobal(Field field) {
+  final name = field.name.text;
+  if (field.isConst) {
+    throw DccLowerError(
+      '"$name" is `@bss const`. Mutable storage cannot be `const`; use '
+      '`@bss final Bss $name = const Bss(bytes: N);`',
+    );
+  }
+  if (!field.isFinal) {
+    throw DccLowerError('"$name" is `@bss` but not `final`');
+  }
+  final declared = field.type;
+  if (declared is! InterfaceType ||
+      declared.classReference.canonicalName?.name != 'Bss') {
+    throw DccLowerError(
+      '"$name" is `@bss` but declared $declared. Mutable static storage must '
+      'be declared `Bss` — it is raw zero-initialized bytes, read and written '
+      'through a Pointer<T>. A HeapObject or Weak<T> global would be an ARC '
+      'root, which is a frozen memory-model question (CLAUDE.md rule 4) and '
+      'is deliberately not expressible here (ADR-0051).',
+    );
+  }
+  final initializer = field.initializer;
+  if (initializer is! ConstantExpression) {
+    throw DccLowerError(
+      '"$name" is `@bss` but its initializer is not a compile-time constant. '
+      'Write `const Bss(bytes: N)` — the SIZE must be known at compile time.',
+    );
+  }
+  final constant = initializer.constant;
+  if (constant is! InstanceConstant) {
+    throw DccLowerError('"$name": `@bss` initializer must be `const Bss(...)`');
+  }
+
+  int? bytes;
+  int align = 8;
+  constant.fieldValues.forEach((ref, value) {
+    final fieldName = ref.canonicalName?.name;
+    if (value is! IntConstant) return;
+    if (fieldName == 'bytes') bytes = value.value;
+    if (fieldName == 'align') align = value.value;
+  });
+
+  final size = bytes;
+  if (size == null || size <= 0) {
+    throw DccLowerError(
+      '"$name": `@bss` needs a positive `bytes:` size, got $bytes',
+    );
+  }
+  if (align <= 0 || (align & (align - 1)) != 0) {
+    throw DccLowerError(
+      '"$name": `@bss` alignment must be a positive power of two, got $align. '
+      'A hardware structure at the wrong alignment faults rather than running '
+      'slowly, so this is rejected rather than rounded.',
+    );
+  }
+  return DCGlobal(
+    linkName: name,
+    initializer: DCZeroInit(size),
+    alignBytes: align,
+    isMutable: true,
+  );
+}
+
 /// The `DCInt` a declared sized-int type maps to, or null if it is not one.
 DCInt? _sizedIntOf(DartType declared) {
   if (declared is ExtensionType) {
@@ -3063,6 +3138,8 @@ void _checkRelocationTargets(
       for (final field in fields) {
         _checkRelocationTargets(field, owner, knownGlobals);
       }
+    case DCZeroInit():
+      return; // no relocations inside zero-initialized storage
     case DCConstAddrOf(globalName: final target):
       if (!knownGlobals.contains(target)) {
         throw DccLowerError(
@@ -3176,6 +3253,13 @@ List<DCGlobal> _collectRodataGlobals(
 }) {
   final globals = <DCGlobal>[];
   for (final field in library.fields) {
+    // (ADR-0051) `@bss` — mutable zero-initialized storage. Collected here
+    // rather than in a separate walk because it shares every rule `@rodata`
+    // has: `final` field, `const` initializer, name-keyed symbol.
+    if (_hasMarkerAnnotation(field.annotations, '_Bss', preludeUri)) {
+      globals.add(_bssGlobal(field));
+      continue;
+    }
     if (!_hasMarkerAnnotation(field.annotations, '_Rodata', preludeUri)) {
       continue;
     }

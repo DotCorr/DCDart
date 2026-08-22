@@ -103,6 +103,30 @@ clean run. The kernel side has offered to run exactly that.
 
 ---
 
+## GAP-0039 — Mutable statics have no concurrency story
+
+**Domain:** dc-ir, backend (M2, downstream: `oscortex_core`)
+**Status:** OPEN
+
+ADR-0051 gives DCDart mutable global storage. It gives no guarantee whatsoever about concurrent
+access. A `@bss` counter incremented from an interrupt handler and read from ordinary code is a
+read-modify-write with no atomicity: the classic lost-update, and nothing in the language says so.
+
+This compounds GAP-0033 (no memory barriers) rather than duplicating it. Barriers are about ORDERING
+between accesses; this is about ATOMICITY of a single one. A kernel needs both, and DCDart currently
+offers neither.
+
+**Cost of the workaround:** invisible on a single core where interrupt entry and exit serialize, which
+is where `oscortex_core` is today — and that is exactly what makes it dangerous, because the code
+that works now is the code that will be wrong later. It becomes real at the first SMP bring-up, and
+the failure mode is a lost tick or a corrupted bitmap entry that reproduces once a week.
+
+The eventual answer is atomic read-modify-write primitives, which interact with the same
+device-memory-versus-ordinary-memory type distinction GAP-0034 needs. Worth solving together rather
+than bolting `Atomic<T>` onto a language that cannot yet say which memory is which.
+
+---
+
 ## GAP-0038 — Nullable heap references have no null SAFETY; a null dereference faults at runtime
 
 **Domain:** dcc-lower (M2)

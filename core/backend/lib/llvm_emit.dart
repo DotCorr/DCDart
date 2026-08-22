@@ -754,9 +754,14 @@ String _emitGlobal(DCGlobal global, {required String context}) {
     );
   }
   final init = _emitConstant(global.initializer, context: context);
+  // `global` (writable) vs `constant` (read-only) is the ONLY difference in
+  // the emitted line, and it is the whole difference between .bss and
+  // .rodata (ADR-0051). LLVM places a zero-initialized writable global in
+  // .bss automatically, where it occupies no space in the object file.
+  final kind = global.isMutable ? 'global' : 'constant';
   final buffer = StringBuffer();
   buffer.writeln(
-    '@${global.linkName} = internal constant $init, align ${global.alignBytes}',
+    '@${global.linkName} = internal $kind $init, align ${global.alignBytes}',
   );
   return buffer.toString();
 }
@@ -793,6 +798,11 @@ String _emitConstant(DCConstant constant, {required String context}) {
       // `[N x T] [T a, T b, ...]` -- each element repeats its own type, which
       // is LLVM's required form for an array constant, not redundancy.
       return '[${elements.length} x $elemType] [$body]';
+    case DCZeroInit(bytes: final bytes):
+      // `zeroinitializer` rather than an explicit array of zeros: it occupies
+      // no space in the object file, which matters at page-table and
+      // frame-bitmap sizes (ADR-0051).
+      return '[$bytes x i8] zeroinitializer';
     case DCConstStruct(fields: final fields):
       // `{ T1, T2 } { T1 a, T2 b }` -- TYPE then VALUE, the same shape the
       // array case emits. Omitting the leading type gives LLVM's unhelpful
@@ -831,6 +841,8 @@ String _constantTypeText(
       return _llvmType(type, context: context);
     case DCConstAddrOf():
       return 'ptr';
+    case DCZeroInit(bytes: final bytes):
+      return '[$bytes x i8]';
     case DCConstStruct(fields: final fields):
       final parts = fields
           .map((f) => _constantTypeText(f, fallback, context: context))

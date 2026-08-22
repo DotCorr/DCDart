@@ -209,6 +209,18 @@ final class DCConstAddrOf extends DCConstant {
   const DCConstAddrOf(this.globalName, {this.offsetBytes = 0});
 }
 
+/// Zero-initialized mutable storage of a fixed size — `.bss` (ADR-0051).
+///
+/// A distinct node from [DCConstArray] holding zeros, because the emitted
+/// form differs in a way that matters: LLVM's `zeroinitializer` occupies no
+/// space in the object file, while an explicit array of zeros does. A 4 KiB
+/// page table or a 128 KiB frame bitmap written out literally would bloat
+/// every kernel image that used one.
+final class DCZeroInit extends DCConstant {
+  final int bytes;
+  const DCZeroInit(this.bytes);
+}
+
 /// One module-level constant, emitted into read-only data.
 ///
 /// There is deliberately NO `isMutable` field. A mutable module-level static
@@ -221,6 +233,17 @@ final class DCGlobal {
   final String linkName;
   final DCConstant initializer;
 
+  /// Mutable (`.bss`) rather than read-only (`.rodata`), ADR-0051.
+  ///
+  /// This field was deliberately ABSENT until the mutable-static decision was
+  /// actually taken — an IR field existing only to be rejected would have
+  /// pre-committed the shape of an escalation nobody had held. It exists now
+  /// because that decision was made (escalation 0006's sibling, delegated by
+  /// the owner 2026-08-22) and restricted: a mutable global may hold only
+  /// scalars and raw pointers, never an ARC-managed reference, which is what
+  /// keeps it out of §3's frozen territory.
+  final bool isMutable;
+
   /// Emitted as an explicit `align N`. Explicit rather than left to LLVM:
   /// nothing else in DCDart emits alignment for anything, so a consumer
   /// reading this through a raw pointer has no other way to know what it
@@ -231,6 +254,7 @@ final class DCGlobal {
     required this.linkName,
     required this.initializer,
     required this.alignBytes,
+    this.isMutable = false,
   });
 }
 
