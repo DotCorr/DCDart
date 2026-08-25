@@ -79,44 +79,34 @@ if [[ $VERIFY_STATUS -ne 0 ]] || ! grep -q "FREESTANDING: pass" <<<"$VERIFY_OUT"
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — link main.c against alias.o, freestanding. Same Linux/x86-64-only
-# entry stub as the other conformance harnesses (GAP-0005).
+# Step 3 — link main.c against alias.o and produce a runnable binary.
+#
+# Same shared link step as every other conformance harness.
+#
+# On Linux/x86-64 this is still the freestanding link -- -ffreestanding
+# -fno-builtin -nostdlib -static plus a minimal `_start` (under -nostdlib
+# there is no crt0, so nothing would otherwise call `main`). That link is
+# belt-and-braces evidence that alias.o needs no crt, no libc and no dynamic
+# loader.
+#
+# But that `_start` issues the x86-64 Linux sys_exit syscall, so it is
+# Linux/x86-64 by construction, and this harness used to FAIL rather than
+# skip on any other host. It now delegates to the shared helper, which keeps
+# the freestanding link on Linux/x86-64 and links against libc everywhere
+# else (rebuilding the source for `--target host`, because the bare-x86_64
+# ELF object will not link into a Mach-O or PE image). See
+# tests/conformance/_lib/hosted-link.sh for exactly what the hosted path
+# gives up -- short version: nothing this harness was relying on it for,
+# because alias.o's freestanding guarantee is asserted in Step 2 above by
+# verify-freestanding.sh, which runs identically on all three hosts and is
+# the stronger check of the two.
+#
+# This is GAP-0048 closed: the behavioural assertion below now runs on
+# macOS, Windows and Linux, and the PASS line names which link path ran, so
+# a pass is never ambiguous about what it proved.
 # ---------------------------------------------------------------------------
-if ! command -v clang >/dev/null 2>&1; then
-  fail "clang not found on PATH, see docs/known-gaps.md GAP-0001"
-fi
-
-HOST_OS="$(uname -s 2>/dev/null || echo unknown)"
-HOST_ARCH="$(uname -m 2>/dev/null || echo unknown)"
-case "$HOST_OS" in
-  Linux*) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_OS'); see docs/known-gaps.md GAP-0005" ;;
-esac
-case "$HOST_ARCH" in
-  x86_64|amd64) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_ARCH'); see docs/known-gaps.md GAP-0005" ;;
-esac
-
-cat > "$WORKDIR/_start.S" <<'EOF'
-    .text
-    .global _start
-_start:
-    call    main
-    movl    %eax, %edi
-    movl    $60, %eax
-    syscall
-EOF
-
-LINK_LOG="$WORKDIR/link.log"
-clang -ffreestanding -fno-builtin -nostdlib -static \
-  -o "$BIN" "$WORKDIR/_start.S" "$EXAMPLE_DIR/main.c" "$OBJ" \
-  >"$LINK_LOG" 2>&1
-LINK_STATUS=$?
-if [[ $LINK_STATUS -ne 0 ]]; then
-  cat "$LINK_LOG" >&2
-  fail "freestanding link of main.c + alias.o exited $LINK_STATUS (log above)"
-fi
-[[ -f "$BIN" ]] || fail "clang reported success but $BIN was not produced"
+source "$CORE_DIR/tests/conformance/_lib/hosted-link.sh"
+dc_link "$BIN" "$EXAMPLE_DIR/main.c" "$OBJ" "$EXAMPLE_DIR/alias.dart"
 
 # ---------------------------------------------------------------------------
 # Step 4 — run the binary, assert exit code 0. main.c's own checks: 1 = not
@@ -129,5 +119,5 @@ if [[ $ACTUAL -ne 0 ]]; then
   fail "alias_test exited $ACTUAL — see core/examples/m2-alias/main.c for what each code means"
 fi
 
-echo "M2-alias: PASS — dcc build -> verify-freestanding pass -> freestanding link -> 2000 alias/read/release cycles (straight-line + branched), leak-free"
+echo "M2-alias: PASS — dcc build -> verify-freestanding pass -> $DC_LINK_MODE link -> 2000 alias/read/release cycles (straight-line + branched), leak-free"
 exit 0

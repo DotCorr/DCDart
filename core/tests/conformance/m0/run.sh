@@ -16,7 +16,7 @@
 #
 # As of 2026-08-13, steps 1-2 (dcc build, verify-freestanding) pass for real
 # on this project's dev host (Windows). Step 3 (link+run) correctly refuses
-# to run there -- see its own comment below and docs/known-gaps.md GAP-0005.
+# to run there -- see its own comment below and docs/known-gaps.md GAP-0048.
 # This script has not yet reported an unqualified PASS anywhere; that needs
 # a Linux host or QEMU.
 #
@@ -121,60 +121,20 @@ fi
 #                     would need a PT_INTERP dynamic loader) -- irrelevant
 #                     without libc, but keeps the output a plain static ELF.
 #
-# The catch with -nostdlib: there is no crt0, so there is no `_start` to
-# call `main`, and no libc `exit()` for `main` to fall into. If we just link
-# main.c + add.o with -nostdlib, `main` returns into undefined memory and
-# the process SIGSEGVs instead of exiting with add(2,3)'s value -- the test
-# would observe exit status 139, not 5. So this harness supplies the
-# smallest possible replacement entry point: call main(), then hand its
-# return value straight to the exit syscall. This stub is test-harness
-# scaffolding only; it is not part of the M0 object under test (add.o) and
-# does not touch add.o's own freestanding guarantee (checked independently
-# in Step 2, above, before this stub is even written).
+# The catch with -nostdlib: there is no crt0, so there is no `_start` to call
+# `main`. The shared helper supplies one on Linux/x86-64, and on every other
+# host links against libc instead -- see tests/conformance/_lib/hosted-link.sh
+# for exactly what that trades away (short version: nothing that this harness
+# was relying on it for, because add.o's freestanding guarantee is asserted in
+# Step 2 above by verify-freestanding.sh, which runs on every host and is the
+# stronger check of the two).
 #
-# Known limitation: the stub below is Linux/x86-64 syscall ABI. That matches
-# this project's dev-host tooling (llvm-nm, bash, QEMU/serial workflow) but
-# is not portable to macOS/Windows hosts. If this harness needs to run on a
-# non-Linux or non-x86_64 dev host, the entry stub needs a per-host variant
-# -- flagged here rather than silently assumed away.
+# This is GAP-0048 closed: the harness used to FAIL rather than skip on macOS
+# and Windows, so 17 of these targets could not run on two of the three hosts
+# DCDart claims to support.
 # ---------------------------------------------------------------------------
-if ! command -v clang >/dev/null 2>&1; then
-  fail "clang not found on PATH, see docs/known-gaps.md GAP-0001"
-fi
-
-HOST_OS="$(uname -s 2>/dev/null || echo unknown)"
-HOST_ARCH="$(uname -m 2>/dev/null || echo unknown)"
-case "$HOST_OS" in
-  Linux*) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_OS'); extend Step 3 in this script before running here" ;;
-esac
-case "$HOST_ARCH" in
-  x86_64|amd64) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_ARCH'); extend Step 3 in this script before running here" ;;
-esac
-
-cat > "$WORKDIR/_start.S" <<'EOF'
-/* Minimal freestanding entry point, harness-only (see Step 3 comment in
- * run.sh for why this exists). Not part of the M0 object under test. */
-    .text
-    .global _start
-_start:
-    call    main
-    movl    %eax, %edi     /* main's return value -> exit_code arg */
-    movl    $60, %eax      /* x86-64 Linux sys_exit */
-    syscall
-EOF
-
-LINK_LOG="$WORKDIR/link.log"
-clang -ffreestanding -fno-builtin -nostdlib -static \
-  -o "$BIN" "$WORKDIR/_start.S" "$EXAMPLE_DIR/main.c" "$OBJ" \
-  >"$LINK_LOG" 2>&1
-LINK_STATUS=$?
-if [[ $LINK_STATUS -ne 0 ]]; then
-  cat "$LINK_LOG" >&2
-  fail "freestanding link of main.c + add.o exited $LINK_STATUS (log above)"
-fi
-[[ -f "$BIN" ]] || fail "clang reported success but $BIN was not produced"
+source "$CORE_DIR/tests/conformance/_lib/hosted-link.sh"
+dc_link "$BIN" "$EXAMPLE_DIR/main.c" "$OBJ" "$EXAMPLE_DIR/add.dart"
 
 # ---------------------------------------------------------------------------
 # Step 4 — run the binary, assert exit code is exactly 5.
@@ -188,5 +148,5 @@ fi
 # ---------------------------------------------------------------------------
 # Step 5 — PASS.
 # ---------------------------------------------------------------------------
-echo "M0: PASS — dcc build -> verify-freestanding pass -> freestanding link -> add(2,3) == 5"
+echo "M0: PASS — dcc build -> verify-freestanding pass -> $DC_LINK_MODE link -> add(2,3) == 5"
 exit 0

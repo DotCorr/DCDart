@@ -74,47 +74,36 @@ if [[ $VERIFY_STATUS -ne 0 ]] || ! grep -q "FREESTANDING: pass" <<<"$VERIFY_OUT"
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — link main.c against mmio.o, freestanding. Same Linux/x86-64-only
-# entry stub as core/tests/conformance/m0/run.sh, same reason (see that
-# script's Step 3 comment and docs/known-gaps.md GAP-0005) -- this is not
-# duplicated logic drifting apart by accident, it's the identical
-# constraint applying to a second conformance target.
+# Step 3 — link main.c against mmio.o and produce a runnable binary.
+#
+# Mirrors core/tests/conformance/m0/run.sh's Step 3 -- not duplicated logic
+# drifting apart by accident, the identical constraint applying to a second
+# conformance target, which is why both now go through one shared helper.
+#
+# On Linux/x86-64 this is still the freestanding link -- -ffreestanding
+# -fno-builtin -nostdlib -static plus a minimal `_start` (under -nostdlib
+# there is no crt0, so nothing would otherwise call `main`). That link is
+# belt-and-braces evidence that mmio.o needs no crt, no libc and no dynamic
+# loader.
+#
+# But that `_start` issues the x86-64 Linux sys_exit syscall, so it is
+# Linux/x86-64 by construction, and this harness used to FAIL rather than
+# skip on any other host. It now delegates to the shared helper, which keeps
+# the freestanding link on Linux/x86-64 and links against libc everywhere
+# else (rebuilding the source for `--target host`, because the bare-x86_64
+# ELF object will not link into a Mach-O or PE image). See
+# tests/conformance/_lib/hosted-link.sh for exactly what the hosted path
+# gives up -- short version: nothing this harness was relying on it for,
+# because mmio.o's freestanding guarantee is asserted in Step 2 above by
+# verify-freestanding.sh, which runs identically on all three hosts and is
+# the stronger check of the two.
+#
+# This is GAP-0048 closed: the behavioural assertion below now runs on
+# macOS, Windows and Linux, and the PASS line names which link path ran, so
+# a pass is never ambiguous about what it proved.
 # ---------------------------------------------------------------------------
-if ! command -v clang >/dev/null 2>&1; then
-  fail "clang not found on PATH, see docs/known-gaps.md GAP-0001"
-fi
-
-HOST_OS="$(uname -s 2>/dev/null || echo unknown)"
-HOST_ARCH="$(uname -m 2>/dev/null || echo unknown)"
-case "$HOST_OS" in
-  Linux*) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_OS'); see docs/known-gaps.md GAP-0005" ;;
-esac
-case "$HOST_ARCH" in
-  x86_64|amd64) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_ARCH'); see docs/known-gaps.md GAP-0005" ;;
-esac
-
-cat > "$WORKDIR/_start.S" <<'EOF'
-    .text
-    .global _start
-_start:
-    call    main
-    movl    %eax, %edi
-    movl    $60, %eax
-    syscall
-EOF
-
-LINK_LOG="$WORKDIR/link.log"
-clang -ffreestanding -fno-builtin -nostdlib -static \
-  -o "$BIN" "$WORKDIR/_start.S" "$EXAMPLE_DIR/main.c" "$OBJ" \
-  >"$LINK_LOG" 2>&1
-LINK_STATUS=$?
-if [[ $LINK_STATUS -ne 0 ]]; then
-  cat "$LINK_LOG" >&2
-  fail "freestanding link of main.c + mmio.o exited $LINK_STATUS (log above)"
-fi
-[[ -f "$BIN" ]] || fail "clang reported success but $BIN was not produced"
+source "$CORE_DIR/tests/conformance/_lib/hosted-link.sh"
+dc_link "$BIN" "$EXAMPLE_DIR/main.c" "$OBJ" "$EXAMPLE_DIR/mmio.dart"
 
 # ---------------------------------------------------------------------------
 # Step 4 — run the binary, assert exit code 0 (main.c's own checks: 1 means
@@ -127,5 +116,5 @@ if [[ $ACTUAL -ne 0 ]]; then
   fail "mmio_test exited $ACTUAL (1 = store didn't land, 2 = load-back mismatched, other = crash)"
 fi
 
-echo "M1-pointer: PASS — dcc build -> verify-freestanding pass -> freestanding link -> MMIO round-trip correct"
+echo "M1-pointer: PASS — dcc build -> verify-freestanding pass -> $DC_LINK_MODE link -> MMIO round-trip correct"
 exit 0

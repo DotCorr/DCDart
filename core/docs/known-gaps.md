@@ -349,7 +349,7 @@ inferring from the gaps file:
 |---|---|---|
 | generics / monomorphization | **RESOLVED 2026-08-22 (ADR-0052)** — functions only | generic CLASSES remain, GAP-0040 |
 | closures | `unsupported expression FunctionExpression` | the functional workload |
-| `String` | `unsupported expression StringLiteral` (spec §7) | JSON parser, string pass |
+| `String` | **PARTIALLY RESOLVED 2026-08-26 (ADR-0053)** — borrowed `Str` slices work; owning `String`/`StrBuf` still blocked on the allocator, GAP-0045 | JSON parser and the string pass still blocked (both need to *build* text, not only read it) |
 | instance methods | **RESOLVED 2026-08-21 (ADR-0043)** | — |
 | `null` / nullable heap refs | **RESOLVED 2026-08-22 (ADR-0049)** | — |
 | heap-typed field **store** | **RESOLVED 2026-08-22 (ADR-0048)** | — |
@@ -1260,6 +1260,15 @@ fresh machine: don't wait on a hung first WSL launch, use `--user root`.
 **Cost of the workaround:** none — this was a real capability gap (no Linux-linkable host), now
 actually closed, not routed around.
 
+**Correction (2026-08-26) — this gap was cited for something it does not cover.** Seventeen
+conformance harnesses carried the text `see docs/known-gaps.md GAP-0005` next to a hard `fail` on
+any non-Linux host. That is *not* what this entry is about: this entry is about M0's exit criterion
+being unverifiable from a Windows host, and it is RESOLVED. Anyone who followed the citation found a
+closed gap and reasonably concluded the limitation had been dealt with. It had not — the suite could
+not run on macOS at all. See **GAP-0048**, which is the real entry for that defect. A citation
+pointing at a resolved gap is worse than no citation, because it answers the question wrongly
+instead of leaving it open.
+
 ---
 
 ## GAP-0007 — Result<T,E>/`?` propagation
@@ -1495,3 +1504,128 @@ documented range comments) or whether `dc-ir` gets its own bootstrap-language ex
 case say why the reasoning in ADR-0002 doesn't transfer). Either is fine; leaving it unstated is
 not — the next agent should not have to rediscover that these files, as written, assume types the
 host Dart runtime doesn't have.
+
+---
+
+## GAP-0045 — `String` and `StrBuf` not implemented; only borrowed `Str` exists
+
+**Domain:** dcc-lower, runtime, spec §7
+**Status:** OPEN — blocked on spec §12 open decision 2 (the allocator)
+
+ADR-0053 implements spec §7's borrowed `Str` slice. It does not implement spec §7's owning
+`String` or mutable `StrBuf`, both of which are heap types and therefore blocked on the allocator
+decision that spec §12 has not settled.
+
+Concretely missing: concatenation, formatting, `toString`, and any way to produce a `Str` whose
+bytes do not already exist somewhere in memory. A kernel can name a device and compare a filename;
+it cannot build a message.
+
+**Cost of the workaround:** callers that need to compose text must own a byte buffer themselves and
+construct a `Str` over it via `Pointer`. That is exactly the hand-rolled unsafe-buffer code the type
+exists to remove, so the cost is paid in `@bare` call sites and will have to be un-paid later.
+
+**Next step:** settle spec §12 decision 2, then implement `String` as a *separate type* from `Str`
+(see ADR-0053's consequences — an owner bit on `Str` is the wrong shape and is called out there).
+
+---
+
+## GAP-0046 — a `Str` can dangle; there is no lifetime story for borrowed text
+
+**Domain:** dcc-lower, spec §3/§7
+**Status:** OPEN — latent today, live the moment GAP-0045 lands
+
+`Str` is non-owning by design (ADR-0053). Nothing prevents one outliving the memory it points at:
+there is no ARC on it, no borrow checker, and no escape analysis. A `Str` into a freed buffer is a
+use-after-free that compiles cleanly.
+
+**This is latent rather than live right now**, and only by accident of what exists: every `Str` that
+can currently be constructed points into `.rodata` and is immortal. The moment `String` (GAP-0045)
+or any heap buffer can back a `Str`, it becomes reachable.
+
+**Cost of the workaround:** none paid yet. The cost is that this is the first question a lifetime
+design has to answer, and answering it *after* code exists that assumes today's immortality is
+strictly harder than answering it before.
+
+**Next step:** decide whether borrowed text gets a lifetime discipline (a `@borrows` annotation, an
+escape check, or a rule that `Str` may not be stored in a heap field) before, not after, `String`.
+This is a spec §3 question and should be escalated rather than decided by whoever implements
+`String`.
+
+---
+
+## GAP-0047 — `Str` has no C header mapping, so it cannot cross the FFI boundary
+
+**Domain:** backend (`c_header.dart`)
+**Status:** OPEN — unimplemented, not blocked
+
+`c_header.dart` (ADR-0034) has no mapping for `Str`, so a `@bare` function taking or returning one
+is not emitted into the generated header and cannot be called from C. Every other DCDart type that
+crosses the boundary has one.
+
+`{ptr, len}` by value is representable in the C ABI (SysV classifies it as a two-register
+INTEGER,INTEGER pair; Windows x64 passes an 16-byte aggregate by reference), so this is a matter of
+writing the mapping and its ABI test, not a blocked design question.
+
+**Cost of the workaround:** C callers must declare the struct by hand, which is precisely the
+hand-written restatement `c_header.dart` exists to eliminate — and getting it wrong is silent ABI
+corruption rather than a compile error.
+
+**Next step:** add the mapping, and pin it with a conformance case that passes a `Str` C→DCDart and
+DCDart→C on both SysV and Windows x64. Do not add the mapping without the ABI test; ADR-0034 already
+refuses `DCBool` for exactly this class of ambiguity.
+
+---
+
+## GAP-0048 — the conformance suite reported a Linux number as if it were the project's number
+
+**Domain:** testing (all milestones)
+**Status:** PARTIALLY RESOLVED — the host gate is closed; the two-target divergence below is open
+
+**This is the most expensive defect found so far, and it was not in the compiler.**
+
+Every M0/M1/M2 behavioural harness linked its object with `-nostdlib` plus a hand-written `_start`
+stub issuing the **x86-64 Linux** `sys_exit` syscall. On any other host the harness did not skip —
+it called `fail` and exited 1. Seventeen of thirty-five harnesses failed together on macOS, and had
+done so for their entire existence.
+
+The number being quoted in status reports — "32 passed, 0 failed" — was measured inside a Linux
+container. On the actual development host it was **18 passed, 17 failed**. A language whose stated
+goal is running natively on macOS, Windows and Linux could not run its own conformance suite on two
+of the three, and the summary line did not say so.
+
+**Three separate things had to go wrong together, and each is worth naming because each recurs:**
+
+1. **A harness that exits 1 for "I cannot run here" is indistinguishable from "the compiler is
+   broken."** The information that would have made this visible was destroyed at the point of
+   measurement.
+2. **The runner had no skip channel at all** — two outcomes, pass and fail — so there was no way to
+   express the real state even if a harness had wanted to.
+3. **The gap was filed as a platform limitation rather than a defect.** The harnesses pointed at
+   `GAP-0005`, which is about M0's exit criterion on a Windows host and is marked **RESOLVED**.
+   Anyone who followed the citation found a closed gap and moved on. A misfiled gap is worse than an
+   unfiled one: it answers the question wrongly instead of leaving it open.
+
+**Fixed:** `tests/conformance/_lib/hosted-link.sh` now provides the link step. Linux/x86-64 keeps
+the `-nostdlib` path and its belt-and-braces link evidence; every other host rebuilds
+`--target host` and links libc. All 17 are converted and pass on Darwin/arm64. The freestanding
+guarantee is untouched and was never coming from that link — it comes from `verify-freestanding.sh`
+on the `bare-x86_64` object, which runs identically on all three hosts and is the **stronger** check
+of the two, since a `-nostdlib` link can succeed on a symbol resolved out of a static archive that
+`nm -u` would still catch. The runner now counts `skipped` as a third, separately listed outcome.
+
+**STILL OPEN — the two-target divergence.** On the hosted path, Step 2 verifies the `bare-x86_64`
+object while Step 4 executes a freshly built `--target host` object. They are two codegen targets of
+the same source, so on this Mac the behavioural passes are evidence for **arm64** semantics and the
+freestanding pass is evidence about **x86-64** output. Neither is wrong, but a reader could take the
+pair as end-to-end evidence about one artifact, and it is not. Two agents flagged this independently
+during the conversion, which is why it is recorded rather than left in the helper's header.
+
+**Cost of the workaround:** x86-64 *behavioural* coverage now requires a Linux host or QEMU. That is
+a real reduction in what a green Darwin run proves, and it is the price of the suite running at all
+on the dev host.
+
+**Next step:** run the suite on Linux/x86-64 in CI so both link paths are exercised every commit, and
+have the runner print the host and link mode in its summary line so no future reader can mistake one
+host's number for the project's. Longer term, boot the `bare-x86_64` objects under QEMU the way
+`oscortex_core`'s harnesses do — that suite does not have this failure mode precisely because it
+never links a host binary.

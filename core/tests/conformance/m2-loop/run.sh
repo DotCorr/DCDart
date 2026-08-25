@@ -73,44 +73,31 @@ if [[ $VERIFY_STATUS -ne 0 ]] || ! grep -q "FREESTANDING: pass" <<<"$VERIFY_OUT"
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — link main.c against loop.o, freestanding. Same Linux/x86-64-only
-# entry stub as the other conformance harnesses (GAP-0005).
+# Step 3 — link main.c against loop.o and run it.
+#
+# The link is freestanding where that is possible: -nostdlib (no libc, no CRT
+# startup objects) plus -ffreestanding -fno-builtin, so nothing can silently
+# pull glibc/musl in and prove nothing about loop.o's freestanding-ness. The
+# catch with -nostdlib is that there is no crt0, so there is no `_start` to
+# call `main`; the entry stub that supplies one issues the x86-64 *Linux*
+# sys_exit syscall and is Linux/x86-64 by construction.
+#
+# That stub used to gate this whole harness: on a macOS or Windows host this
+# step did not skip, it FAILED. So the shared helper below now decides. On
+# Linux/x86-64 it takes exactly the -nostdlib path described above and keeps
+# the belt-and-braces link evidence; on every other host it rebuilds the
+# source for --target host and links against real libc, keeping the
+# behavioural assertion. See tests/conformance/_lib/hosted-link.sh for
+# precisely what the hosted path trades away -- short version: nothing this
+# harness was relying on it for, because loop.o's freestanding guarantee is
+# asserted in Step 2 above by verify-freestanding.sh, which runs identically
+# on every host and is the stronger check of the two.
+#
+# This is GAP-0048 closed. $DC_LINK_MODE records which path ran, and the PASS
+# line below prints it, so a pass is never ambiguous about what it proved.
 # ---------------------------------------------------------------------------
-if ! command -v clang >/dev/null 2>&1; then
-  fail "clang not found on PATH, see docs/known-gaps.md GAP-0001"
-fi
-
-HOST_OS="$(uname -s 2>/dev/null || echo unknown)"
-HOST_ARCH="$(uname -m 2>/dev/null || echo unknown)"
-case "$HOST_OS" in
-  Linux*) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_OS'); see docs/known-gaps.md GAP-0005" ;;
-esac
-case "$HOST_ARCH" in
-  x86_64|amd64) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_ARCH'); see docs/known-gaps.md GAP-0005" ;;
-esac
-
-cat > "$WORKDIR/_start.S" <<'EOF'
-    .text
-    .global _start
-_start:
-    call    main
-    movl    %eax, %edi
-    movl    $60, %eax
-    syscall
-EOF
-
-LINK_LOG="$WORKDIR/link.log"
-clang -ffreestanding -fno-builtin -nostdlib -static \
-  -o "$BIN" "$WORKDIR/_start.S" "$EXAMPLE_DIR/main.c" "$OBJ" \
-  >"$LINK_LOG" 2>&1
-LINK_STATUS=$?
-if [[ $LINK_STATUS -ne 0 ]]; then
-  cat "$LINK_LOG" >&2
-  fail "freestanding link of main.c + loop.o exited $LINK_STATUS (log above)"
-fi
-[[ -f "$BIN" ]] || fail "clang reported success but $BIN was not produced"
+source "$CORE_DIR/tests/conformance/_lib/hosted-link.sh"
+dc_link "$BIN" "$EXAMPLE_DIR/main.c" "$OBJ" "$EXAMPLE_DIR/loop.dart"
 
 # ---------------------------------------------------------------------------
 # Step 4 — run the binary, assert exit code 0. main.c's own checks: 1 =
@@ -124,5 +111,5 @@ if [[ $ACTUAL -ne 0 ]]; then
   fail "loop_test exited $ACTUAL — see core/examples/m2-loop/main.c for what each code means"
 fi
 
-echo "M2-loop: PASS — dcc build -> verify-freestanding pass -> freestanding link -> sumTo (50 values) + firstAtLeast (19x15 combinations, nested early-return inside a loop), all correct"
+echo "M2-loop: PASS — dcc build -> verify-freestanding pass -> $DC_LINK_MODE link -> sumTo (50 values) + firstAtLeast (19x15 combinations, nested early-return inside a loop), all correct"
 exit 0

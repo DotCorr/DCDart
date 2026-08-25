@@ -73,44 +73,31 @@ if [[ $VERIFY_STATUS -ne 0 ]] || ! grep -q "FREESTANDING: pass" <<<"$VERIFY_OUT"
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — link main.c against bitwise.o, freestanding. Same Linux/
-# x86-64-only entry stub as the other conformance harnesses (GAP-0005).
+# Step 3 — link main.c against bitwise.o and produce a runnable binary.
+#
+# On Linux/x86-64 this is still the freestanding link: -ffreestanding
+# -fno-builtin -nostdlib -static, plus a hand-written `_start`, because
+# -nostdlib means there is no crt0 and therefore nothing to call `main`.
+# That link is belt-and-braces evidence that bitwise.o needs no crt, no libc
+# and no dynamic loader.
+#
+# On every other host that `_start` cannot work -- it is x86-64 Linux
+# `sys_exit` by construction -- so the shared helper rebuilds bitwise.dart
+# for `--target host` and links it against libc instead. See
+# tests/conformance/_lib/hosted-link.sh for exactly what that trades away;
+# short version: nothing this harness relied on it for, because bitwise.o's
+# freestanding guarantee is asserted in Step 2 above by
+# verify-freestanding.sh, which runs identically on every host and is the
+# stronger of the two checks.
+#
+# This is GAP-0048 closed: this harness used to FAIL rather than skip on
+# macOS and Windows, so it (and 16 sibling targets) could not run on two of
+# the three hosts DCDart claims to support. $DC_LINK_MODE records which path
+# ran and is printed in the PASS line, so a pass is never ambiguous about
+# what it proved.
 # ---------------------------------------------------------------------------
-if ! command -v clang >/dev/null 2>&1; then
-  fail "clang not found on PATH, see docs/known-gaps.md GAP-0001"
-fi
-
-HOST_OS="$(uname -s 2>/dev/null || echo unknown)"
-HOST_ARCH="$(uname -m 2>/dev/null || echo unknown)"
-case "$HOST_OS" in
-  Linux*) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_OS'); see docs/known-gaps.md GAP-0005" ;;
-esac
-case "$HOST_ARCH" in
-  x86_64|amd64) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_ARCH'); see docs/known-gaps.md GAP-0005" ;;
-esac
-
-cat > "$WORKDIR/_start.S" <<'EOF'
-    .text
-    .global _start
-_start:
-    call    main
-    movl    %eax, %edi
-    movl    $60, %eax
-    syscall
-EOF
-
-LINK_LOG="$WORKDIR/link.log"
-clang -ffreestanding -fno-builtin -nostdlib -static \
-  -o "$BIN" "$WORKDIR/_start.S" "$EXAMPLE_DIR/main.c" "$OBJ" \
-  >"$LINK_LOG" 2>&1
-LINK_STATUS=$?
-if [[ $LINK_STATUS -ne 0 ]]; then
-  cat "$LINK_LOG" >&2
-  fail "freestanding link of main.c + bitwise.o exited $LINK_STATUS (log above)"
-fi
-[[ -f "$BIN" ]] || fail "clang reported success but $BIN was not produced"
+source "$CORE_DIR/tests/conformance/_lib/hosted-link.sh"
+dc_link "$BIN" "$EXAMPLE_DIR/main.c" "$OBJ" "$EXAMPLE_DIR/bitwise.dart"
 
 # ---------------------------------------------------------------------------
 # Step 4 — run the binary, assert exit code 0. main.c's own checks: 1-3 =
@@ -123,5 +110,5 @@ if [[ $ACTUAL -ne 0 ]]; then
   fail "bitwise_test exited $ACTUAL — see core/examples/m2-bitwise/main.c for what each code means"
 fi
 
-echo "M2-bitwise: PASS — dcc build -> verify-freestanding pass -> freestanding link -> real execution, &, |, ^, << (u64) exhaustive over ranges, >> (u64) over ranges, & at u32/u16/u8, all correct"
+echo "M2-bitwise: PASS — dcc build -> verify-freestanding pass -> $DC_LINK_MODE link -> real execution, &, |, ^, << (u64) exhaustive over ranges, >> (u64) over ranges, & at u32/u16/u8, all correct"
 exit 0

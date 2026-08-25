@@ -9,20 +9,19 @@
 #
 # Structure is m2-bitwise/run.sh's, with ONE step added. Steps 1, 2, 4 and 5
 # are that harness's steps 1-4 verbatim in shape (build, verify-freestanding,
-# freestanding link, run-and-check-exit-code), including the identical
-# Linux/x86-64 gate on the freestanding link. Step 3 is new and is the reason
-# this harness is not a straight copy: `*` traps on overflow and `~/`/`%` trap
-# on a zero divisor, and a trap KILLS the process, so those paths physically
-# cannot be checked by main.c's exit code -- they need their own binary and
-# their own assertion ("was killed by a signal"), which is what step 3 is.
+# link, run-and-check-exit-code), including the identical use of the shared
+# link helper. Step 3 is new and is the reason this harness is not a straight
+# copy: `*` traps on overflow and `~/`/`%` trap on a zero divisor, and a trap
+# KILLS the process, so those paths physically cannot be checked by main.c's
+# exit code -- they need their own binary and their own assertion ("was
+# killed by a signal"), which is what step 3 is.
 #
-# Step 3 is placed BEFORE the freestanding link rather than after it on
+# Step 3 is placed BEFORE the link-and-run step rather than after it on
 # purpose. It builds with `--target host` and links against the host libc, so
-# it runs on any host with a working clang -- including the macOS/arm64 dev
-# machines where step 4's Linux/x86-64-only entry stub correctly refuses. Put
-# last, it would be dead code on exactly the hosts where it is the only
-# execution-based evidence available. It is NOT a substitute for step 4 and
-# does not let this harness report PASS without it.
+# it runs on any host with a working clang. It is the only execution-based
+# evidence for the trapping paths, and ordering it first keeps it from being
+# skipped by an early failure in the link step. It is NOT a substitute for
+# steps 4-5 and does not let this harness report PASS without them.
 #
 # Usage:
 #   bash core/tests/conformance/m2-arith/run.sh
@@ -96,17 +95,26 @@ fi
 # ---------------------------------------------------------------------------
 # Step 3 — trap verification. `~/ 0`, `% 0` and an overflowing `*` must each
 # KILL the process (ADR-0035, ADR-0036). Built with --target host and linked
-# against the host libc so this step is executable on any clang host, not
-# just the Linux/x86-64 one step 4 requires.
+# against the host libc so this step is executable on any clang host.
 #
 # The assertion is "died by signal", never "exited with code N": the exact
-# signal is a backend/platform choice (SIGTRAP on this project's targets
-# today, so 128+5 = 133, but SIGILL/SIGABRT would be an equally valid way to
-# implement a trap and must not fail this check). Bash reports a
-# signal-killed child as 128+signum, so 129..159 is exactly the set of
-# "killed by a signal" statuses and nothing else. A trap that stopped
-# trapping returns 40..45 from trap_divzero.c and lands outside that range,
-# which is the regression this step exists to catch.
+# signal is a backend/platform choice, and it genuinely differs by host.
+# `llvm.trap` lowers per target:
+#
+#   Linux/x86-64   -> `ud2`  -> SIGILL  (4)  -> bash reports 132
+#   macOS/arm64    -> `brk`  -> SIGTRAP (5)  -> bash reports 133
+#
+# Both are correct implementations of "this operation traps", so pinning
+# this check to either number would make the harness fail on the other host
+# for no real reason. SIGABRT (6) via a libc `abort()` lowering would be an
+# equally valid third answer. Bash reports a signal-killed child as
+# 128+signum, so 129..159 is exactly the set of "killed by a signal"
+# statuses and nothing else.
+#
+# This is NOT "any nonzero exit". The two regressions this step exists to
+# catch both land squarely OUTSIDE 129..159 and still fail: a trap that
+# became a normal exit, and an operation that silently returned a wrong
+# value instead of trapping, both return trap_divzero.c's own 40..45 codes.
 # ---------------------------------------------------------------------------
 if ! command -v clang >/dev/null 2>&1; then
   fail "clang not found on PATH, see docs/known-gaps.md GAP-0001"
@@ -162,40 +170,31 @@ check_trap "remU64(1071, 0)  [% by zero]" a
 check_trap "mulU64(2^63, 3)  [* overflow]" a b
 
 # ---------------------------------------------------------------------------
-# Step 4 — link main.c against arith.o, freestanding. Same Linux/x86-64-only
-# entry stub as the other conformance harnesses (GAP-0005).
+# Step 4 — link main.c against arith.o and produce a runnable binary.
+#
+# On Linux/x86-64 this is still the freestanding link: -ffreestanding
+# -fno-builtin -nostdlib -static, plus a hand-written `_start`, because
+# -nostdlib means there is no crt0 and therefore nothing to call `main`.
+# That link is belt-and-braces evidence that arith.o needs no crt, no libc
+# and no dynamic loader.
+#
+# On every other host that `_start` cannot work -- it is x86-64 Linux
+# `sys_exit` by construction -- so the shared helper rebuilds arith.dart for
+# `--target host` and links it against libc instead. See
+# tests/conformance/_lib/hosted-link.sh for exactly what that trades away;
+# short version: nothing this harness relied on it for, because arith.o's
+# freestanding guarantee is asserted in Step 2 above by
+# verify-freestanding.sh (and again in Step 3 for the --target host object),
+# which runs identically on every host and is the stronger of the two checks.
+#
+# This is GAP-0048 closed: this harness used to FAIL rather than skip on
+# macOS and Windows, so it (and 16 sibling targets) could not run on two of
+# the three hosts DCDart claims to support. $DC_LINK_MODE records which path
+# ran and is printed in the PASS line, so a pass is never ambiguous about
+# what it proved.
 # ---------------------------------------------------------------------------
-HOST_OS="$(uname -s 2>/dev/null || echo unknown)"
-HOST_ARCH="$(uname -m 2>/dev/null || echo unknown)"
-case "$HOST_OS" in
-  Linux*) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_OS'); see docs/known-gaps.md GAP-0005" ;;
-esac
-case "$HOST_ARCH" in
-  x86_64|amd64) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_ARCH'); see docs/known-gaps.md GAP-0005" ;;
-esac
-
-cat > "$WORKDIR/_start.S" <<'EOF'
-    .text
-    .global _start
-_start:
-    call    main
-    movl    %eax, %edi
-    movl    $60, %eax
-    syscall
-EOF
-
-LINK_LOG="$WORKDIR/link.log"
-clang -ffreestanding -fno-builtin -nostdlib -static \
-  -o "$BIN" "$WORKDIR/_start.S" "$EXAMPLE_DIR/main.c" "$OBJ" \
-  >"$LINK_LOG" 2>&1
-LINK_STATUS=$?
-if [[ $LINK_STATUS -ne 0 ]]; then
-  cat "$LINK_LOG" >&2
-  fail "freestanding link of main.c + arith.o exited $LINK_STATUS (log above)"
-fi
-[[ -f "$BIN" ]] || fail "clang reported success but $BIN was not produced"
+source "$CORE_DIR/tests/conformance/_lib/hosted-link.sh"
+dc_link "$BIN" "$EXAMPLE_DIR/main.c" "$OBJ" "$EXAMPLE_DIR/arith.dart"
 
 # ---------------------------------------------------------------------------
 # Step 5 — run the binary, assert exit code 0. main.c's own checks: 1-4 = `*`
@@ -210,5 +209,5 @@ if [[ $ACTUAL -ne 0 ]]; then
   fail "arith_test exited $ACTUAL -- see core/examples/m2-arith/main.c for what each code means"
 fi
 
-echo "M2-ARITH: PASS -- dcc build -> verify-freestanding pass -> trap check (~/ 0, % 0, * overflow all killed by signal) -> freestanding link -> real execution, * at u64/u32/u16/u8 and ~/ and % at u64/u32/u8 swept over ranges, gcd/digitSum/isPrime/powMod/lcm/sumProperDivisors composed against hard-coded answers, all correct"
+echo "M2-ARITH: PASS -- dcc build -> verify-freestanding pass -> trap check (~/ 0, % 0, * overflow all killed by signal) -> $DC_LINK_MODE link -> real execution, * at u64/u32/u16/u8 and ~/ and % at u64/u32/u8 swept over ranges, gcd/digitSum/isPrime/powMod/lcm/sumProperDivisors composed against hard-coded answers, all correct"
 exit 0

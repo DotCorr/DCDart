@@ -74,46 +74,35 @@ if [[ $VERIFY_STATUS -ne 0 ]] || ! grep -q "FREESTANDING: pass" <<<"$VERIFY_OUT"
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — link main.c against header.o, freestanding. Same Linux/x86-64-
-# only entry stub as core/tests/conformance/m0/run.sh, same reason (see
-# docs/known-gaps.md GAP-0005) -- identical constraint, third conformance
-# target.
+# Step 3 — link main.c against header.o and produce a runnable binary.
+#
+# Same shared link step as core/tests/conformance/m0/run.sh -- identical
+# constraint, third conformance target, one helper.
+#
+# On Linux/x86-64 this is still the freestanding link -- -ffreestanding
+# -fno-builtin -nostdlib -static plus a minimal `_start` (under -nostdlib
+# there is no crt0, so nothing would otherwise call `main`). That link is
+# belt-and-braces evidence that header.o needs no crt, no libc and no dynamic
+# loader.
+#
+# But that `_start` issues the x86-64 Linux sys_exit syscall, so it is
+# Linux/x86-64 by construction, and this harness used to FAIL rather than
+# skip on any other host. It now delegates to the shared helper, which keeps
+# the freestanding link on Linux/x86-64 and links against libc everywhere
+# else (rebuilding the source for `--target host`, because the bare-x86_64
+# ELF object will not link into a Mach-O or PE image). See
+# tests/conformance/_lib/hosted-link.sh for exactly what the hosted path
+# gives up -- short version: nothing this harness was relying on it for,
+# because header.o's freestanding guarantee is asserted in Step 2 above by
+# verify-freestanding.sh, which runs identically on all three hosts and is
+# the stronger check of the two.
+#
+# This is GAP-0048 closed: the behavioural assertion below now runs on
+# macOS, Windows and Linux, and the PASS line names which link path ran, so
+# a pass is never ambiguous about what it proved.
 # ---------------------------------------------------------------------------
-if ! command -v clang >/dev/null 2>&1; then
-  fail "clang not found on PATH, see docs/known-gaps.md GAP-0001"
-fi
-
-HOST_OS="$(uname -s 2>/dev/null || echo unknown)"
-HOST_ARCH="$(uname -m 2>/dev/null || echo unknown)"
-case "$HOST_OS" in
-  Linux*) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_OS'); see docs/known-gaps.md GAP-0005" ;;
-esac
-case "$HOST_ARCH" in
-  x86_64|amd64) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_ARCH'); see docs/known-gaps.md GAP-0005" ;;
-esac
-
-cat > "$WORKDIR/_start.S" <<'EOF'
-    .text
-    .global _start
-_start:
-    call    main
-    movl    %eax, %edi
-    movl    $60, %eax
-    syscall
-EOF
-
-LINK_LOG="$WORKDIR/link.log"
-clang -ffreestanding -fno-builtin -nostdlib -static \
-  -o "$BIN" "$WORKDIR/_start.S" "$EXAMPLE_DIR/main.c" "$OBJ" \
-  >"$LINK_LOG" 2>&1
-LINK_STATUS=$?
-if [[ $LINK_STATUS -ne 0 ]]; then
-  cat "$LINK_LOG" >&2
-  fail "freestanding link of main.c + header.o exited $LINK_STATUS (log above)"
-fi
-[[ -f "$BIN" ]] || fail "clang reported success but $BIN was not produced"
+source "$CORE_DIR/tests/conformance/_lib/hosted-link.sh"
+dc_link "$BIN" "$EXAMPLE_DIR/main.c" "$OBJ" "$EXAMPLE_DIR/header.dart"
 
 # ---------------------------------------------------------------------------
 # Step 4 — run the binary, assert exit code 0. main.c's own checks: 1-3 mean
@@ -127,5 +116,5 @@ if [[ $ACTUAL -ne 0 ]]; then
   fail "header_test exited $ACTUAL — see core/examples/m1-struct/main.c for what each code means"
 fi
 
-echo "M1-struct: PASS — dcc build -> verify-freestanding pass -> freestanding link -> packed layout matches C reference byte-for-byte"
+echo "M1-struct: PASS — dcc build -> verify-freestanding pass -> $DC_LINK_MODE link -> packed layout matches C reference byte-for-byte"
 exit 0

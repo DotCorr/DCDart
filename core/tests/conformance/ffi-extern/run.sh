@@ -172,7 +172,7 @@ if [[ -z "$FS_LINKER" ]] && command -v x86_64-elf-ld >/dev/null 2>&1; then
 fi
 if [[ -z "$FS_LINKER" ]]; then
   cat "$FS_DIR/link.log" >&2 2>/dev/null
-  fail "no ELF linker available for the freestanding leg (need a Linux clang or x86_64-elf-ld); see docs/known-gaps.md GAP-0005"
+  fail "no ELF linker available for the freestanding leg (need a Linux clang or x86_64-elf-ld); see docs/known-gaps.md GAP-0048"
 fi
 [[ -f "$FS_BIN" ]] || fail "$FS_LINKER reported success but $FS_BIN was not produced"
 

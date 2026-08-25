@@ -4,7 +4,7 @@
 # The native-host conformance target. Every other harness in this directory
 # links its @bare object with `-ffreestanding -nostdlib -static` plus a
 # hand-written `_start.S`, and gates itself to Linux/x86-64 because that stub
-# is Linux/x86-64-only (former GAP-0005). It had to: dcc hardcoded the
+# is Linux/x86-64-only (former GAP-0048). It had to: dcc hardcoded the
 # freestanding triple `x86_64-unknown-none-elf`, so its output was not a
 # native object for any real host OS.
 #

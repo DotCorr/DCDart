@@ -73,44 +73,32 @@ if [[ $VERIFY_STATUS -ne 0 ]] || ! grep -q "FREESTANDING: pass" <<<"$VERIFY_OUT"
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — link main.c against weak.o, freestanding. Same Linux/x86-64-only
-# entry stub as the other conformance harnesses (GAP-0005).
+# Step 3 — link main.c against weak.o and run it.
+#
+# The link itself is delegated to the shared helper in
+# tests/conformance/_lib/hosted-link.sh, which picks a link path per host.
+# On Linux/x86-64 it still performs the freestanding link -- `-ffreestanding
+# -fno-builtin -nostdlib -static` plus a hand-written `_start`, since with
+# `-nostdlib` there is no crt0 to call `main` -- and so keeps the
+# belt-and-braces link-level evidence that weak.o needs no crt, no libc and
+# no dynamic loader. On every other host the helper rebuilds the source for
+# `--target host` and links against libc, because the bare-x86_64 object is
+# ELF and will not link into a Mach-O or PE image.
+#
+# What the hosted path gives up is only that link-level evidence, not the
+# freestanding guarantee itself: Step 2 above asserts it directly on the
+# bare-x86_64 object via verify-freestanding.sh, which runs identically on
+# all three hosts and is the stronger of the two checks. See the helper's
+# header for the full reasoning.
+#
+# This is GAP-0048 closed. This harness previously FAILED rather than
+# skipped on macOS and Windows, so it could not run on two of the three
+# hosts DCDart claims to support. $DC_LINK_MODE, set by dc_link, records
+# which path actually ran and is reported in the PASS line below, so a pass
+# is never ambiguous about what it proved.
 # ---------------------------------------------------------------------------
-if ! command -v clang >/dev/null 2>&1; then
-  fail "clang not found on PATH, see docs/known-gaps.md GAP-0001"
-fi
-
-HOST_OS="$(uname -s 2>/dev/null || echo unknown)"
-HOST_ARCH="$(uname -m 2>/dev/null || echo unknown)"
-case "$HOST_OS" in
-  Linux*) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_OS'); see docs/known-gaps.md GAP-0005" ;;
-esac
-case "$HOST_ARCH" in
-  x86_64|amd64) ;;
-  *) fail "this harness's freestanding entry stub is Linux/x86-64 only (host reported '$HOST_ARCH'); see docs/known-gaps.md GAP-0005" ;;
-esac
-
-cat > "$WORKDIR/_start.S" <<'EOF'
-    .text
-    .global _start
-_start:
-    call    main
-    movl    %eax, %edi
-    movl    $60, %eax
-    syscall
-EOF
-
-LINK_LOG="$WORKDIR/link.log"
-clang -ffreestanding -fno-builtin -nostdlib -static \
-  -o "$BIN" "$WORKDIR/_start.S" "$EXAMPLE_DIR/main.c" "$OBJ" \
-  >"$LINK_LOG" 2>&1
-LINK_STATUS=$?
-if [[ $LINK_STATUS -ne 0 ]]; then
-  cat "$LINK_LOG" >&2
-  fail "freestanding link of main.c + weak.o exited $LINK_STATUS (log above)"
-fi
-[[ -f "$BIN" ]] || fail "clang reported success but $BIN was not produced"
+source "$CORE_DIR/tests/conformance/_lib/hosted-link.sh"
+dc_link "$BIN" "$EXAMPLE_DIR/main.c" "$OBJ" "$EXAMPLE_DIR/weak.dart"
 
 # ---------------------------------------------------------------------------
 # Step 4 — run the binary, assert exit code 0. main.c's own checks: 1 = not
@@ -124,5 +112,5 @@ if [[ $ACTUAL -ne 0 ]]; then
   fail "weak_test exited $ACTUAL — see core/examples/m2-weak/main.c for what each code means"
 fi
 
-echo "M2-weak: PASS — dcc build -> verify-freestanding pass -> freestanding link -> 1000 real weak-reference cycles (dangling + alive paths), zombie-slot mechanics exact, genuinely leak-free"
+echo "M2-weak: PASS — dcc build -> verify-freestanding pass -> $DC_LINK_MODE link -> 1000 real weak-reference cycles (dangling + alive paths), zombie-slot mechanics exact, genuinely leak-free"
 exit 0
