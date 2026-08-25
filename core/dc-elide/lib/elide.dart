@@ -220,6 +220,8 @@ Set<int> referencedValueIds(DCInstruction instruction) {
       ref(value);
     case IntToPtr(:final address):
       ref(address);
+    case PtrToInt(:final pointer):
+      ref(pointer);
     case PtrOffset(:final base):
       ref(base);
     case PortOut(:final port, :final value):
@@ -227,6 +229,16 @@ Set<int> referencedValueIds(DCInstruction instruction) {
       ref(value);
     case PortIn(:final port):
       ref(port);
+    case AtomicLoad(:final pointer):
+      ref(pointer);
+    case AtomicStore(:final pointer, :final value):
+      ref(pointer);
+      ref(value);
+    case AtomicRmw(:final pointer, :final value):
+      ref(pointer);
+      ref(value);
+    case Fence():
+      break; // orders other instructions; has no operands of its own
     case NullRef():
       break; // a constant; no operands
     case AddressOfGlobal():

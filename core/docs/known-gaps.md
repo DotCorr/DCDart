@@ -132,7 +132,8 @@ exist to remove.
 ## GAP-0039 — Mutable statics have no concurrency story
 
 **Domain:** dc-ir, backend (M2, downstream: `oscortex_core`)
-**Status:** OPEN
+**Status:** RESOLVED (2026-08-26) — ADR-0055 (atomics) and ADR-0056 (barriers). See the resolution
+note at the end of this entry for what it did NOT cover, which is the more important half.
 
 ADR-0051 gives DCDart mutable global storage. It gives no guarantee whatsoever about concurrent
 access. A `@bss` counter incremented from an interrupt handler and read from ordinary code is a
@@ -150,6 +151,29 @@ the failure mode is a lost tick or a corrupted bitmap entry that reproduces once
 The eventual answer is atomic read-modify-write primitives, which interact with the same
 device-memory-versus-ordinary-memory type distinction GAP-0034 needs. Worth solving together rather
 than bolting `Atomic<T>` onto a language that cannot yet say which memory is which.
+
+**Resolution.** `Atomic.load`/`store`/`exchange`/`fetchAdd`/`fetchSub`/`fetchAnd`/`fetchOr`/`fetchXor`
+at `u8`…`u64` (ADR-0055), plus `fence(Ordering.…)` (ADR-0056) for the ordering half this entry
+correctly said was a *different* question. The tick counter is `Atomic.fetchAdd`; the free-frame
+bitmap is `fetchOr`/`fetchAnd`, which is worth repeating because this entry names "a corrupted bitmap
+entry" and it is a different operation from the lost tick.
+
+Every operation lowers to a real instruction — `lock xadd`, `lock cmpxchg`, `xchg` — never a
+`__atomic_*` libcall, which would be a rule 1 violation. `tests/conformance/atomic/` asserts that by
+name at every optimization level, and asserts a paired negative control: the same read-modify-write
+written non-atomically must stay unlocked, without which the whole harness proves nothing.
+
+**Not solved together with GAP-0034, contrary to this entry's own recommendation.** That advice was
+about `Atomic<T>` as a wrapper TYPE, which is not what shipped: `Atomic.*` are static methods over a
+`Pointer<T>` (a wrapper type needs generic classes, GAP-0040). The device/ordinary-memory distinction
+turned out not to be a prerequisite of atomicity at all — but it IS a prerequisite of testing the
+ordering half, which is GAP-0043.
+
+**What this did NOT touch, and it is the larger hazard.** ARC's own refcounts are non-atomic:
+`_emitRetain` is a plain `load i32`/`add`/`store i32`, emitted by the compiler on every ownership
+transfer in every program without anyone asking. That is this entry's failure mode one layer down,
+and it is a spec §3.1 question frozen at M3 rather than something to fix in a unit like this one.
+Escalation 0007.
 
 ---
 
@@ -401,7 +425,8 @@ traversal. If M3 comes in over budget, check this before concluding anything abo
 ## GAP-0033 — `volatile` prevents elision and reordering, but there are no memory BARRIERS
 
 **Domain:** dc-ir, backend (M2, downstream: `oscortex_core`)
-**Status:** OPEN
+**Status:** RESOLVED for standalone fences (2026-08-26, ADR-0056). NOT resolved for the rest of a
+memory-ordering model — see GAP-0044.
 
 ADR-0041 emits LLVM `volatile`, which stops the optimizer deleting, duplicating or reordering an
 access relative to other volatile accesses. That is what MMIO correctness needs on a single core.
@@ -411,10 +436,137 @@ multi-core visibility or about ordering relative to non-volatile accesses. `DCDA
 for "explicit ordering", which means real barriers — `mfence`/`dmb`, acquire/release, or LLVM's
 `fence` instruction. None exist.
 
-**Cost of the workaround:** invisible today, because `oscortex_core` is single-core with interrupts as
-the only concurrency, and interrupt entry/exit is a serializing event. It becomes real at the first SMP
-bring-up or the first lock-free structure shared with a device, and at that point it is the kind of bug
-that reproduces once a week and never under a debugger.
+**Resolution.** ADR-0056 implements spec §6's own spelling, `fence(Ordering.…)`, with five orderings:
+`acquire`, `release`, `acqRel`, `seqCst` and `compilerOnly`. Verified in
+`tests/conformance/fence/` at `-O0`…`-Os`.
+
+**What is NOT resolved, and why it is a separate entry rather than a footnote here:** a fence is the
+coarse idiom. Per-access acquire/release loads and stores do not exist, there is no written
+happens-before relation anywhere in the spec, and nothing says what a `@volatile` access orders with
+respect to a fence. GAP-0044.
+
+**The honest limit of the test**, recorded here as well as in the harness: on x86-64 only `seqCst`
+reaches the machine (`mfence`); TSO provides the other three in hardware, so they emit no instruction
+and are asserted at the IR level instead — the same resolution ADR-0041/GAP-0036 reached for
+`volatile`. And no differential test is possible today at all: see GAP-0043.
+
+---
+
+## GAP-0044 — Fences exist; a memory-ordering MODEL does not, and atomics are seq_cst-only
+
+**Domain:** dc-ir, backend, DCDART_SPEC.md §6 (M2/M3, downstream: `oscortex_core`)
+**Status:** OPEN
+
+ADR-0055 and ADR-0056 gave DCDart atomics and standalone fences. Three things they deliberately did
+not give it, grouped because they are one question — "what does DCDart promise about the order in
+which memory operations become visible?" — and the answer today is "nothing written down".
+
+1. **No happens-before relation is specified anywhere.** Spec §6 lists `fence(Ordering.acquire)` as a
+   required primitive and stops. What `Ordering.acquire` *means* is currently "whatever LLVM's
+   `fence acquire` means", which is a real and well-defined answer, but it is inherited rather than
+   stated, and it is not written where a DCDart programmer would look.
+
+2. **No per-access ordering.** `Atomic.load`/`store` are sequentially consistent with no `Ordering`
+   parameter (ADR-0055's decision, and deliberately the strong default: starting strong and relaxing
+   later is a widening that breaks nothing, starting relaxed and tightening later would silently
+   break every program that assumed the default sufficed). The cost is real but narrow: on x86-64 a
+   `lock`-prefixed RMW is already a full barrier, so only a seq_cst *store* is more expensive than a
+   relaxed one — `xchg` rather than `mov`. On AArch64 the gap is wider, and this becomes worth
+   measuring before `bare-aarch64` carries real code.
+
+3. **Atomic arithmetic wraps, silently exempt from spec §4.1's trapping rule.** `Atomic.fetchAdd`
+   cannot trap on overflow: the overflow is only observable after the write has committed and there
+   is nothing to roll back to. Documented in the prelude, the IR node and ADR-0055 — but it IS the
+   one exception to a `[LOAD-BEARING]` rule, and an exception that lives only in doc comments is one
+   a future integer-model change will not know about.
+
+**Cost of the workaround:** nothing today; `oscortex_core` is single-core and writes fences, not
+per-access orderings. Item 3 is the one that could bite silently — a wrapping counter reported as an
+enormous value with no diagnostic anywhere, exactly the failure mode GAP-0026 describes for unsigned
+misinterpretation.
+
+---
+
+## GAP-0043 — The fences are currently redundant with `volatile`, so their ordering property is untestable
+
+**Domain:** dcc-lower, backend, tests (M2)
+**Status:** OPEN — a testing gap, not a correctness one
+
+ADR-0056's conformance harness cannot run the test that would actually prove a fence works: a
+differential showing that without it the compiler reorders two accesses and with it it does not.
+
+The reason is a collision between two correct decisions. Every access in
+`examples/m2-fence/fence.dart` goes through `Pointer<T>.value`, and ADR-0041 makes every
+`Pointer<T>` access **volatile** — including bulk ordinary-memory access it does not need, which is
+GAP-0034. Volatile accesses may not be reordered relative to one another. So on today's language the
+fences are redundant with a guarantee `Pointer<T>` is already handing out for free, and removing a
+fence changes no emitted code.
+
+This is not an argument against the fences. It is a dependency worth knowing: **the redundancy ends
+the moment GAP-0034's device-memory/ordinary-memory type split lands** and ordinary pointer access
+stops being volatile. At that point these fences become load-bearing with no source change, and the
+differential test becomes writable. Whoever closes GAP-0034 should write it.
+
+**Cost of the workaround:** the acquire/release/acqRel orderings are pinned only by an IR-level
+assertion (they emit no x86-64 instruction) plus a count. That catches a lowering that drops or
+collapses an ordering, which is the regression that would actually happen. It does not catch a
+mis-specified ordering — mapping `release` to `acquire` would pass the count and fail nothing.
+
+---
+
+## GAP-0042 — Atomic alignment is neither checked nor representable
+
+**Domain:** dc-ir, backend (M2, downstream: `oscortex_core`)
+**Status:** OPEN — silent undefined behaviour, no diagnostic possible today
+
+ADR-0055's atomics emit `align N` equal to the operand width, which is what LLVM requires. Nothing
+verifies the pointer actually satisfies it, and nothing can: `DCPointer` carries no alignment, and
+`Pointer<T>.fromAddress` takes an arbitrary `u64`.
+
+An under-aligned atomic is undefined at the hardware level, not merely slow. A `lock` operation
+spanning a cache-line boundary is not atomic on some x86 parts and raises `#AC` on others when
+alignment checking is enabled — and split-lock detection, which modern kernels enable, turns it into
+a fault. The failure is a machine-check-shaped event a long way from the source line that caused it.
+
+Every caller in-tree is safe today by construction: a `@bss` block declares `align` explicitly
+(ADR-0051), and the example addresses are `base + index * 8`. That is safety by inspection of four
+call sites, which does not survive the fifth.
+
+**Cost of the workaround:** the guarantee lives in the programmer's head. The fix is the same
+information GAP-0034 wants and GAP-0051 wants — an alignment on the pointer TYPE, so
+`Pointer<u64>.elementAt(n)` derives both stride and alignment in one place. Worth solving with those
+rather than bolting an `assert` onto `Atomic.*`.
+
+---
+
+## GAP-0041 — No compare-exchange, because DC-IR has no multi-result instruction
+
+**Domain:** dc-ir, dcc-lower, backend (M2/M3)
+**Status:** OPEN
+
+`DCDART_SPEC.md` §6 lists "CAS" among the required atomics. ADR-0055 shipped `load`, `store`,
+`exchange` and five `fetch*` operations, and not compare-exchange.
+
+The reason is structural rather than effort: `cmpxchg` produces TWO values — the previous contents
+and whether the swap happened — and `dc-ir/lib/instructions.dart`'s own header states the rule it
+would break: *"Every non-terminator instruction defines at most one result — DC-IR has no
+multi-result instructions… if a future instruction genuinely needs to define more than one value,
+that's a new node shape to design then, not a `List<DCValue> results` retrofitted onto this base
+class now."* Adding one is a larger change than all of ADR-0055.
+
+Three shapes exist for whoever takes it: a genuine multi-result node (cleanest, largest blast radius
+— every switch over `DCInstruction` and `dc-elide`'s `referencedValueIds` change shape); a
+`DCStruct`-typed result plus two `ExtractField`s, which is what LLVM itself does and needs no new
+node kind at all; or two instructions sharing a pointer, which is unsound and is listed only so it is
+visibly rejected. **The `DCStruct` route is almost certainly right** and would make `Result<T,E>`'s
+existing `MakeStruct`/`ExtractField` machinery do the work.
+
+**Cost of the workaround:** a test-and-set spinlock is expressible via `Atomic.exchange` — swap 1 in,
+you hold the lock iff 0 came out — so mutual exclusion is available. What is not is any lock-free
+structure needing an ABA-safe update: a lock-free free list, a Treiber stack, or an atomic
+"increment only if below a limit". Each of those has to become a spinlock-guarded critical section,
+which is correct and slower, and in an interrupt handler a spinlock is a deadlock risk a CAS would
+not have been.
 
 ---
 

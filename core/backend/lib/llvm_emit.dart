@@ -335,6 +335,11 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
       _emitDivRem('div', instruction.dest, instruction.lhs, instruction.rhs, e, context);
     case IRem():
       _emitDivRem('rem', instruction.dest, instruction.lhs, instruction.rhs, e, context);
+    case PtrToInt():
+      final destType = _llvmType(instruction.dest.type, context: context);
+      e.line(
+        '%v${instruction.dest.id.index} = ptrtoint ptr %v${instruction.pointer.id.index} to $destType',
+      );
     case NullRef():
       // LLVM's `null` constant. Materialized through a no-op GEP so the
       // result is a real SSA name other instructions can reference, matching
@@ -426,6 +431,61 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
         '"in${inSpec.suffix} \$1, \$0", "={${inSpec.reg}},{dx}"'
         '(i16 %v${instruction.port.id.index})',
       );
+    // Atomics (ADR-0055). `load atomic`/`store atomic` REQUIRE an explicit
+    // `align` in LLVM textual IR — unlike a plain load/store, which may omit
+    // it — and the alignment must be at least the type's size or LLVM rejects
+    // the module. `atomicrmw` does not require one.
+    //
+    // The rule-1 property these must hold: on every target this project
+    // emits for, a naturally-aligned atomic at 1/2/4/8 bytes lowers to a real
+    // instruction (`lock xadd`, `xchg`, `mov`), NOT to a `__atomic_*` libcall.
+    // A libcall would be an undefined runtime symbol in a `@bare` object and
+    // therefore a failed change even with a green suite. The width check
+    // below is what keeps that true: it is not defensive tidiness, it is the
+    // enforcement point.
+    case AtomicLoad():
+      final type = _llvmType(instruction.dest.type, context: context);
+      final bytes = _atomicWidthBytes(instruction.dest.type, context: context, what: 'AtomicLoad');
+      e.line(
+        '%v${instruction.dest.id.index} = load atomic $type, ptr '
+        '%v${instruction.pointer.id.index} seq_cst, align $bytes',
+      );
+    case AtomicStore():
+      final type = _llvmType(instruction.value.type, context: context);
+      final bytes = _atomicWidthBytes(instruction.value.type, context: context, what: 'AtomicStore');
+      e.line(
+        'store atomic $type %v${instruction.value.id.index}, ptr '
+        '%v${instruction.pointer.id.index} seq_cst, align $bytes',
+      );
+    case AtomicRmw():
+      final type = _llvmType(instruction.value.type, context: context);
+      _atomicWidthBytes(instruction.value.type, context: context, what: 'AtomicRmw');
+      // AtomicOp's names are LLVM's own opcode names (see its doc comment),
+      // so there is no mapping table here and none to drift.
+      e.line(
+        '%v${instruction.dest.id.index} = atomicrmw ${instruction.op.name} ptr '
+        '%v${instruction.pointer.id.index}, $type '
+        '%v${instruction.value.id.index} seq_cst',
+      );
+    // Barriers (ADR-0056). `compilerOnly` is NOT an LLVM ordering — there is
+    // no `fence` spelling for "constrain the compiler and emit nothing", so
+    // it is an empty inline asm with a memory clobber, which is what Linux's
+    // `barrier()` is. The other four are real `fence` instructions; three of
+    // them emit no machine code on x86-64 because TSO already provides them,
+    // and that is expected, not a bug (see ADR-0056's verification section).
+    case Fence():
+      if (instruction.ordering == DCOrdering.compilerOnly) {
+        e.line('call void asm sideeffect "", "~{memory}"()');
+      } else {
+        final ordering = switch (instruction.ordering) {
+          DCOrdering.acquire => 'acquire',
+          DCOrdering.release => 'release',
+          DCOrdering.acqRel => 'acq_rel',
+          DCOrdering.seqCst => 'seq_cst',
+          DCOrdering.compilerOnly => throw StateError('handled above'),
+        };
+        e.line('fence $ordering');
+      }
     case Call():
       _emitCall(instruction, e, context);
     case Alloc():
@@ -884,6 +944,55 @@ String _constantTypeText(
   }
   throw BackendError(
     '"$context": port I/O on a non-integer operand ($type)',
+  );
+}
+
+/// The byte width of an atomic operand, and the gate that keeps atomics from
+/// becoming a runtime dependency (ADR-0055).
+///
+/// LLVM lowers an atomic to a real instruction only when the type is an
+/// integer of a power-of-two byte size the target supports natively. Outside
+/// that set — an `i1`, an `i128` on x86-64, a struct — it emits a call to
+/// `__atomic_load`/`__atomic_fetch_add`/… from libatomic. In a `@bare` object
+/// that is an undefined runtime symbol, which is a `CLAUDE.md` rule 1
+/// violation and a failed change regardless of what the test suite says.
+///
+/// So this check is not defensive tidiness; it is where that guarantee is
+/// enforced. `wSize` is included because both targets this project emits for
+/// are 64-bit; a future 32-bit target must revisit it (a 64-bit atomic on
+/// i686 is `cmpxchg8b`, still an instruction, but `usize` would no longer
+/// mean 8 here).
+///
+/// The alignment returned equals the width, which is what LLVM requires for
+/// an atomic and what every caller in this project satisfies: a `@bss` block
+/// declares `align` explicitly (ADR-0051) and a heap payload field sits at a
+/// naturally aligned offset. An UNDER-aligned address is undefined behaviour
+/// at the hardware level (a `lock` operation spanning a cache line is not
+/// atomic on some x86 parts and faults on others) and nothing here can detect
+/// it — DC-IR carries no alignment on a `DCPointer`. Recorded in GAP-0042.
+int _atomicWidthBytes(
+  DCType type, {
+  required String context,
+  required String what,
+}) {
+  if (type is DCInt) {
+    switch (type.width) {
+      case IntWidth.w8:
+        return 1;
+      case IntWidth.w16:
+        return 2;
+      case IntWidth.w32:
+        return 4;
+      case IntWidth.w64:
+      case IntWidth.wSize:
+        return 8;
+    }
+  }
+  throw BackendError(
+    '"$context": $what on a non-integer operand ($type). An atomic must be a '
+    'sized integer (u8/u16/u32/u64) — anything else lowers to a `__atomic_*` '
+    'libcall, which is an undefined runtime symbol in a @bare object and a '
+    'CLAUDE.md rule 1 violation.',
   );
 }
 

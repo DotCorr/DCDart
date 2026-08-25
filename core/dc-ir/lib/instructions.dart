@@ -180,6 +180,24 @@ final class IRem extends DCInstruction {
   DCValue? get result => dest;
 }
 
+/// A pointer back to its integer address — the mirror of [IntToPtr]
+/// (ADR-0055).
+///
+/// DCDart's whole pointer idiom is "an address in a `u64`, wrapped with
+/// `Pointer<T>.fromAddress`". Until now the conversion only went one way, so
+/// any pointer the compiler produced — a `Str`'s byte pointer, a struct field
+/// holding one — was a dead end: you could dereference it, and you could not
+/// do arithmetic on it. Walking a string one byte at a time needs exactly
+/// that arithmetic.
+final class PtrToInt extends DCInstruction {
+  final DCValue dest;
+  final DCValue pointer;
+  const PtrToInt({required this.dest, required this.pointer});
+
+  @override
+  DCValue? get result => dest;
+}
+
 /// The null heap reference (ADR-0049).
 ///
 /// A distinct instruction rather than a `ConstInt` with a pointer dest,
@@ -532,6 +550,119 @@ final class PortIn extends DCInstruction {
 
   @override
   DCValue? get result => dest;
+}
+
+// ---------------------------------------------------------------------
+// Atomics and barriers — spec §6's required-primitives table
+// (docs/decisions/0055-atomics.md, 0056-memory-barriers.md).
+//
+// Two mechanisms, two ADRs, and they are kept apart here on purpose.
+// ATOMICITY is a property of ONE access (it cannot be interleaved).
+// ORDERING is a property of the relationship BETWEEN accesses. Neither
+// implies the other, and a node that carried both would invite code that
+// asks for one and silently gets the other's guarantee.
+// ---------------------------------------------------------------------
+
+/// Which read-modify-write an [AtomicRmw] performs. Names match LLVM's own
+/// `atomicrmw` opcodes exactly (`add`/`sub`/`and`/`or`/`xor`/`xchg`), so the
+/// backend needs no translation table — the same choice ADR-0013 made for
+/// `ICmpPredicate`.
+///
+/// Deliberately absent: `nand`, `max`/`min`/`umax`/`umin`. LLVM has them and
+/// x86 lowers them to a `cmpxchg` loop; nothing needs them, and each is a
+/// one-line addition here plus one in the emitter when something does.
+enum AtomicOp { add, sub, and, or, xor, xchg }
+
+/// An indivisible read (`load atomic ... seq_cst`). `pointer.type` must be
+/// `DCPointer(T)` where `T == dest.type`, and `T` must be a `DCInt` of 1, 2,
+/// 4 or 8 bytes.
+///
+/// Distinct from `Load(isVolatile: true)`, and the distinction is not
+/// cosmetic. Volatile stops the OPTIMIZER deleting or duplicating an access;
+/// it says nothing about whether the hardware performs it as one indivisible
+/// operation, and on a misaligned or oversized location it will not. Atomic
+/// is the machine-level guarantee. Nothing in this project may substitute one
+/// for the other.
+///
+/// No ordering field: every atomic here is sequentially consistent
+/// (ADR-0055). Weaker orderings are a widening, addable later without
+/// invalidating any program compiled today; a weak default could never have
+/// been tightened.
+final class AtomicLoad extends DCInstruction {
+  final DCValue dest;
+  final DCValue pointer;
+  const AtomicLoad({required this.dest, required this.pointer});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// An indivisible write (`store atomic ... seq_cst`). Same type rule as
+/// [AtomicLoad]. No result, same shape as `Store`.
+final class AtomicStore extends DCInstruction {
+  final DCValue pointer;
+  final DCValue value;
+  const AtomicStore({required this.pointer, required this.value});
+
+  @override
+  DCValue? get result => null;
+}
+
+/// An indivisible read-modify-write (`atomicrmw <op> ... seq_cst`).
+/// `dest` receives the contents as they were BEFORE the operation, matching
+/// C11, LLVM and x86 `xadd`.
+///
+/// This is the node GAP-0039 is about. `p.value = p.value + 1` on a `@bss`
+/// counter is three separable steps; this is one.
+///
+/// **Arithmetic here WRAPS, and cannot do otherwise.** Every other integer
+/// operation in this file carries an [Overflow] and traps by default (spec
+/// §4.1). An atomic RMW has no such option: the overflow is only observable
+/// after the write has already been committed, and there is nothing to roll
+/// back to. Recorded as an explicit field-free fact rather than an `Overflow`
+/// field that would only ever hold one value.
+final class AtomicRmw extends DCInstruction {
+  final DCValue dest;
+  final DCValue pointer;
+  final AtomicOp op;
+  final DCValue value;
+  const AtomicRmw({
+    required this.dest,
+    required this.pointer,
+    required this.op,
+    required this.value,
+  });
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Which ordering a [Fence] establishes. Names match LLVM's `fence` orderings
+/// (`acquire`/`release`/`acq_rel`/`seq_cst`), plus one that is not an LLVM
+/// ordering at all.
+///
+/// [compilerOnly] is the odd one out and is spelled out because a reader will
+/// otherwise assume it is `monotonic`/relaxed. LLVM has no "compiler-only
+/// fence" ordering — `fence monotonic` is not even legal IR. The mechanism is
+/// an empty `asm sideeffect` with a `~{memory}` clobber, which is exactly what
+/// Linux's `barrier()` is. It emits no instruction on any target and
+/// constrains only the compiler.
+enum DCOrdering { acquire, release, acqRel, seqCst, compilerOnly }
+
+/// A memory barrier. No operands, no result — it constrains the movement of
+/// other instructions and computes nothing.
+///
+/// Not foldable, not removable, not duplicable by any pass. `dc-elide`'s
+/// dead-value analysis works on `result`, and this instruction has none, so
+/// it is never a candidate for removal — but that is a property of how that
+/// pass happens to be written, so anything added later that removes
+/// result-less instructions must exclude this one explicitly.
+final class Fence extends DCInstruction {
+  final DCOrdering ordering;
+  const Fence({required this.ordering});
+
+  @override
+  DCValue? get result => null;
 }
 
 /// Allocates a heap object (spec §3.1's `DCObject` header + payload) and

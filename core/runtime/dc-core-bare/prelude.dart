@@ -536,6 +536,166 @@ class Port {
   static u32 inl(u16 port) => throw UnimplementedError('dcc-lower substitutes real codegen for this');
 }
 
+/// Atomic read-modify-write on ordinary memory (DCDART_SPEC.md §6's
+/// required-primitives table, "Atomics: `Atomic<u32>`, CAS, fetch-add";
+/// docs/decisions/0055-atomics.md, known-gaps GAP-0039).
+///
+/// **ATOMICITY, NOT ORDERING.** These make a single access indivisible. They
+/// do not order OTHER accesses around themselves — that is [fence], a
+/// separate mechanism with its own ADR. A kernel needs both and they are not
+/// substitutes.
+///
+/// **Why this is not a `@bss`-only feature.** It takes a `Pointer<T>`, so it
+/// works on any address: a `@bss` counter, a slot in a heap object's payload,
+/// or a mailbox a device writes. `@bss` is only where the hazard was first
+/// noticed (ADR-0051 shipped mutable statics and the kernel immediately built
+/// a non-atomic tick counter on them).
+///
+/// **STATIC METHODS ON A NON-GENERIC CLASS, not spec §6's `Atomic<u32>`
+/// type.** A `Atomic<u32>` wrapper type would need generic CLASSES, which are
+/// not implemented (GAP-0040) — so the spec's literal spelling is not
+/// writable today. The methods themselves are generic FUNCTIONS, which are
+/// (ADR-0052), and the element width is read off the `Pointer<T>` argument.
+/// The wrapper type is a strictly additive change later; nothing here has to
+/// move to get it.
+///
+/// **Every operation is sequentially consistent.** There is no `Ordering`
+/// parameter, deliberately. On x86-64 a `lock`-prefixed RMW is already a full
+/// barrier, so seq_cst costs a fetch-and-op exactly nothing; only a seq_cst
+/// [store] is more expensive than a relaxed one (`xchg` rather than `mov`).
+/// Choosing the strong default can be relaxed later without invalidating any
+/// program; choosing the weak default could never be tightened. See the ADR.
+///
+/// Widths: `u8`, `u16`, `u32`, `u64`. Each lowers to a real instruction —
+/// never a `__atomic_*` libcall, which would be a `CLAUDE.md` rule 1
+/// violation, and which the conformance harness checks for by name.
+///
+/// ```dart
+/// final p = Pointer<u64>.fromAddress(Bss.addressOf(tickCounter));
+/// final previous = Atomic.fetchAdd(p, u64(1));
+/// ```
+class Atomic {
+  /// An indivisible read. Cannot tear, cannot be duplicated, cannot be
+  /// invented out of nothing by the optimizer.
+  static T load<T>(Pointer<T> address) =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
+
+  /// An indivisible write. On x86-64 this lowers to `xchg`, not `mov`,
+  /// because a sequentially consistent store is itself a barrier.
+  static void store<T>(Pointer<T> address, T value) =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
+
+  /// Swaps [value] in and returns what was there. This is what makes a
+  /// spinlock expressible without compare-exchange (GAP-0041): swap 1 in, and
+  /// you hold the lock iff 0 came out.
+  static T exchange<T>(Pointer<T> address, T value) =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
+
+  /// Adds [value], returning the contents as they were BEFORE the add —
+  /// matching C11, LLVM and x86 `xadd`. The counter's new value is
+  /// `fetchAdd(p, d) + d`, computed by the caller.
+  ///
+  /// **Wrapping, not trapping**, unlike DCDart's ordinary `+` (spec §4.1).
+  /// There is no way to trap: the overflow is detected after the write has
+  /// already happened, and there is nothing to roll back to. Saying so here
+  /// rather than leaving it as the one silent exception to the integer rule.
+  static T fetchAdd<T>(Pointer<T> address, T value) =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
+
+  /// Subtracts [value], returning the previous contents. Wrapping, for the
+  /// same reason as [fetchAdd].
+  static T fetchSub<T>(Pointer<T> address, T value) =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
+
+  /// Bitwise AND, returning the previous contents. Clearing a bit in a
+  /// free-frame bitmap.
+  static T fetchAnd<T>(Pointer<T> address, T value) =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
+
+  /// Bitwise OR, returning the previous contents. Setting a bit in a
+  /// free-frame bitmap — the second failure mode GAP-0039 names, and it is
+  /// this operation rather than [fetchAdd]: two cores claiming two different
+  /// frames in the same word lose one of the two updates under a plain
+  /// read-modify-write.
+  static T fetchOr<T>(Pointer<T> address, T value) =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
+
+  /// Bitwise XOR, returning the previous contents.
+  static T fetchXor<T>(Pointer<T> address, T value) =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
+}
+
+/// The ordering a [fence] establishes (DCDART_SPEC.md §6,
+/// docs/decisions/0056-memory-barriers.md).
+///
+/// A plain class with `const` instances rather than a Dart `enum`: `enum`
+/// implies `dart:core::Enum`, and `dcc-lower` compiles with
+/// `--no-link-platform`, under which an unbound platform supertype is a node
+/// this compiler cannot safely inspect (see [Pointer]'s note on the same
+/// hazard). The instance carries its own NAME as a const string, which is the
+/// same trick `Ref` uses and for the same reason: names survive constant
+/// evaluation.
+class Ordering {
+  final String name;
+  const Ordering._(this.name);
+
+  /// No load or store after this fence may be moved before it.
+  /// Pairs with [release]. Free on x86-64 in hardware; still constrains the
+  /// compiler, which is the half that is not free.
+  static const Ordering acquire = Ordering._('acquire');
+
+  /// No load or store before this fence may be moved after it.
+  /// Pairs with [acquire]. This is the producer side of publish/consume:
+  /// fill the buffer, fence, then set the ready flag.
+  static const Ordering release = Ordering._('release');
+
+  /// Both at once — one fence where a critical section ends and another
+  /// begins.
+  static const Ordering acqRel = Ordering._('acqRel');
+
+  /// A total order over all sequentially consistent operations. The only
+  /// ordering that costs a real instruction on x86-64 (`mfence`), because it
+  /// is the only one that forbids StoreLoad reordering — a store to one
+  /// location followed by a load of a DIFFERENT one, which TSO permits to be
+  /// reordered and which Dekker's algorithm and every seqlock reader depend
+  /// on not being.
+  static const Ordering seqCst = Ordering._('seqCst');
+
+  /// Forbids the COMPILER from moving accesses across this point, and emits
+  /// no instruction on any target.
+  ///
+  /// This is the correct and sufficient barrier for a single-core kernel
+  /// whose only concurrency is interrupts, because interrupt entry is itself
+  /// a serializing event — which is `oscortex_core` today. It is NOT
+  /// sufficient at the first second core, and code that relies on it must say
+  /// which of the two it is assuming.
+  static const Ordering compilerOnly = Ordering._('compilerOnly');
+}
+
+/// A memory barrier (DCDART_SPEC.md §6's required-primitives table,
+/// `fence(Ordering.acquire)`; docs/decisions/0056-memory-barriers.md,
+/// known-gaps GAP-0033).
+///
+/// **ORDERING, NOT ATOMICITY.** A fence constrains the order in which
+/// surrounding accesses become visible. It makes no access indivisible — that
+/// is [Atomic], a separate mechanism with its own ADR.
+///
+/// A top-level function rather than a static method, because that is spec
+/// §6's own spelling and it is writable as-is here, unlike `Atomic<u32>`.
+///
+/// ```dart
+/// data.value = payload;
+/// fence(Ordering.release);
+/// ready.value = u32(1);
+/// ```
+/// Deliberately NOT annotated `@bare`, despite being usable from `@bare`
+/// code: `@bare` marks a function dcc should COMPILE into the object, and a
+/// `@bare` function in an imported library is a hard error (GAP-0028). Like
+/// every other prelude primitive, this body never runs — `dcc-lower`
+/// substitutes codegen for the call.
+void fence(Ordering ordering) =>
+    throw UnimplementedError('dcc-lower substitutes real codegen for this');
+
 /// Pointer<T> (DCDART_SPEC.md §6). M1 minimal surface: `.fromAddress` and
 /// `.value` get/set, for `T = u32` only -- dcc-lower recognizes exactly that
 /// instantiation (a real generic monomorphizer is bigger M1+ work this one
@@ -629,6 +789,55 @@ class Result {
   /// continue evaluation with the extracted `payload` as this expression's
   /// value.
   u64 propagate() => throw UnimplementedError('dcc-lower substitutes real codegen for this');
+}
+
+/// A borrowed UTF-8 string slice — `{ ptr, len }` by value
+/// (DCDART_SPEC.md §7, docs/decisions/0053-string-slices.md).
+///
+/// NON-OWNING and immutable. A `Str` points at bytes it does not own, so it
+/// costs nothing to pass, needs no allocator, and involves no ARC — which is
+/// what makes string literals usable in `@bare` code before a heap exists.
+///
+/// ```dart
+/// @bare u64 greet() {
+///   final s = Str("hello");   // no allocation; points into .rodata
+///   return s.length;          // 5 -- BYTES, not UTF-16 code units
+/// }
+/// ```
+///
+/// An EXTENSION TYPE over `String`, not a class, and for the same reason
+/// `u64` is one: a bare `"hello"` has Dart static type `String`, so
+/// `"hello".length` resolves to `dart:core`'s getter and returns `int`, which
+/// does not type-check against `u64`. Wrapping it as `Str("hello")` gives the
+/// expression a DCDart type whose members are DCDart's, exactly as `u64(5)`
+/// does for integers. The wrap is erased entirely at compile time — the
+/// emitted code is an address into `.rodata` and a length, nothing more.
+///
+/// **`length` is BYTES.** Spec §7 names this the largest single source of
+/// semantic drift from upstream Dart: Dart's `String.length` counts UTF-16
+/// code units, this counts UTF-8 bytes. They agree for ASCII and diverge
+/// otherwise. `.chars` (runes) and `.utf16Length` are specified for porting
+/// and not built.
+///
+/// Spec §7's other two types are NOT implemented: `String` (owned, ARC'd) and
+/// `StrBuf` (growable) both need the allocator spec §12's open decision 2 has
+/// not settled. `Str` needs none of it.
+extension type const Str(String _value) {
+  /// Length in BYTES. See the type doc — this is not Dart's `.length`.
+  u64 get length => throw UnimplementedError('dcc-lower substitutes real codegen for this');
+
+  /// The ADDRESS of the first byte, as a `u64`.
+  ///
+  /// An address rather than a `Pointer<u8>` because DCDart's pointer idiom is
+  /// "an address in a u64, wrapped with `Pointer<T>.fromAddress`" — the same
+  /// shape `Rodata.addressOf` and `Bss.addressOf` use. Handing back a
+  /// `Pointer<u8>` would be a dead end: you could dereference it and not do
+  /// arithmetic on it, and walking a string is exactly arithmetic.
+  ///
+  /// ```dart
+  /// final p = Pointer<u8>.fromAddress(s.address + i);
+  /// ```
+  u64 get address => throw UnimplementedError('dcc-lower substitutes real codegen for this');
 }
 
 /// Marks a class as heap-allocated with ARC (DCDART_SPEC.md §3.1). M2's

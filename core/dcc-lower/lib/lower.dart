@@ -32,6 +32,8 @@
 // since their base is a DCHeapPointer, not a raw address.
 
 import 'package:dc_elide/elide.dart';
+import 'dart:convert';
+
 import 'package:dc_ir/dc_ir.dart';
 import 'package:kernel/kernel.dart';
 
@@ -43,6 +45,14 @@ import 'kernel_frontend.dart';
 const DCStruct resultStructType = DCStruct('Result', [
   DCStructField('tag', DCInt.u64),
   DCStructField('payload', DCInt.u64),
+]);
+
+/// The DC-IR type for `Str` (ADR-0055): a by-value `{bytes, length}` slice,
+/// UTF-8 and non-owning. Same by-value struct treatment as `resultStructType`
+/// — one concrete shape, so a fixed constant rather than a per-site layout.
+const DCStruct strStructType = DCStruct('Str', [
+  DCStructField('bytes', DCPointer(DCInt.u8)),
+  DCStructField('length', DCInt.u64),
 ]);
 
 /// Lowers the DCDart source at [dartSourcePath] to a [DCModule].
@@ -120,6 +130,13 @@ Future<DCModule> lowerToDCModule(
     final pendingSpecializations = <String, _Specialization>{};
     final emittedSpecializations = <String>{};
 
+    // (ADR-0055) String literals discovered while lowering. Interned by
+    // CONTENT, so two identical literals share one .rodata global -- they are
+    // immutable and non-owning, so nothing can tell them apart, and this is
+    // the one place merging identical constants is unambiguously right
+    // (contrast ADR-0040's descriptors, where identity matters).
+    final stringLiterals = <String, String>{};
+
     final functions = <DCFunction>[];
     for (final proc in targetLibrary.procedures) {
       if (!_hasMarkerAnnotation(proc.annotations, '_Bare', preludeUri)) continue;
@@ -140,7 +157,7 @@ Future<DCModule> lowerToDCModule(
       }
       functions.add(
         _BareFunctionLowerer(proc, preludeUri, structLayouts, heapLayouts, externNames,
-                globalNames, null, pendingSpecializations, const {})
+                globalNames, null, pendingSpecializations, const {}, stringLiterals)
             .lower(),
       );
     }
@@ -180,6 +197,7 @@ Future<DCModule> lowerToDCModule(
           entry.key.enclosingClass,
           pendingSpecializations,
           const {},
+          stringLiterals,
         ).lower(linkNameOverride: entry.value),
       );
     }
@@ -206,6 +224,7 @@ Future<DCModule> lowerToDCModule(
           null,
           pendingSpecializations,
           entry.value.substitution,
+          stringLiterals,
         ).lower(linkNameOverride: entry.key),
       );
     }
@@ -255,6 +274,21 @@ Future<DCModule> lowerToDCModule(
     // criterion scope (ROADMAP.md), not M3-only, per docs/known-gaps.md
     // GAP-0017 item 2's correction.
     final elidedFunctions = functions.map(elideRedundantRetainReleasePairs).toList();
+
+    // (ADR-0055) Emit one .rodata global per distinct string literal. Done
+    // after ALL lowering so every literal -- including those inside
+    // monomorphized specializations -- is present.
+    for (final entry in stringLiterals.entries) {
+      globals.add(
+        DCGlobal(
+          linkName: entry.value,
+          initializer: DCConstArray(DCInt.u8, [
+            for (final byte in utf8.encode(entry.key)) DCConstInt(DCInt.u8, byte),
+          ]),
+          alignBytes: 1,
+        ),
+      );
+    }
 
     return DCModule(
       name: dartSourcePath,
@@ -798,6 +832,10 @@ class _BareFunctionLowerer {
   /// Empty for an ordinary function.
   final Map<String, DartType> typeSubstitution;
 
+  /// (ADR-0055) String literal content -> its `.rodata` symbol name.
+  /// Interned by content across the whole module.
+  final Map<String, String> stringLiterals;
+
   _BareFunctionLowerer(
     this.proc,
     this.preludeUri,
@@ -808,6 +846,7 @@ class _BareFunctionLowerer {
     this.receiverClass,
     this.pendingSpecializations = const {},
     this.typeSubstitution = const {},
+    this.stringLiterals = const {},
   ]);
 
   ValueId _allocId() => ValueId(_nextValueIndex++);
@@ -1136,6 +1175,49 @@ class _BareFunctionLowerer {
             );
           }
           _addInstr(PortOut(port: port, value: value));
+          return;
+        }
+
+        // (ADR-0055) `Atomic.store(p, v);` — the one void-returning member of
+        // `Atomic`, so it lands here for the same reason `Port.outb` does.
+        if (target.isStatic &&
+            target.enclosingClass?.name == 'Atomic' &&
+            target.name.text == 'store' &&
+            target.enclosingLibrary.importUri == preludeUri) {
+          final (pointer, elementType) = _lowerAtomicPointerArg(expr, 'store');
+          final args = expr.arguments.positional;
+          if (args.length != 2) {
+            throw DccLowerError(
+              '"$context": Atomic.store takes a pointer and a value',
+            );
+          }
+          final value = _lowerExpression(args[1]);
+          if (value.type != elementType) {
+            throw DccLowerError(
+              '"$context": Atomic.store writes a ${value.type} through a '
+              'Pointer<$elementType>. The widths must match exactly — there is '
+              'no implicit widening (spec §4.1), and a narrowing atomic store '
+              'would silently change which bytes are updated indivisibly.',
+            );
+          }
+          _addInstr(AtomicStore(pointer: pointer, value: value));
+          return;
+        }
+
+        // (ADR-0056) `fence(Ordering.release);` — a top-level function, which
+        // is spec §6's own spelling. Void by nature: a barrier computes
+        // nothing, it constrains the movement of everything around it.
+        if (target.isStatic &&
+            target.enclosingClass == null &&
+            target.name.text == 'fence' &&
+            target.enclosingLibrary.importUri == preludeUri) {
+          final args = expr.arguments.positional;
+          if (args.length != 1) {
+            throw DccLowerError(
+              '"$context": fence takes exactly one Ordering argument',
+            );
+          }
+          _addInstr(Fence(ordering: _lowerOrdering(args.single)));
           return;
         }
 
@@ -1938,6 +2020,23 @@ class _BareFunctionLowerer {
         }
       }
 
+      // (ADR-0055) `Atomic.load(p)` / `Atomic.fetchAdd(p, v)` and friends --
+      // every value-producing member of `Atomic`. `Atomic.store` is
+      // void-returning and is recognized separately in `_lowerStatement`,
+      // exactly as `Port.outb` is against `Port.inb`.
+      //
+      // Recognized HERE, ahead of the generic-call path below, so a call to
+      // one of these never reaches the monomorphizer (ADR-0052). These are
+      // generic FUNCTIONS in the prelude only so that one declaration covers
+      // every width; there is no body to specialize, and queueing a
+      // specialization of one would emit a symbol for a function that has no
+      // machine representation.
+      if (target.isStatic &&
+          target.enclosingClass?.name == 'Atomic' &&
+          target.enclosingLibrary.importUri == preludeUri) {
+        return _lowerAtomic(expr, target.name.text);
+      }
+
       // `Rodata.addressOf(table)` (ADR-0040) -- a plain static method call,
       // recognized the same way `Port.inb` is: static + enclosing class name
       // + prelude URI. Its argument must be a StaticGet naming a @rodata
@@ -1993,6 +2092,47 @@ class _BareFunctionLowerer {
       // first needed u8/u16/u32 literals -- u64 was the only width with
       // this recognized until now, since nothing else had constructed a
       // narrower literal from source.)
+      // (ADR-0055) `Str("literal")`, `s.length`, `s.bytes`. Same
+      // extension-type call shapes the sized ints use -- `Str|constructor#`
+      // and `Str|get#length` -- so they are recognized the same way.
+      if (target.isExtensionTypeMember &&
+          target.enclosingLibrary.importUri == preludeUri) {
+        final name = target.name.text;
+        if (name == 'Str|constructor#') {
+          final arg = expr.arguments.positional.single;
+          if (arg is! StringLiteral) {
+            throw DccLowerError(
+              '"$context": Str(...) needs a string LITERAL. Its bytes are '
+              'emitted into .rodata at compile time, so a runtime string has '
+              'nothing to point at (ADR-0055).',
+            );
+          }
+          return _lowerStringLiteral(arg.value);
+        }
+        if (name == 'Str|get#length' || name == 'Str|get#address') {
+          final receiver = _lowerExpression(expr.arguments.positional.single);
+          if (receiver.type != strStructType) {
+            throw DccLowerError(
+              '"$context": ${name.split('#').last} read on ${receiver.type}, '
+              'expected a Str',
+            );
+          }
+          if (name == 'Str|get#length') {
+            final dest = DCValue(_allocId(), DCInt.u64);
+            _addInstr(ExtractField(dest: dest, struct: receiver, fieldIndex: 1));
+            return dest;
+          }
+          // `.address` -- the struct holds a real `ptr` so the C ABI sees
+          // `{char*, size_t}`, but the surface hands back a u64 so ordinary
+          // pointer arithmetic works (ADR-0055).
+          final ptr = DCValue(_allocId(), const DCPointer(DCInt.u8));
+          _addInstr(ExtractField(dest: ptr, struct: receiver, fieldIndex: 0));
+          final dest = DCValue(_allocId(), DCInt.u64);
+          _addInstr(PtrToInt(dest: dest, pointer: ptr));
+          return dest;
+        }
+      }
+
       if (target.isExtensionTypeMember && target.enclosingLibrary.importUri == preludeUri) {
         final sizedIntType = switch (target.name.text) {
           'u8|constructor#' => DCInt.u8,
@@ -2317,6 +2457,40 @@ class _BareFunctionLowerer {
     );
   }
 
+  /// A string literal -> a `Str` slice over bytes in `.rodata` (ADR-0055).
+  ///
+  /// Interned by CONTENT: two identical literals share one global. They are
+  /// immutable and non-owning, so nothing can distinguish them, and merging
+  /// is unambiguously right here -- unlike ADR-0040's descriptors, where two
+  /// byte-identical globals must stay distinct because their ADDRESS is their
+  /// identity.
+  ///
+  /// `length` is the UTF-8 BYTE count, not Dart's UTF-16 code-unit count.
+  /// Spec §7 names that as the largest single source of semantic drift from
+  /// upstream Dart.
+  DCValue _lowerStringLiteral(String content) {
+    final bytes = utf8.encode(content);
+    final symbol = stringLiterals.putIfAbsent(
+      content,
+      () => 'dc.str.${stringLiterals.length}',
+    );
+
+    final address = DCValue(_allocId(), DCInt.u64);
+    _addInstr(AddressOfGlobal(dest: address, globalName: symbol));
+    final pointer = DCValue(_allocId(), const DCPointer(DCInt.u8));
+    _addInstr(IntToPtr(dest: pointer, address: address));
+    final length = DCValue(_allocId(), DCInt.u64);
+    _addInstr(ConstInt(dest: length, bits: bytes.length));
+
+    final dest = DCValue(_allocId(), strStructType);
+    _addInstr(MakeStruct(
+      dest: dest,
+      structType: strStructType,
+      fields: [pointer, length],
+    ));
+    return dest;
+  }
+
   /// `x == null` / `x != null` on a heap reference (ADR-0049).
   ///
   /// Compared as pointers, which is the only comparison a heap reference
@@ -2339,6 +2513,143 @@ class _BareFunctionLowerer {
       rhs: nullValue,
     ));
     return dest;
+  }
+
+  /// Lowers the shared first argument of every `Atomic.*` call: the
+  /// `Pointer<T>` being operated on. Returns the lowered pointer and the
+  /// element type read off it.
+  ///
+  /// The ELEMENT TYPE IS THE WIDTH, and it comes from the pointer rather than
+  /// from the method name (`fetchAdd32`, `fetchAdd64`, …) on purpose. It is
+  /// the same information `Pointer<T>.value` already uses to pick a load
+  /// width, so there is one place that decides it and no way for a call site
+  /// to restate it wrongly — the failure mode GAP-0051 describes for the
+  /// hand-written `u64(8)` strides.
+  (DCValue, DCType) _lowerAtomicPointerArg(StaticInvocation expr, String name) {
+    final args = expr.arguments.positional;
+    if (args.isEmpty) {
+      throw DccLowerError(
+        '"$context": Atomic.$name needs a Pointer<T> as its first argument',
+      );
+    }
+    final pointer = _lowerExpression(args.first);
+    final pointerType = pointer.type;
+    if (pointerType is! DCPointer) {
+      throw DccLowerError(
+        '"$context": Atomic.$name\'s first argument has type $pointerType, '
+        'expected a Pointer<T>. Compose one with '
+        '`Pointer<uN>.fromAddress(Bss.addressOf(x))`.',
+      );
+    }
+    final element = pointerType.pointee;
+    if (element is! DCInt) {
+      throw DccLowerError(
+        '"$context": Atomic.$name on a Pointer<$element>. An atomic operand '
+        'must be a sized integer (u8/u16/u32/u64) — anything else lowers to a '
+        '`__atomic_*` libcall, which is an undefined runtime symbol in a '
+        '`@bare` object and a CLAUDE.md rule 1 violation.',
+      );
+    }
+    return (pointer, element);
+  }
+
+  /// (ADR-0055) Every value-producing `Atomic.*` member. `Atomic.store` is
+  /// void and handled in `_lowerStatement`.
+  DCValue _lowerAtomic(StaticInvocation expr, String name) {
+    final (pointer, elementType) = _lowerAtomicPointerArg(expr, name);
+    final args = expr.arguments.positional;
+
+    if (name == 'load') {
+      if (args.length != 1) {
+        throw DccLowerError(
+          '"$context": Atomic.load takes exactly one argument, the pointer',
+        );
+      }
+      final dest = DCValue(_allocId(), elementType);
+      _addInstr(AtomicLoad(dest: dest, pointer: pointer));
+      return dest;
+    }
+
+    // Names map to DC-IR's AtomicOp, which in turn carries LLVM's own opcode
+    // names, so there is exactly one translation in the whole pipeline and it
+    // is this table.
+    final op = switch (name) {
+      'exchange' => AtomicOp.xchg,
+      'fetchAdd' => AtomicOp.add,
+      'fetchSub' => AtomicOp.sub,
+      'fetchAnd' => AtomicOp.and,
+      'fetchOr' => AtomicOp.or,
+      'fetchXor' => AtomicOp.xor,
+      _ => null,
+    };
+    if (op == null) {
+      throw DccLowerError(
+        '"$context": Atomic.$name is not implemented. Available: load, store, '
+        'exchange, fetchAdd, fetchSub, fetchAnd, fetchOr, fetchXor. '
+        'Compare-exchange is deliberately absent — see docs/known-gaps.md '
+        'GAP-0041.',
+      );
+    }
+    if (args.length != 2) {
+      throw DccLowerError(
+        '"$context": Atomic.$name takes a pointer and a value',
+      );
+    }
+    final value = _lowerExpression(args[1]);
+    if (value.type != elementType) {
+      throw DccLowerError(
+        '"$context": Atomic.$name applies a ${value.type} to a '
+        'Pointer<$elementType>. The widths must match exactly — there is no '
+        'implicit widening (spec §4.1).',
+      );
+    }
+    final dest = DCValue(_allocId(), elementType);
+    _addInstr(AtomicRmw(dest: dest, pointer: pointer, op: op, value: value));
+    return dest;
+  }
+
+  /// (ADR-0056) Reads the `Ordering` argument of a `fence(...)` call.
+  ///
+  /// `Ordering.release` does NOT arrive as a `StaticGet` naming a field: a
+  /// `const` field's references are inlined by the CFE at every use site
+  /// (ADR-0040's central finding), so what arrives is a `ConstantExpression`
+  /// wrapping an `InstanceConstant` of class `Ordering`. Its one field holds
+  /// the ordering's own NAME as a `StringConstant` — carrying a name rather
+  /// than an index, again ADR-0040's lesson, and it means a malformed call
+  /// produces an error naming the ordering rather than an integer.
+  DCOrdering _lowerOrdering(Expression argument) {
+    Constant? constant;
+    if (argument is ConstantExpression) {
+      constant = argument.constant;
+    }
+    if (constant is! InstanceConstant ||
+        constant.classNode.name != 'Ordering') {
+      throw DccLowerError(
+        '"$context": fence\'s argument must be one of the `Ordering` '
+        'constants — `Ordering.acquire`, `.release`, `.acqRel`, `.seqCst` or '
+        '`.compilerOnly`. Got ${argument.runtimeType}. It cannot be a '
+        'variable: the ordering decides which instruction is emitted, so it '
+        'has to be known at compile time.',
+      );
+    }
+    final values = constant.fieldValues.values.toList();
+    final nameConstant = values.length == 1 ? values.single : null;
+    if (nameConstant is! StringConstant) {
+      throw DccLowerError(
+        '"$context": an `Ordering` constant must hold exactly one constant '
+        'string naming itself (prelude `Ordering._(...)`)',
+      );
+    }
+    return switch (nameConstant.value) {
+      'acquire' => DCOrdering.acquire,
+      'release' => DCOrdering.release,
+      'acqRel' => DCOrdering.acqRel,
+      'seqCst' => DCOrdering.seqCst,
+      'compilerOnly' => DCOrdering.compilerOnly,
+      _ => throw DccLowerError(
+          '"$context": unknown Ordering "${nameConstant.value}"',
+        ),
+    };
   }
 
   /// `a == b` / `a != b` where both sides are the same sized-int type.
