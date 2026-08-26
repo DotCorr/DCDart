@@ -2257,6 +2257,38 @@ dart dc-objdump/bin/dc_objdump.dart --arc --no-elide <src>.dart   # what lowerin
 dart dc-objdump/bin/dc_objdump.dart --arc            <src>.dart   # what survived
 ```
 
+### Why nobody noticed: the pass scores 100% on exactly the programs written to validate it
+
+Swept across every example and benchmark in the tree (`bash bench/elision-delta.sh`):
+
+| program | retains lowered | survive | removed |
+|---|---|---|---|
+| `m2-closure` | 4 | 0 | **100%** |
+| `m2-heap-field` | 1 | 0 | **100%** |
+| `m2-owned` | 1 | 0 | **100%** |
+| `m3-funcptr` | 6 | 1 | 83% |
+| `m2-loopheap`, `m3-generic-class` | 2 | 1 | 50% |
+| `tree-traversal` | 6 | 4 | 33% |
+| `m2-list` | 12 | 9 | 25% |
+| **`json`** | **19** | **18** | **5%** |
+| | **55** | **34** | **38.2% overall** |
+
+**Read the 38.2% with care — it is an average dominated by tiny programs.** The pass removes
+everything on a four-retain conformance example and one pair in nineteen on a JSON parser, and the
+mean of those is not a fact about anything.
+
+The pattern is the point. `m2-closure`, `m2-heap-field` and `m2-owned` are the targets written to
+demonstrate that elision works, and every one of them is straight-line, single-block, and contains
+**no null test** — so every pair sits inside one block where an intra-block pass can see it. The
+programs where it fails are the ones with the shape real code has: `m2-list` is a linked list,
+`json` is a node graph, and both are nothing but `if (x != null)`.
+
+So the pass has six passing unit tests and three conformance targets at 100%, and removes 5% on a
+parser. **Nothing was wrong with those tests; they simply share a shape with each other and not with
+real programs.** That is the same defect family as this project's other findings today — a
+mechanism validated against exactly the conditions under which it succeeds — and it is why a
+correctness suite could be green for months while the optimiser did almost nothing.
+
 **Cost of the workaround:** none available. This is the M3 gate's dominant term on any benchmark
 that chases pointers, and it is a fixable optimiser limitation rather than a language verdict —
 which is the good news, and also why publishing a gate number before fixing it would be publishing
