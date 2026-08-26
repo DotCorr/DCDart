@@ -465,7 +465,7 @@ inferring from the gaps file:
 | prerequisite | status | blocks |
 |---|---|---|
 | generics / monomorphization | **RESOLVED** — functions 2026-08-22 (ADR-0052), generic CLASSES 2026-08-26 (ADR-0054, GAP-0040 closed) | — (but see GAP-0054: a generic container is what makes the pass-3 aliasing hazard easy to reach) |
-| closures | **PARTIALLY RESOLVED 2026-08-26 (ADR-0057)** — non-capturing local functions hoist to static symbols and call directly; CAPTURING closures and closures-as-VALUES are not implemented and are not one lowering each (GAP-0052, escalation 0008) | the functional workload, still |
+| closures | **RESOLVED for the BENCHMARK 2026-08-26 (ADR-0057 + ADR-0060)** — non-capturing local functions hoist to static symbols (ADR-0057), and a function can now be torn off, passed, returned and called through the value (ADR-0060, GAP-0052 closed). CAPTURING closures are still rejected: escalation 0008 **§2**, open | — for the functional workload, which needs functions-as-values, not capture. Still blocks anything that needs a captured environment |
 | `String` | **PARTIALLY RESOLVED 2026-08-26 (ADR-0053)** — borrowed `Str` slices work; owning `String`/`StrBuf` still blocked on the allocator, GAP-0045 | JSON parser and the string pass still blocked (both need to *build* text, not only read it) |
 | instance methods | **RESOLVED 2026-08-21 (ADR-0043)** | — |
 | `null` / nullable heap refs | **RESOLVED 2026-08-22 (ADR-0049)** | — |
@@ -491,6 +491,17 @@ Revised again when ADR-0057 and ADR-0054 were integrated together: the third row
 CLASSES, closed in the same integration (GAP-0040), which is why this now reads *two* and not
 *three*. Generic METHODS on a class are still not implemented (GAP-0055).
 
+**Revised a third time by ADR-0060 (2026-08-26), and the half that closed is not the half the
+sentence above emphasised.** Closures-as-VALUES are done — GAP-0052 is closed, an indirect call
+exists, and it preserves elision. CAPTURING closures are not, and are still escalation 0008 §2. The
+distinction matters because the two were written as one item here and they are not one item: the
+functional benchmark needs functions passed to functions, which is now available; a captured
+environment needs an allocator (escalation 0002) and a capture convention (0008 §2), neither of which
+moved. So:
+
+> **One prerequisite remains for the benchmark suite:** owning `String`/`StrBuf` (GAP-0045). Capture
+> remains open as a LANGUAGE gap, not a benchmark blocker.
+
 A tree/graph traversal benchmark is now writable, and so — as of ADR-0054 — is a hashmap workload.
 **Do not write the hashmap one without reading GAP-0054 first.** Its canonical shape, `map.get(k)`
 followed by a mutation of the map, is precisely the get-then-mutate pattern that can put a `Release`
@@ -498,15 +509,27 @@ of an *aliasing* value between an elided retain and its use. That pass-3 elision
 because `_releaseHeapLocals` runs after the return expression — a property of how `dcc-lower` orders
 a return, not a property of the pass — so the benchmark that most wants a hashmap is the one standing
 closest to the hazard. A JSON parser and a string-processing pass still need text that can be
-*built*, not only read. **The
-closure-heavy functional workload is the one that got no closer**, because passing a function to a
-function is precisely the part ADR-0057 does not do — and per escalation 0008 §3, it is also the
-benchmark where the elision model is structurally weakest, so it should be scoped with that document
-open.
+*built*, not only read.
+
+**The closure-heavy functional workload — the one that "got no closer" under ADR-0057 — is now
+writable (ADR-0060).** Passing a function to a function was precisely the missing part, and it is
+what GAP-0052's closure landed. Escalation 0008 §3's separate worry, that such a benchmark would
+measure unelided ARC because the elision model is structurally weakest there, **did not
+materialise**: an indirect call through a `DCFuncPtr` carries its arguments' ownership in the type,
+and `viaFuncPtr` emits `alloc=1 retain=0 release=0` — byte-identical to the direct spelling. Write it
+against `examples/m3-funcptr/` and note that its callbacks must take heap arguments BORROWED
+(GAP-0057).
 
 **So M3 is not one unit away. It is most of the remaining language.** That is worth stating plainly
 because "the gate is unblocked" reads as "the gate is next", and it is not — the benchmarks are
 downstream of features nobody has built.
+
+**Update 2026-08-26 (ADR-0060):** that paragraph is now nearly spent, and the honest replacement is
+narrower rather than more optimistic. Every language prerequisite in the table above is resolved for
+benchmark purposes except owning `String`/`StrBuf` (GAP-0045), for which `tests/conformance/rawheap/`
+shows a program can build its own. What remains is **authoring work** — see GAP-0051b, where zero of
+five are written. "Most of the remaining language" was true when it was written; what replaces it is
+not "the gate is next" but "the gate is now blocked on five benchmarks nobody has typed".
 
 **The ordering point that matters most.** `CLAUDE.md` rule 4 freezes the memory model *after* M3. The
 heap-typed-field-store ownership policy (GAP-0020: does a store release the old value? retain the new
@@ -1864,8 +1887,40 @@ consumer lives inside the repo where the relative path happens to work.
 ## GAP-0052 — DC-IR cannot call through a value: no indirect call, no function-pointer type
 
 **Domain:** dc-ir, backend (M3 prerequisite)
-**Status:** OPEN — and until 2026-08-26 it was **unrecorded**, which is why closures kept being
-estimated as one lowering
+**Status:** **CLOSED 2026-08-26 — ADR-0060**, `tests/conformance/funcptr/`. `DCFuncPtr`, `FuncRef`
+and `IndirectCall` exist; a function can be torn off, passed, returned and called through the value.
+
+**The prediction below did not come true, and that is the whole result of the unit.** The last
+paragraph of this entry says every indirect call site becomes an elision barrier because
+`argOwnership` is not derivable through a value. ADR-0060's answer is to put ownership **in the
+pointer's type**: a `DCFuncPtr` is only ever created by `FuncRef` from a NAMED function, where the
+`@owned` annotations are in plain sight, so the convention is derived rather than assumed and travels
+with the value through ordinary DCType equality. `IndirectCall` has no `argOwnership` field at all —
+it reads the callee's type — so `dc-elide` consumes the same fact for both call forms. Measured on
+`examples/m3-funcptr`, the same program written four ways:
+
+```
+viaTopLevel:      alloc=1 retain=0 release=0     <- direct
+viaClosure:       alloc=1 retain=0 release=0     <- direct, hoisted local
+viaFuncPtr:       alloc=1 retain=0 release=0     <- INDIRECT
+viaTopFuncPtr:    alloc=1 retain=0 release=0     <- INDIRECT
+borrowViaFuncPtr: alloc=1 retain=1 release=2     <- INDIRECT, borrowed: pair correctly SURVIVES
+```
+
+Escalation 0008 §6's own four lines on `examples/m2-closure` are unmoved.
+
+**What is still open, and is NOT this gap:** the capture convention and its `[weak self]`-shaped
+language surface — escalation 0008 **§2**, untouched. A capturing closure is still rejected. And
+`DCFuncPtr`'s ownership cannot be spelled in a Dart function type, which is GAP-0057.
+
+The original entry follows, unedited, because it is the record of what was believed before the unit
+ran.
+
+---
+
+**Domain:** dc-ir, backend (M3 prerequisite)
+**Status (original, 2026-08-26):** OPEN — and until 2026-08-26 it was **unrecorded**, which is why
+closures kept being estimated as one lowering
 
 `dc-ir/lib/instructions.dart`'s `Call` carries `final String targetName` — a symbol name, not an
 operand. There is no `IndirectCall` instruction, no function-pointer `DCType`, no `FuncPtr`: grepped
@@ -1905,6 +1960,107 @@ with diagnostics naming this gap rather than a generic "unsupported type". `test
 records the elision baseline (`viaTopLevel`/`viaClosure`, identical ARC counts, pair elided) so that
 whoever builds the indirect call can diff against a program that already exists and see the barrier
 arrive, instead of discovering it in a benchmark.
+
+---
+
+## GAP-0057 — a Dart function TYPE cannot carry `@owned`, so a consuming callback cannot be passed to a higher-order function
+
+**Domain:** dcc-lower, spec §3.2 / §4 (language surface)
+**Status:** OPEN — introduced by ADR-0060, which is also what makes it visible
+
+ADR-0060 makes per-parameter ownership part of a function pointer's TYPE, because that is the only
+carrier that reaches an indirect call site. The convention is read at the tear-off, from the target's
+declaration. But a *Dart function type* has nowhere to write it: Kernel's
+`FunctionType.positionalParameters` is a `List<DartType>`, and `@owned` is an annotation on a
+`VariableDeclaration`, which a function type has none of.
+
+So `_lowerType`'s `FunctionType` case can only produce the **all-borrowed** `DCFuncPtr`, and this is
+a compile error:
+
+```dart
+u64 apply(u64 Function(Box) f, @owned Box b) => f(b);
+apply(dropTop, Box(v));   // dropTop takes @owned Box  -> type mismatch
+```
+
+**Cost of the workaround:** a higher-order function's callback parameter must BORROW its heap
+arguments. That is the shape `map`/`filter`/`fold` already have, so M3's functional workload is
+unaffected; what is unreachable is a generic "consume this and hand it to my callback" combinator.
+The error is hard and its diagnostic explains the reason and the two ways out (borrow, or call the
+consuming function directly) — deliberately not a silent coercion, because coercing either direction
+is a double release or a leak (ADR-0060's "no variance" section).
+
+**The honest fix is a language change, not a lowering:** syntax for `@owned` inside a function type.
+That is a spec §4 surface addition AND a §3 ARC-convention decision, which `CLAUDE.md` rule 4 puts
+outside an implementation unit — the same reasoning ADR-0057 used to refuse the capture convention.
+It should be decided alongside escalation 0008 §2, not separately: both are "how does an ARC
+convention get written down at a place Dart's own syntax has no room for one".
+
+---
+
+## GAP-0058 — the generated C header spells a function pointer but cannot spell its ownership
+
+**Domain:** backend (`--emit-header`), FFI
+**Status:** OPEN — introduced by ADR-0060
+
+`cDeclaratorOf` emits a real C function-pointer declarator (`uint64_t (*a0)(uint64_t)`), so a C
+caller handed one by DCDart can actually call it, and a C function pointer can be passed in — the
+`funcptr` conformance target does exactly that. What it cannot emit is the `@owned` half of the
+`DCFuncPtr`: C has no way to say it and no compiler that would enforce it.
+
+**Cost of the workaround:** a C function passed where DCDart expects an owned-consuming callback must
+release its argument, and nothing checks that it does. This is the same class of unchecked contract
+`DCHeapRef` already carries across this boundary ("pass it back, never dereference it, never
+free() it"), now with one more clause. Today the exposure is small because GAP-0057 makes a consuming
+callback hard to declare in the first place; closing GAP-0057 without closing this one would widen it.
+
+---
+
+## GAP-0059 — an `@extern` C function cannot be torn off as a function pointer
+
+**Domain:** dcc-lower
+**Status:** OPEN — deliberate refusal in ADR-0060, not an oversight
+
+`_lowerStaticTearOff` accepts a `@bare` top-level procedure only. An `@extern` C symbol is rejected
+by name.
+
+The reason is the one ADR-0060 is built on: a `DCFuncPtr`'s ownership must be **derived** from a
+declaration this compiler checked, and an external C function's ARC convention is whatever its author
+decided. Emitting a pointer type for it would be an assertion dressed as a derivation, and the whole
+elision result rests on that distinction holding.
+
+**Cost of the workaround:** the canonical C-interop shape — handing a DCDart comparator to `qsort`,
+or storing a C callback in a DCDart table — is unreachable in that direction. The reverse direction
+(C passing a function pointer INTO a DCDart higher-order function) works today and is tested. A
+closing fix probably looks like an explicit ownership declaration on the `@extern` side, which is
+GAP-0057's question again from the other end.
+
+---
+
+## GAP-0060 — a `void` `@bare` function whose body falls off the end never releases its `@owned` heap parameters
+
+**Domain:** dcc-lower (ARC insertion, ADR-0021). **Pre-existing — found while writing ADR-0060's
+example, not caused by it.**
+**Status:** OPEN — reproduces on `main` with an ordinary direct call
+
+```
+consumeEmpty(@owned Box b) {}            -> alloc=0 retain=0 release=0    LEAK
+consumeReturn(@owned Box b) { return; }  -> alloc=0 retain=0 release=1    correct
+consumeValue(@owned Box b) => b.value;   -> alloc=0 retain=0 release=1    correct
+```
+
+The `@owned` parameter's release is emitted where a `return` is lowered. A `void` body that simply
+runs off the end has no `Return` statement in Kernel to hang it on, so nothing releases and the
+caller's transferred reference leaks — one object per call, silently.
+
+Nothing to do with function pointers: the direct call `consume(b);` leaks identically. It was found
+because `examples/m3-funcptr`'s void-callback shape is the first place in the repo that wanted a void
+`@owned` consumer at all.
+
+**Cost of the workaround:** write `return;` explicitly. `examples/m3-funcptr/funcptr.dart` does, with
+a comment saying why, so that target measures indirect calls rather than this bug. The real fix is to
+emit the release at every function EXIT rather than at every `Return` statement — which is the same
+shape as the fall-off-the-end problem for heap LOCALS, so it should be looked at with GAP-0050's
+per-iteration release policy rather than patched in isolation.
 
 ---
 
@@ -2018,7 +2174,7 @@ lowering job (per-iteration release policy) and is **done** — see the third ro
 
 ---
 
-## GAP-0051b — M3's benchmark suite: 4 of 5 now writable, 0 of 5 written
+## GAP-0051b — M3's benchmark suite: 5 of 5 now writable, 0 of 5 written
 
 **Domain:** bench, dcc-lower (M3)
 **Status:** OPEN — this is now the M3 critical path, and it is authoring work rather than compiler work
@@ -2033,7 +2189,7 @@ the language cannot express the benchmarks. It is that **nobody has written them
 | hashmap-heavy | **yes** | ADR-0054 generic classes, plus the heap |
 | JSON parser | **yes** | ADR-0058's `Heap.allocate` — a program writes its own `StrBuf`, as `tests/conformance/rawheap/` does (GAP-0045) |
 | string-processing pass | **yes** | same |
-| closure-heavy functional | **NO** | **GAP-0052** — DC-IR has no indirect call and no function-pointer type, so a closure passed, returned or stored is inexpressible. ADR-0057's non-capturing closures hoist to symbols, which is not what a functional workload is made of |
+| closure-heavy functional | **yes** (2026-08-26) | **ADR-0060** closed GAP-0052 — `DCFuncPtr`, `FuncRef`, `IndirectCall`. A function can be passed, returned and called through the value, and the indirect call is NOT an elision barrier (`viaFuncPtr: alloc=1 retain=0 release=0`, identical to the direct spelling), so the benchmark will measure ARC rather than a missing analysis. Callbacks must BORROW their heap arguments — GAP-0057 |
 
 **A claim made and withdrawn, recorded because the reasoning was the error, not the fact.** A status
 report on 2026-08-26 said all five were writable, on the grounds that the last *heap* blocker had
@@ -2048,5 +2204,9 @@ harness enforces this — it prints `*** NO GATE NUMBER IS PRODUCED BY THIS RUN 
 all five ids are present, specifically so a partial suite cannot be quoted as a gate result.
 
 **Next step:** write `tree-traversal` first — it is the shortest path to the first real M3 data point
-and, with `hashmap`, carries most of the ARC the gate is measuring. `closure-heavy` needs GAP-0052
-closed first, which is an `IndirectCall` instruction and a function-pointer `DCType`, not a lowering.
+and, with `hashmap`, carries most of the ARC the gate is measuring. `closure-heavy` is now writable
+too (ADR-0060); write it against `examples/m3-funcptr/` for the shapes, and note that its callbacks
+must take heap arguments BORROWED (GAP-0057) — which is what `map`/`filter`/`fold` want anyway.
+
+**Still zero of five written.** The row above changing from NO to yes is not progress toward the
+gate; it removes the last reason the gate cannot be attempted.

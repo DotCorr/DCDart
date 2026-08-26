@@ -612,6 +612,10 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
       }
     case Call():
       _emitCall(instruction, e, context);
+    case FuncRef():
+      _emitFuncRef(instruction, e);
+    case IndirectCall():
+      _emitIndirectCall(instruction, e, context);
     case Alloc():
       declareTrapIntrinsic(e.declaredIntrinsics);
       _emitAlloc(instruction, e, context, e.heapRegionBytes);
@@ -896,16 +900,85 @@ void _emitMakeStruct(MakeStruct instruction, _FunctionEmitter e, String context)
 /// one pass, this works regardless of whether the callee appears earlier
 /// or later in the emitted text.
 void _emitCall(Call instruction, _FunctionEmitter e, String context) {
-  final argsText = instruction.args
-      .map((a) => '${_llvmType(a.type, context: context)} %v${a.id.index}')
-      .join(', ');
-  final dest = instruction.dest;
+  _emitCallText(
+    e,
+    callee: '@${instruction.targetName}',
+    retTypeText: instruction.dest == null
+        ? 'void'
+        : _llvmType(instruction.dest!.type, context: context),
+    argsText: _argListText(instruction.args, context),
+    dest: instruction.dest,
+  );
+}
+
+/// `FuncRef` (ADR-0060): the address of a named function, as an SSA value.
+///
+/// LLVM has no "take the address of a function" instruction — a function
+/// symbol IS a `ptr` constant. But DC-IR's `FuncRef` defines a `DCValue`, and
+/// every other value in this emitter is spelled `%vN`, so the constant is
+/// bound to one with an identity `bitcast`. That keeps the emitter's single
+/// invariant intact (a `ValueId` is always `%vN`, never sometimes a symbol
+/// name) at the cost of one instruction that `instcombine` folds away before
+/// any code is generated — verified: at `-O2` the indirect call through a
+/// `FuncRef` in the same function is devirtualized back to a direct `call`.
+///
+/// `getelementptr i8, ptr @f, i64 0` would do the same job; `bitcast` is used
+/// because it says "reinterpret this symbol as a pointer value" rather than
+/// implying pointer arithmetic on code.
+void _emitFuncRef(FuncRef instruction, _FunctionEmitter e) {
+  e.line('%v${instruction.dest.id.index} = bitcast ptr @${instruction.targetName} to ptr');
+}
+
+/// `IndirectCall` (ADR-0060): the same LLVM `call` as `_emitCall`, with a
+/// `%vN` callee in place of an `@symbol` one.
+///
+/// That really is the whole difference at this level. LLVM's opaque-pointer
+/// call syntax carries the callee's signature in the call itself — the return
+/// type and the argument types written at the call site ARE the function
+/// type — so nothing has to be reconstructed from `DCFuncPtr`; the operand
+/// types already agree with it by construction (dcc-lower checks them against
+/// the pointer's type before building this instruction).
+///
+/// The return type comes from the callee's `DCFuncPtr`, not from `dest`, so a
+/// void indirect call is emitted correctly even though it has no `dest` to
+/// read a type from.
+void _emitIndirectCall(IndirectCall instruction, _FunctionEmitter e, String context) {
+  final returnType = instruction.signature.returnType;
+  _emitCallText(
+    e,
+    callee: '%v${instruction.callee.id.index}',
+    retTypeText: returnType is DCVoid ? 'void' : _llvmType(returnType, context: context),
+    argsText: _argListText(instruction.args, context),
+    dest: instruction.dest,
+  );
+}
+
+String _argListText(List<DCValue> args, String context) => args
+    .map((a) => '${_llvmType(a.type, context: context)} %v${a.id.index}')
+    .join(', ');
+
+/// The ONE place this backend writes an LLVM `call`.
+///
+/// Direct (`@name`), indirect through a DC-IR `DCFuncPtr` value (`%vN`), and
+/// ADR-0022's destructor dispatch through the object header's `cls` field all
+/// route through here. The third of those predates DC-IR's function-pointer
+/// type: it was an indirect call hand-written inside `_emitRelease` for one
+/// fixed signature, `void (ptr)`. It is now expressed through this helper
+/// rather than left beside it — a second, parallel way to emit an indirect
+/// call is exactly the thing that later diverges from the first (attributes,
+/// calling conventions, tail-call markers) without anyone noticing.
+void _emitCallText(
+  _FunctionEmitter e, {
+  required String callee,
+  required String retTypeText,
+  required String argsText,
+  required DCValue? dest,
+}) {
   if (dest == null) {
-    e.line('call void @${instruction.targetName}($argsText)');
+    e.line('call $retTypeText $callee($argsText)');
     return;
   }
-  final retType = _llvmType(dest.type, context: context);
-  e.line('%v${dest.id.index} = call $retType @${instruction.targetName}($argsText)');
+  e.line('%v${dest.id.index} = call $retTypeText $callee($argsText)');
 }
 
 void declareOverflowIntrinsic(Set<String> declared, String name, String type) {
@@ -1553,7 +1626,22 @@ void _emitRelease(Release instruction, _FunctionEmitter e, String context) {
   // every destructor this project generates has the identical signature
   // `void (ptr)` (docs/decisions/0022), so no per-class type variance to
   // handle here.
-  e.line('call void %$clsVal(ptr %v${instruction.object.id.index})');
+  //
+  // (ADR-0060) This was the project's FIRST indirect call, written here by
+  // hand before DC-IR could express one. It now goes through the same
+  // `_emitCallText` as `Call` and `IndirectCall` instead of standing beside
+  // them: the general mechanism arrived, so the special case became an
+  // instance of it rather than a second implementation of it. What stays
+  // special is only that no DC-IR instruction drives it -- the callee is
+  // loaded from the object header inside `Release`'s own expansion, not
+  // named by dcc-lower.
+  _emitCallText(
+    e,
+    callee: '%$clsVal',
+    retTypeText: 'void',
+    argsText: 'ptr %v${instruction.object.id.index}',
+    dest: null,
+  );
   e.terminate('br label %$afterDtorLabel');
 
   e.startBlock(afterDtorLabel);
@@ -1705,6 +1793,15 @@ String _llvmType(DCType type, {required String context}) {
   // above), the type distinction exists only to keep MakeWeak/WeakLoad/
   // DropWeak from ever being handed a raw or strong pointer by mistake.
   if (type is DCWeakPointer) return 'ptr';
+  // DCFuncPtr (ADR-0060): opaque `ptr` again, for a reason specific to this
+  // one -- since LLVM 15 there is no function-pointer type distinct from
+  // `ptr` at all, and a call's signature is written at the CALL SITE
+  // (`call i64 %fp(i64 %x)`), not carried by the pointer. DC-IR's `DCFuncPtr`
+  // therefore carries strictly MORE than LLVM's type system can express: the
+  // per-parameter `@owned` ownership that makes `IndirectCall` elidable
+  // (docs/escalations/0008 §3). That information is consumed by dc-elide,
+  // upstream of here, and has no LLVM representation to lose it in.
+  if (type is DCFuncPtr) return 'ptr';
   // Anonymous/literal LLVM struct type -- fine for a by-value aggregate
   // (spec §5 Result<T,E>, docs/decisions/0014) constructed fresh via
   // MakeStruct; there is no name to preserve since DCStruct equality is

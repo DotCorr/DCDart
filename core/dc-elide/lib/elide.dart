@@ -142,17 +142,43 @@ DCBasicBlock _elideBlock(DCBasicBlock block) {
           kept.add(instruction);
         }
       case Call():
-        final ownedIds = <int>{
-          for (var i = 0; i < instruction.args.length; i++)
-            if (instruction.argOwnership[i]) instruction.args[i].id.index,
-        };
-        pendingRetain.removeWhere((id, _) {
-          if (ownedIds.contains(id)) {
-            callConsumed.add(id); // survives THIS call, now under the strict rule above
-            return false;
-          }
-          return true; // ordinary conservative invalidation, unchanged from before
-        });
+        _invalidateAcrossCall(
+          args: instruction.args,
+          argOwnership: instruction.argOwnership,
+          pendingRetain: pendingRetain,
+          callConsumed: callConsumed,
+        );
+        kept.add(instruction);
+      case IndirectCall():
+        // (ADR-0060) IDENTICAL treatment to a direct `Call` -- and that
+        // identity is the entire claim of the indirect-call unit, not an
+        // implementation shortcut.
+        //
+        // An indirect call is exactly as opaque as a direct one; neither is
+        // analysed interprocedurally here, so the conservative invalidation
+        // is unchanged. What could have differed is the EXCEPTION: `Call`
+        // keeps a pending retain alive across a call that CONSUMES its
+        // argument, and an indirect call would lose that -- making every
+        // closure call site an elision barrier, docs/escalations/0008 §3 --
+        // if ownership were unknowable through a value.
+        //
+        // It is knowable, because `DCFuncPtr` carries it. `argOwnership` here
+        // is read off the callee's own TYPE, which `dcc-lower` built from the
+        // target function's declaration at the `FuncRef` that produced the
+        // pointer. So this is not the same code by coincidence: it is the
+        // same fact, arriving by a different route.
+        //
+        // The CALLEE operand is deliberately not fed into the invalidation
+        // below -- it is a `DCFuncPtr`, never a `DCHeapPointer`, so it can
+        // never be the object of a pending retain. `referencedValueIds`
+        // still reports it, which is where it matters (the `callConsumed`
+        // sweep at the top of this loop).
+        _invalidateAcrossCall(
+          args: instruction.args,
+          argOwnership: instruction.argOwnership,
+          pendingRetain: pendingRetain,
+          callConsumed: callConsumed,
+        );
         kept.add(instruction);
       case MakeWeak():
       case WeakLoad():
@@ -174,6 +200,39 @@ DCBasicBlock _elideBlock(DCBasicBlock block) {
     params: block.params,
     body: kept.whereType<DCInstruction>().toList(),
   );
+}
+
+/// Rule 2 of this file's header, applied to one call -- direct or indirect.
+///
+/// Every pending retain is invalidated by the call, EXCEPT one whose object
+/// is an argument the call fully consumes; that one is promoted into
+/// [callConsumed] and thereafter tracked under the strictly stronger rule
+/// documented at that set's declaration.
+///
+/// Shared by `Call` and `IndirectCall` rather than written twice: the two
+/// differ only in where `argOwnership` comes from (a field computed by
+/// dcc-lower from the callee's declaration, versus the callee pointer's own
+/// `DCFuncPtr` type), and nothing about the SAFETY argument depends on which.
+/// Duplicating it would make it possible for the direct and indirect cases to
+/// drift apart under a later edit -- in a pass where a divergence is a
+/// double-free, not a missed optimization.
+void _invalidateAcrossCall({
+  required List<DCValue> args,
+  required List<bool> argOwnership,
+  required Map<int, int> pendingRetain,
+  required Set<int> callConsumed,
+}) {
+  final ownedIds = <int>{
+    for (var i = 0; i < args.length; i++)
+      if (argOwnership[i]) args[i].id.index,
+  };
+  pendingRetain.removeWhere((id, _) {
+    if (ownedIds.contains(id)) {
+      callConsumed.add(id); // survives THIS call, now under the strict rule above
+      return false;
+    }
+    return true; // ordinary conservative invalidation, unchanged from before
+  });
 }
 
 /// Every `ValueId.index` [instruction] reads as an operand -- everything
@@ -253,6 +312,14 @@ Set<int> referencedValueIds(DCInstruction instruction) {
     case FreeRaw(:final pointer):
       ref(pointer);
     case Call(:final args):
+      args.forEach(ref);
+    case FuncRef():
+      break; // names a symbol, not a value; no operands (cf. AddressOfGlobal)
+    case IndirectCall(:final callee, :final args):
+      // The CALLEE is a real operand, unlike `Call`'s symbol name. Omitting
+      // it here would let this pass believe the function pointer is dead
+      // between the `FuncRef` that made it and the call that uses it.
+      ref(callee);
       args.forEach(ref);
     case Retain(:final object):
     case Release(:final object):

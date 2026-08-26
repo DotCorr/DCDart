@@ -806,6 +806,88 @@ final class Call extends DCInstruction {
   DCValue? get result => dest;
 }
 
+/// Materializes the address of a named function as a VALUE (ADR-0060).
+/// `dest.type` must be a `DCFuncPtr` (types.dart) describing exactly the
+/// signature — including per-parameter ownership — of the function
+/// `targetName` names.
+///
+/// Names a SYMBOL, not a value, for the same reason `Call.targetName` and
+/// `AddressOfGlobal.globalName` do: DC-IR has no cross-function value
+/// namespace (ssa.dart), so a function cannot be a `DCValue` that
+/// instructions in other functions reference. The name is resolved at
+/// emission.
+///
+/// **This is the only place a `DCFuncPtr` can be created**, and that is
+/// load-bearing rather than incidental. `dcc-lower` builds `dest.type` from
+/// the target's declaration, where the `@owned` annotations are in plain
+/// sight — so the ownership recorded in the type is EXACT, not assumed. If
+/// a second, weaker source of function pointers were ever added (an integer
+/// cast, say), the guarantee `IndirectCall` rests on would be gone: see
+/// `DCFuncPtr`'s own comment for why that guarantee is the difference
+/// between an indirect call and an elision barrier.
+final class FuncRef extends DCInstruction {
+  final DCValue dest;
+  final String targetName;
+  const FuncRef({required this.dest, required this.targetName});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Calls the function a `DCFuncPtr` VALUE points at (ADR-0060) — the
+/// closure/callback counterpart of `Call`. `callee.type` must be a
+/// `DCFuncPtr`; `dest` is `null` iff that type's `returnType` is `DCVoid`,
+/// and otherwise `dest.type` must equal it exactly (same "no implicit
+/// widening" rule as everywhere else). `args` must match
+/// `callee.type.params` in length and, element-wise, in type.
+///
+/// **There is no `argOwnership` field, on purpose.** `Call` needs one
+/// because its callee is a bare `String` carrying no signature. Here the
+/// callee is a typed operand, and the type already says which parameters are
+/// consumed — so [argOwnership] READS it rather than storing a second copy
+/// that could drift out of agreement with the pointer being called. That
+/// impossibility of drift is the mechanism by which an indirect call keeps
+/// the elision the equivalent direct call gets (docs/escalations/0008 §3,
+/// ADR-0060): dc-elide's call-consumed case (ADR-0031) fires through this
+/// instruction using exactly the same fact it uses for `Call`.
+///
+/// Non-null callee is NOT checked here or at emission. A `DCFuncPtr` can
+/// only come from `FuncRef`, which always names a real symbol, so there is
+/// no way to produce a null one from DCDart source today; if a nullable
+/// function type ever exists, the null check belongs at that lowering, not
+/// as an unconditional branch on every call.
+final class IndirectCall extends DCInstruction {
+  final DCValue? dest;
+  final DCValue callee;
+  final List<DCValue> args;
+
+  const IndirectCall({
+    this.dest,
+    required this.callee,
+    required this.args,
+  });
+
+  /// The callee's signature. Throws if `callee.type` is not a `DCFuncPtr` —
+  /// a dcc-lower bug, not a source error.
+  DCFuncPtr get signature {
+    final type = callee.type;
+    if (type is! DCFuncPtr) {
+      throw StateError(
+        'IndirectCall callee v${callee.id.index} has type $type, not a '
+        'DCFuncPtr (dcc-lower bug)',
+      );
+    }
+    return type;
+  }
+
+  /// Parallel to `args`, exactly as `Call.argOwnership` is — derived from
+  /// the callee's type rather than stored. See the class comment.
+  List<bool> get argOwnership => signature.paramOwnership;
+
+  @override
+  DCValue? get result => dest;
+}
+
 // ---------------------------------------------------------------------
 // ARC — spec §3.1. Shape frozen in spirit by CLAUDE.md rule 4 ("memory-
 // model changes are frozen after M3") even though M2 (elision) and M3 (the

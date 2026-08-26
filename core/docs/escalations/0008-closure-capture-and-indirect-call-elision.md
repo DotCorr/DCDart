@@ -1,8 +1,30 @@
 # Escalation 0008: Closures need an indirect call, and an indirect call has no computable ownership — the elision model assumes a statically-known callee
 
-**Status:** OPEN — not decided. Escalated because `CLAUDE.md` rule 4 freezes §3 at M3 and a closure
-capture convention *is* an ARC convention; and because the enabling mechanism (indirect calls)
-removes a fact every elision pass currently relies on.
+**Status:** **PARTIALLY ANSWERED 2026-08-26 — §3 is resolved by ADR-0060; §2 remains OPEN and
+undecided.** Escalated because `CLAUDE.md` rule 4 freezes §3 at M3 and a closure capture convention
+*is* an ARC convention; and because the enabling mechanism (indirect calls) removes a fact every
+elision pass currently relies on.
+
+**§3 did not come true.** The prediction below — that an indirect call cannot know its arguments'
+ownership, so every closure call site becomes an elision barrier — assumed ownership must be
+re-derived at the call site from a callee that is not there. ADR-0060 puts it in the function
+pointer's TYPE instead: a `DCFuncPtr` is only ever created by `FuncRef` from a NAMED function, where
+the `@owned` annotations are visible, and the convention then travels with the value. `IndirectCall`
+has no `argOwnership` field at all — it reads the callee's type — so `dc-elide` consumes the same
+fact for a direct and an indirect call. The four lines §6 asks to be diffed are **unmoved**, and the
+indirect spelling of the same program matches them exactly (see §6's update).
+
+**§2 is untouched and is what still needs a human.** The capture convention (by value / strong /
+`unowned`) and the `[weak self]`-shaped language surface `CLAUDE.md`'s cycle rule needs to be
+enforceable are not decided, not implemented, and were deliberately not decided by ADR-0060 — a
+capturing closure is still rejected with ADR-0057's diagnostic. §7's "what proceeds without waiting"
+still applies to everything else.
+
+**One new question falls out of ADR-0060 and belongs with §2 when it is taken up** (GAP-0057): a Dart
+function TYPE has nowhere to write `@owned`, because annotations live on parameter declarations and a
+function type has none. So a callback's heap parameters must be borrowed. That is the same shape of
+problem as §2 — an ARC convention with no place in Dart's syntax to be written down — and the two
+should be decided together rather than getting two unrelated syntaxes.
 
 **No current work is blocked by this document.** The non-capturing subset has since landed
 (ADR-0058) and is deliberately built so that it answers none of the questions below — see §6, which
@@ -181,6 +203,39 @@ rather than a name, `argOwnership` is unknown, the pair comes back, and the seco
 above become `retain=1 release=1`. **When someone builds GAP-0052's indirect call, re-run this
 harness and diff these four lines.** If they move, that is the elision barrier arriving, measured on
 a program that already exists, before the benchmark suite exists to be misled by it.
+
+### The diff, run (2026-08-26, ADR-0060)
+
+They did not move. Re-run on `examples/m2-closure` after the indirect call landed:
+
+```
+viaTopLevel:          alloc=1 retain=0 release=0
+viaClosure:           alloc=1 retain=0 release=0
+dropTop:              alloc=0 retain=0 release=1
+viaClosure$dropLocal: alloc=0 retain=0 release=1
+```
+
+Identical to the four lines above. And the new spelling — the same `@owned`-consuming callee reached
+through a function POINTER — joins them rather than regressing
+(`examples/m3-funcptr`, `tests/conformance/funcptr/`):
+
+```
+viaFuncPtr:           alloc=1 retain=0 release=0     <- INDIRECT, hoisted local via pointer
+viaTopFuncPtr:        alloc=1 retain=0 release=0     <- INDIRECT, top-level via pointer
+borrowViaFuncPtr:     alloc=1 retain=1 release=2     <- INDIRECT, borrowed: pair correctly SURVIVES
+```
+
+The last line is the guard against the good news being an artifact: an elision pass that had simply
+become more aggressive would have removed that pair too, and introduced a use-after-free while making
+the first two lines look identical. Both directions are asserted at their absolute counts.
+
+**Why the prediction was wrong is worth keeping, not just that it was.** §3 reasoned about the CALL
+SITE — "for a call through a value the callee is not known" — which is true and is not the binding
+constraint. The fact only has to reach `dc-elide`; it does not have to be recomputed where it is
+consumed. A function pointer is created exactly once, from a named function, and that creation site
+knows everything. The general form of the error is treating "not derivable HERE" as "not derivable",
+and it is worth remembering because the same shape will recur wherever a fact is needed at a site
+that did not produce it.
 
 ## 7. What proceeds without waiting
 

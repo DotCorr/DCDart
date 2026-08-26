@@ -105,17 +105,27 @@ String emitCHeader(DCModule module, {required String headerName}) {
 }
 
 /// One `returnType name(params);` line.
+///
+/// Built through [cDeclaratorOf] on the RETURN type, with `name(params)` as the
+/// declarator, rather than as `"$ret $name($params)"`. For every ordinary
+/// return type the two are the same string; for a function-pointer return they
+/// are not, and only the first is valid C:
+///
+///     uint64_t (*chooser(uint64_t a0))(uint64_t);   // correct
+///     uint64_t (*)(uint64_t) chooser(uint64_t a0);  // does not parse
+///
+/// C declarator syntax reads outward from the identifier, so a returned
+/// function pointer wraps the whole call declarator. This was found by
+/// compiling the emitted header (ADR-0060) rather than by reading it.
 String _emitDeclaration(DCFunction function) {
-  final ret = cTypeOf(function.returnType, context: function.linkName);
   final params = <String>[];
   for (var i = 0; i < function.paramTypes.length; i++) {
-    final type = cTypeOf(function.paramTypes[i], context: function.linkName);
-    params.add('$type a$i');
+    params.add(cDeclaratorOf(function.paramTypes[i], 'a$i', context: function.linkName));
   }
   // C's `f()` means "unspecified arguments", not "no arguments"; `f(void)`
   // is the one that actually type-checks a zero-arg call.
   final paramList = params.isEmpty ? 'void' : params.join(', ');
-  return '$ret ${function.linkName}($paramList);';
+  return '${cDeclaratorOf(function.returnType, '${function.linkName}($paramList)', context: function.linkName)};';
 }
 
 String _emitStruct(DCStruct struct) {
@@ -133,13 +143,33 @@ String _emitStruct(DCStruct struct) {
   buffer.writeln('#endif');
   buffer.writeln('typedef struct {');
   for (final field in struct.fields) {
-    buffer.writeln('  ${cTypeOf(field.type, context: struct.name)} ${field.name};');
+    buffer.writeln('  ${cDeclaratorOf(field.type, field.name, context: struct.name)};');
   }
   buffer.writeln('} DCDART_PACKED ${struct.name};');
   buffer.writeln('#if defined(_MSC_VER)');
   buffer.writeln('#  pragma pack(pop)');
   buffer.writeln('#endif');
   return buffer.toString();
+}
+
+/// One named declaration in C: a type and the identifier it declares.
+///
+/// For almost every DCType this is just `"$type $name"` — but C's declarator
+/// syntax is not "type then name" in general, and a function pointer is the
+/// case where that bites: the identifier goes INSIDE the parentheses
+/// (`uint64_t (*f)(uint64_t)`), so pasting a name after `cTypeOf`'s
+/// abstract-declarator spelling produces a header that does not compile.
+/// Every place this emitter names a thing goes through here, so the shape is
+/// decided once (ADR-0060).
+String cDeclaratorOf(DCType type, String name, {required String context}) {
+  if (type is DCFuncPtr) {
+    final ret = cTypeOf(type.returnType, context: context);
+    final ps = type.params.isEmpty
+        ? 'void'
+        : type.params.map((p) => cTypeOf(p.type, context: context)).join(', ');
+    return '$ret (*$name)($ps)';
+  }
+  return '${cTypeOf(type, context: context)} $name';
 }
 
 /// Maps a DC-IR type to its C spelling.
@@ -193,6 +223,23 @@ String cTypeOf(DCType type, {required String context}) {
       return 'DCHeapRef';
     case DCWeakPointer():
       return 'DCWeakRef';
+    case DCFuncPtr(params: final params, returnType: final returnType):
+      // (ADR-0060) A real C function-pointer type, spelled out, so a C caller
+      // handed one by DCDart can actually call it.
+      //
+      // The `@owned` half of the DC-IR type is DELIBERATELY not represented:
+      // C has no way to say it, and there is no annotation that would make a
+      // C compiler enforce it. A C function passed where DCDart expects an
+      // owned-consuming callback must release its argument, and nothing in
+      // this header can check that — the same unchecked contract `DCHeapRef`
+      // already carries across this boundary, now with one more clause. It is
+      // filed as GAP-0058 rather than papered over with a comment nobody
+      // reads at the call site.
+      final ret = cTypeOf(returnType, context: context);
+      final ps = params.isEmpty
+          ? 'void'
+          : params.map((p) => cTypeOf(p.type, context: context)).join(', ');
+      return '$ret (*)($ps)';
     case DCStruct(name: final name):
       return name;
   }
@@ -223,14 +270,30 @@ List<DCStruct> _collectStructs(DCModule module) {
   return result;
 }
 
-bool _usesHeapPointer(DCModule module) => module.functions.any(
-      (f) =>
-          f.returnType is DCHeapPointer ||
-          f.paramTypes.any((t) => t is DCHeapPointer),
-    );
+bool _usesHeapPointer(DCModule module) =>
+    _anySignatureType(module, (t) => t is DCHeapPointer);
 
-bool _usesWeakPointer(DCModule module) => module.functions.any(
-      (f) =>
-          f.returnType is DCWeakPointer ||
-          f.paramTypes.any((t) => t is DCWeakPointer),
-    );
+bool _usesWeakPointer(DCModule module) =>
+    _anySignatureType(module, (t) => t is DCWeakPointer);
+
+/// Whether any type in any signature satisfies [test], descending INTO a
+/// `DCFuncPtr`'s own parameter and return types (ADR-0060).
+///
+/// The descent is what makes the two typedef guards above stay correct: a
+/// module whose only heap reference is `void Function(Box)`'s parameter still
+/// needs `DCHeapRef` defined, and a shallow check would emit a header that
+/// mentions an undeclared type. Not extended to `DCPointer`'s pointee, which
+/// is a pre-existing shallow check with its own (unrelated) reason to be:
+/// `cTypeOf` spells a pointee inline rather than by typedef name.
+bool _anySignatureType(DCModule module, bool Function(DCType) test) {
+  bool visit(DCType type) {
+    if (test(type)) return true;
+    if (type is DCFuncPtr) {
+      return visit(type.returnType) || type.params.any((p) => visit(p.type));
+    }
+    return false;
+  }
+
+  return module.functions
+      .any((f) => visit(f.returnType) || f.paramTypes.any(visit));
+}

@@ -64,6 +64,23 @@ final class DCInt extends DCType {
 
   @override
   int get hashCode => Object.hash(DCInt, width, signed);
+
+  // Diagnostics only. dcc-lower's type-mismatch errors interpolate a DCType
+  // directly ("passes argument 0 of type $actual for a parameter declared
+  // $expected"), and Dart's default `Instance of 'DCInt'` makes those messages
+  // useless exactly when someone needs them. Added with `DCFuncPtr`
+  // (ADR-0060), whose own `toString` nests these.
+  @override
+  String toString() {
+    final w = switch (width) {
+      IntWidth.w8 => '8',
+      IntWidth.w16 => '16',
+      IntWidth.w32 => '32',
+      IntWidth.w64 => '64',
+      IntWidth.wSize => 'size',
+    };
+    return '${signed ? 'i' : 'u'}$w';
+  }
 }
 
 /// `isize`/`usize` are a distinct width, not sugar for `w64`: DC-IR must
@@ -92,6 +109,9 @@ final class DCFloat extends DCType {
 
   @override
   int get hashCode => Object.hash(DCFloat, width);
+
+  @override
+  String toString() => width == FloatWidth.w32 ? 'f32' : 'f64';
 }
 
 enum FloatWidth { w32, w64 }
@@ -110,6 +130,9 @@ final class DCBool extends DCType {
 
   @override
   int get hashCode => (DCBool).hashCode;
+
+  @override
+  String toString() => 'bool';
 }
 
 /// The empty type. Never a `DCValue.type` — nothing produces a value of
@@ -123,6 +146,9 @@ final class DCVoid extends DCType {
 
   @override
   int get hashCode => (DCVoid).hashCode;
+
+  @override
+  String toString() => 'void';
 }
 
 /// Spec §6: `Pointer<T>`. `pointee` is itself a `DCType`, so pointer-to-
@@ -146,6 +172,9 @@ final class DCPointer extends DCType {
 
   @override
   int get hashCode => Object.hash(DCPointer, pointee);
+
+  @override
+  String toString() => 'Pointer<$pointee>';
 }
 
 /// Marks "this is what ARC operates on" — conceptually a pointer to a heap
@@ -172,6 +201,9 @@ final class DCHeapPointer extends DCType {
 
   @override
   int get hashCode => Object.hash(DCHeapPointer, pointee);
+
+  @override
+  String toString() => 'HeapRef<$pointee>';
 }
 
 /// Spec §3.3 layer 1: `weak`. Does NOT keep its target alive (no strong
@@ -197,6 +229,9 @@ final class DCWeakPointer extends DCType {
 
   @override
   int get hashCode => Object.hash(DCWeakPointer, pointee);
+
+  @override
+  String toString() => 'Weak<$pointee>';
 }
 
 /// One field of a `DCStruct`. `name` is carried for diagnostics and debug
@@ -254,4 +289,103 @@ final class DCStruct extends DCType {
 
   @override
   int get hashCode => Object.hashAll(fields.map((f) => f.type));
+
+  @override
+  String toString() => 'struct $name{${fields.map((f) => f.type).join(', ')}}';
+}
+
+/// One parameter of a [DCFuncPtr]: its type, and whether the function
+/// behind the pointer CONSUMES it (spec §3.2 item 2's `@owned`) or merely
+/// borrows it.
+///
+/// `owned` sits on the TYPE, not on the call site, and that placement is
+/// the entire point of ADR-0060 — see [DCFuncPtr].
+final class DCFuncParam {
+  final DCType type;
+  final bool owned;
+  const DCFuncParam(this.type, {required this.owned});
+
+  @override
+  bool operator ==(Object other) =>
+      other is DCFuncParam && other.type == type && other.owned == owned;
+
+  @override
+  int get hashCode => Object.hash(DCFuncParam, type, owned);
+}
+
+/// A pointer to a function (ADR-0060). What a closure, a callback or a
+/// torn-off function name IS as a value, and the operand type
+/// `IndirectCall` (instructions.dart) requires.
+///
+/// **Ownership is part of the type.** `params` records, per parameter,
+/// whether the callee consumes it — so two function pointers with the same
+/// Dart signature but different ARC conventions are DIFFERENT DCTypes and
+/// cannot be assigned to one another. This is not decoration:
+///
+/// `Call.argOwnership` exists so dc-elide can tell a load-bearing borrowed
+/// retain/release pair apart from a redundant owned-consuming one
+/// (docs/decisions/0031-move-semantics.md). `dcc-lower` computes it from the
+/// callee's declaration. For a call through a VALUE there is no declaration
+/// to read, and the fact is not conservatively derivable — it is not
+/// derivable at all (docs/escalations/0008 §3). Assuming "borrowed" would
+/// make every indirect call an elision barrier, which is how "closures are
+/// slow in DCDart" becomes a fact about the language instead of a fact about
+/// a missing analysis.
+///
+/// Recording it on the pointer's type instead moves the question to where
+/// the answer IS known: a function pointer is only ever created from a named
+/// function (`FuncRef`), and there the declaration is in hand. Every later
+/// use — assignment, parameter passing, the call itself — carries the
+/// convention with it, checked by ordinary DCType equality, so an indirect
+/// call knows its arguments' ownership exactly as a direct call does.
+///
+/// **NO VARIANCE, deliberately.** Neither direction is safe, so `==` is
+/// exact in `owned` as well as in `type`:
+///   - owned pointer through a borrowed-typed slot: the caller keeps its own
+///     reference and releases it, the callee also releases → double release.
+///   - borrowed pointer through an owned-typed slot: the caller retains
+///     before the call, nothing ever releases that retain → leak.
+/// A subtype lattice on ARC conventions would be a memory-model change
+/// (CLAUDE.md rule 4), not an implementation convenience.
+///
+/// **Not `DCPointer(...)` of something.** A `DCPointer` is `Load`/`Store`
+/// -able and points at data with a layout; code has neither. Keeping them
+/// distinct is the same reasoning `DCHeapPointer` already uses to stop
+/// `Retain` being handed a raw pointer.
+///
+/// At the LLVM level this is a plain opaque `ptr`, like every other pointer
+/// here; the signature is carried by the `IndirectCall` that uses it, which
+/// is exactly how LLVM's own opaque-pointer call syntax works.
+final class DCFuncPtr extends DCType {
+  final List<DCFuncParam> params;
+  final DCType returnType;
+  const DCFuncPtr(this.params, this.returnType);
+
+  /// Per-parameter ownership, in the shape `Call.argOwnership` uses, so a
+  /// consumer (dc-elide) can treat a direct and an indirect call through one
+  /// code path.
+  List<bool> get paramOwnership =>
+      params.map((p) => p.owned).toList(growable: false);
+
+  @override
+  bool operator ==(Object other) {
+    if (other is! DCFuncPtr) return false;
+    if (other.returnType != returnType) return false;
+    if (other.params.length != params.length) return false;
+    for (var i = 0; i < params.length; i = i + 1) {
+      if (other.params[i] != params[i]) return false;
+    }
+    return true;
+  }
+
+  @override
+  int get hashCode => Object.hash(DCFuncPtr, returnType, Object.hashAll(params));
+
+  @override
+  String toString() {
+    final ps = params
+        .map((p) => p.owned ? '@owned ${p.type}' : '${p.type}')
+        .join(', ');
+    return 'DCFuncPtr($returnType Function($ps))';
+  }
 }

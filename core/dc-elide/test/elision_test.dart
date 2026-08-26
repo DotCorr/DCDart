@@ -252,4 +252,185 @@ void main() {
 
     expect(body.whereType<Retain>().length, 1, reason: 'no matching Release exists -- must not be removed');
   });
+
+  // -----------------------------------------------------------------------
+  // ADR-0060 -- INDIRECT CALLS. The three tests below are the direct-call
+  // tests above, re-run through a callee that is a VALUE rather than a name.
+  //
+  // They are duplicated deliberately rather than parameterized: the whole
+  // claim of ADR-0060 is that these two call forms are treated IDENTICALLY by
+  // this pass, and a shared helper that ran both would make a future
+  // divergence invisible by construction. Written out, a divergence fails
+  // exactly one of them.
+  // -----------------------------------------------------------------------
+
+  test('removes a Retain/Release pair spanning an INDIRECT call whose pointer type says @owned '
+      '(ADR-0060 -- the property docs/escalations/0008 §3 predicted would be lost)', () {
+    // The callee is unknown at this call site. What is known is the POINTER'S
+    // TYPE, and it records that parameter 0 is consumed -- so the pair is
+    // exactly as redundant as it is for the equivalent direct Call, and this
+    // pass has exactly as much reason to remove it.
+    final heapPtr = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final callee = DCValue(
+      ValueId(1),
+      const DCFuncPtr(
+        [DCFuncParam(DCHeapPointer(DCVoid()), owned: true)],
+        DCInt.u64,
+      ),
+    );
+    final callResult = DCValue(ValueId(2), DCInt.u64);
+
+    final function = DCFunction(
+      linkName: 'test_indirect_owned_consumed',
+      paramTypes: const [],
+      returnType: DCInt.u64,
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: const [],
+          body: [
+            FuncRef(dest: callee, targetName: 'dropBoxAndReadValue'),
+            Retain(object: heapPtr),
+            IndirectCall(dest: callResult, callee: callee, args: [heapPtr]),
+            Release(object: heapPtr),
+            Return(value: callResult),
+          ],
+        ),
+      ],
+    );
+
+    final elided = elideRedundantRetainReleasePairs(function);
+    final body = elided.blocks.single.body;
+
+    expect(body.whereType<Retain>().length, 0,
+        reason: 'ownership reached this pass through DCFuncPtr; the pair is redundant');
+    expect(body.whereType<Release>().length, 0);
+    expect(body, [isA<FuncRef>(), isA<IndirectCall>(), isA<Return>()]);
+  });
+
+  test('does NOT remove a pair spanning an INDIRECT call whose pointer type says BORROWED', () {
+    // Same instruction, opposite type. If `owned` were ignored -- or if
+    // IndirectCall fell through to the switch's `default:` and were treated as
+    // an ordinary skippable instruction -- this pair would be wrongly removed
+    // and the object freed while the caller still holds it.
+    final heapPtr = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final callee = DCValue(
+      ValueId(1),
+      const DCFuncPtr(
+        [DCFuncParam(DCHeapPointer(DCVoid()), owned: false)],
+        DCInt.u64,
+      ),
+    );
+    final callResult = DCValue(ValueId(2), DCInt.u64);
+
+    final function = DCFunction(
+      linkName: 'test_indirect_borrowed',
+      paramTypes: const [],
+      returnType: DCInt.u64,
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: const [],
+          body: [
+            FuncRef(dest: callee, targetName: 'someBorrowingConsumer'),
+            Retain(object: heapPtr),
+            IndirectCall(dest: callResult, callee: callee, args: [heapPtr]),
+            Release(object: heapPtr),
+            Return(value: callResult),
+          ],
+        ),
+      ],
+    );
+
+    final elided = elideRedundantRetainReleasePairs(function);
+    final body = elided.blocks.single.body;
+
+    expect(body.whereType<Retain>().length, 1,
+        reason: 'a retain spanning a BORROWING indirect call must survive, exactly as for a direct one');
+    expect(body.whereType<Release>().length, 1);
+  });
+
+  test('does NOT remove a pair spanning an owned-consuming INDIRECT call when the value is used '
+      'again afterward -- the critical safety case, through a pointer', () {
+    // The stricter call-consumed rule must apply to IndirectCall too. If
+    // `referencedValueIds` did not report IndirectCall's operands, the later
+    // read would not invalidate the candidate and this pair would be
+    // cancelled, turning the Load into a use-after-free.
+    final heapPtr = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final callee = DCValue(
+      ValueId(1),
+      const DCFuncPtr(
+        [DCFuncParam(DCHeapPointer(DCVoid()), owned: true)],
+        DCInt.u64,
+      ),
+    );
+    final callResult = DCValue(ValueId(2), DCInt.u64);
+    final fieldPtr = DCValue(ValueId(3), const DCPointer(DCInt.u64));
+    final fieldVal = DCValue(ValueId(4), DCInt.u64);
+
+    final function = DCFunction(
+      linkName: 'test_indirect_owned_then_read_again',
+      paramTypes: const [],
+      returnType: DCInt.u64,
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: const [],
+          body: [
+            FuncRef(dest: callee, targetName: 'ownedConsumer'),
+            Retain(object: heapPtr),
+            IndirectCall(dest: callResult, callee: callee, args: [heapPtr]),
+            PtrOffset(dest: fieldPtr, base: heapPtr, offsetBytes: 0),
+            Load(dest: fieldVal, pointer: fieldPtr),
+            Release(object: heapPtr),
+            Return(value: fieldVal),
+          ],
+        ),
+      ],
+    );
+
+    final elided = elideRedundantRetainReleasePairs(function);
+    final body = elided.blocks.single.body;
+
+    expect(body.whereType<Retain>().length, 1,
+        reason: 'heapPtr is referenced again after the indirect call, so the pair must survive');
+    expect(body.whereType<Release>().length, 1);
+  });
+
+  test('IndirectCall.argOwnership is READ from the callee type, so it cannot disagree with it', () {
+    // Not a behavioural test of the pass -- a structural one about why the
+    // pass can trust the fact. `Call` stores argOwnership as a field that
+    // dcc-lower fills in; `IndirectCall` has no such field, so there is no
+    // second copy to drift.
+    final callee = DCValue(
+      ValueId(0),
+      const DCFuncPtr(
+        [
+          DCFuncParam(DCHeapPointer(DCVoid()), owned: true),
+          DCFuncParam(DCInt.u64, owned: false),
+        ],
+        DCVoid(),
+      ),
+    );
+    final heapPtr = DCValue(ValueId(1), const DCHeapPointer(DCVoid()));
+    final scalar = DCValue(ValueId(2), DCInt.u64);
+
+    final call = IndirectCall(callee: callee, args: [heapPtr, scalar]);
+    expect(call.argOwnership, [true, false]);
+    expect(call.signature.returnType, const DCVoid());
+    expect(call.result, isNull, reason: 'a void indirect call defines no value');
+  });
+
+  test('two DCFuncPtr types differing ONLY in ownership are NOT equal', () {
+    // The type-identity property the whole design rests on. If these compared
+    // equal, dcc-lower would let an owned-consuming pointer be passed where a
+    // borrowing one is expected, which is a double release.
+    const owned = DCFuncPtr([DCFuncParam(DCHeapPointer(DCVoid()), owned: true)], DCInt.u64);
+    const borrowed = DCFuncPtr([DCFuncParam(DCHeapPointer(DCVoid()), owned: false)], DCInt.u64);
+    expect(owned == borrowed, isFalse);
+    expect(owned == const DCFuncPtr([DCFuncParam(DCHeapPointer(DCVoid()), owned: true)], DCInt.u64), isTrue);
+  });
 }

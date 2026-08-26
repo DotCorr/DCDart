@@ -137,6 +137,25 @@ it is hard.
   superset of what this does, and would replace the rejection with a lowering, not rewrite the
   hoisting.
 
+### Superseded in part by ADR-0060 (2026-08-26)
+
+Two of this ADR's rejections are gone, and one of its predictions was wrong.
+
+- **"A local function used as a value" and "a function type in any signature" are no longer
+  errors.** ADR-0060 added `DCFuncPtr`, `FuncRef` and `IndirectCall`, closing GAP-0052. The hoisting
+  above is unchanged and is what a torn-off local function points AT — the two compose exactly as
+  this ADR's last consequence predicted a superset would.
+- **The capture rejection is unchanged**, and so is escalation 0008 §2. What changed in the capture
+  scan is narrow: a sibling or own local function's name in **value** position is no longer counted
+  as a capture, for exactly the reason it was already not one in **call** position — the name
+  resolves to a static symbol, not to a slot in the enclosing frame.
+- **Consequence 3's forecast did not hold.** It reads: "the numbers that will move when a closure
+  becomes a value and `argOwnership` stops being derivable." They did not move; the four lines above
+  are byte-identical after ADR-0060, and the indirect spelling of the same program joins them at
+  `alloc=1 retain=0 release=0`. `argOwnership` did not stop being derivable — it stopped needing to
+  be derived at the call site, because ADR-0060 carries it in the pointer's type from the tear-off,
+  where the declaration is still in hand.
+
 ## Rejected alternative
 
 **Lower capturing closures onto ADR-0015's arena now.** Fastest to a green test, and wrong: it

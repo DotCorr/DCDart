@@ -1506,6 +1506,21 @@ class _BareFunctionLowerer {
       // Named explicitly so the diagnostic points at the actual restriction
       // instead of the generic list below.
       if (expr is LocalFunctionInvocation || expr is FunctionInvocation) {
+        // (ADR-0060) A call THROUGH A POINTER is lowered in statement
+        // position, because a void callback invoked for effect
+        // (`onEach(item);`) is the ordinary shape of the thing this unit
+        // exists for -- unlike a void LOCAL function called as a statement,
+        // which ADR-0057 left unimplemented for want of a real case and
+        // which still is.
+        if (expr is FunctionInvocation && _calleeOf(expr) == null) {
+          _lowerIndirectCall(
+            _lowerCalleeValue(expr),
+            expr.arguments,
+            allowVoid: true,
+            what: 'the called function pointer',
+          );
+          return;
+        }
         throw DccLowerError(
           '"$context": a call to a local function is only lowered in '
           'EXPRESSION position — bind the result to a local '
@@ -2321,18 +2336,17 @@ class _BareFunctionLowerer {
     if (expr is VariableGet) {
       final value = _values[expr.variable];
       if (value == null) {
-        // (ADR-0057) A local function's name reaching value position. It has
-        // a symbol, but no VALUE: DC-IR has no function-pointer type, so
-        // there is nothing to produce here. Say that, rather than the generic
-        // "unrecognized variable", which would point at the wrong problem.
-        if (_localFunctions.containsKey(expr.variable)) {
-          throw DccLowerError(
-            '"$context": local function "${expr.variable.name}" is used as a '
-            'VALUE (passed, returned or stored) rather than called. DC-IR has '
-            'no function-pointer type and no indirect call, so a closure '
-            'cannot be a value yet (docs/known-gaps.md GAP-0052); and once it '
-            'could, every such call site would be an elision barrier — see '
-            'docs/escalations/0008-closure-capture-and-indirect-call-elision.md',
+        // (ADR-0060, was ADR-0057's rejection) A local function's name in
+        // VALUE position. It has a symbol, so a function pointer to it is
+        // exactly what it means. The `DCFuncPtr` type is built from the
+        // function's own declaration here, so its `@owned` convention is
+        // derived rather than assumed — see `_funcPtrTypeOfNode`.
+        final localFn = _localFunctions[expr.variable];
+        if (localFn != null) {
+          return _lowerFuncRef(
+            localFn.linkName,
+            localFn.node,
+            what: 'local function "${expr.variable.name}"',
           );
         }
         throw DccLowerError(
@@ -2349,13 +2363,27 @@ class _BareFunctionLowerer {
     if (expr is LocalFunctionInvocation || expr is FunctionInvocation) {
       final callee = _calleeOf(expr);
       if (callee == null) {
+        // (ADR-0060) A call through a function-pointer VALUE — a parameter, a
+        // local bound to a tear-off, or anything else of `DCFuncPtr` type.
+        // This is what ADR-0057 could only reject.
+        if (expr is FunctionInvocation) {
+          final result = _lowerIndirectCall(
+            _lowerCalleeValue(expr),
+            expr.arguments,
+            allowVoid: false,
+            what: 'the called function pointer',
+          );
+          if (result == null) {
+            throw DccLowerError(
+              '"$context": internal error — _lowerIndirectCall returned no '
+              'value with allowVoid: false (dcc-lower bug)',
+            );
+          }
+          return result;
+        }
         throw DccLowerError(
-          '"$context": call through a function VALUE. DC-IR\'s `Call` carries '
-          'a target SYMBOL NAME, not a callee operand — there is no indirect '
-          'call instruction and no function-pointer type '
-          '(docs/known-gaps.md GAP-0052). Only a call to a non-capturing '
-          'local function declared in an enclosing scope is lowered '
-          '(ADR-0057)',
+          '"$context": `LocalFunctionInvocation` naming a variable that is '
+          'not a hoisted local function (dcc-lower bug, not a source error)',
         );
       }
       final arguments =
@@ -2368,6 +2396,24 @@ class _BareFunctionLowerer {
         );
       }
       return result;
+    }
+
+    // (ADR-0060) `final f = topLevelFn;` — a top-level function's name in
+    // value position. TWO Kernel spellings, and which one arrives depends on
+    // whether constant evaluation has run: the plain `StaticTearOff`
+    // expression, or that same tear-off folded into a
+    // `ConstantExpression(StaticTearOffConstant)`. The pipeline this compiler
+    // uses (`dart compile kernel`) produces the folded form, so the second is
+    // the one actually exercised — the first is kept because nothing
+    // guarantees that stays true and the two mean exactly the same thing.
+    if (expr is StaticTearOff) {
+      return _lowerStaticTearOff(expr.target);
+    }
+    if (expr is ConstantExpression) {
+      final constant = expr.constant;
+      if (constant is StaticTearOffConstant) {
+        return _lowerStaticTearOff(constant.target);
+      }
     }
 
     // (ADR-0057) A function expression anywhere OTHER than a local variable's
@@ -3447,7 +3493,8 @@ class _BareFunctionLowerer {
         throw DccLowerError(
           '"$context": call to "${target.name.text}" passes argument $i of '
           'type ${arg.type} for a parameter declared $expectedType -- no '
-          'implicit widening (same rule as arithmetic)',
+          'implicit widening (same rule as arithmetic)'
+          '${_funcPtrConventionHint(expectedType, arg.type)}',
         );
       }
       final isOwnedParam = _hasMarkerAnnotation(calleeParams[i].annotations, '_Owned', preludeUri);
@@ -3552,14 +3599,14 @@ class _BareFunctionLowerer {
 
     for (final used in scan.valueUses) {
       if (scan.declared.contains(used)) continue;
-      if (_localFunctions.containsKey(used)) {
-        throw DccLowerError(
-          '$what uses local function "${used.name}" as a VALUE rather than '
-          'calling it — DC-IR has no function-pointer type and no indirect '
-          'call, so there is nothing for that value to be '
-          '(docs/known-gaps.md GAP-0052)',
-        );
-      }
+      // (ADR-0060) A sibling (or own) local function's name in VALUE position
+      // is NOT a capture, for the same reason it is not one in CALL position:
+      // the name resolves to a static SYMBOL, not to a slot in the enclosing
+      // frame. It lowers to a `FuncRef`, which needs no environment. ADR-0057
+      // had to reject this only because DC-IR had no type for the value to
+      // inhabit; it now does, and the free-variable rule generalizes without
+      // touching the capture question escalation 0008 §2 still owns.
+      if (_localFunctions.containsKey(used)) continue;
       throw DccLowerError(
         '$what captures "${used.name}" from an enclosing scope. Only '
         'NON-CAPTURING local functions are lowered (ADR-0057): a captured '
@@ -3661,7 +3708,8 @@ class _BareFunctionLowerer {
         throw DccLowerError(
           '"$context": call to local function "${callee.linkName}" passes '
           'argument $i of type ${arg.type} for a parameter declared '
-          '$expectedType -- no implicit widening (same rule as arithmetic)',
+          '$expectedType -- no implicit widening (same rule as arithmetic)'
+          '${_funcPtrConventionHint(expectedType, arg.type)}',
         );
       }
       final isOwnedParam =
@@ -3689,6 +3737,206 @@ class _BareFunctionLowerer {
     ));
     return dest;
   }
+
+  // -------------------------------------------------------------------
+  // Function pointers and indirect calls (ADR-0060).
+  //
+  // Three operations, and the middle one is the whole design:
+  //   1. TEAR OFF  -- `FuncRef`, turning a named function into a value whose
+  //                   `DCFuncPtr` type records its ARC convention EXACTLY,
+  //                   because the declaration is right there.
+  //   2. CARRY     -- ordinary DCType equality, so the convention travels
+  //                   with the value through locals, parameters and returns
+  //                   and cannot be lost or silently widened.
+  //   3. CALL      -- `IndirectCall`, which reads ownership back off the
+  //                   pointer's type instead of being told it.
+  //
+  // Step 2 is why an indirect call is not an elision barrier here. See
+  // docs/escalations/0008 §3 for what the alternative costs.
+  // -------------------------------------------------------------------
+
+  /// The `DCFuncPtr` type of the function [node] declares, with per-parameter
+  /// ownership read from its `@owned` annotations.
+  ///
+  /// This is the ONLY place a `DCFuncPtr` is built from a declaration, and so
+  /// the only place ownership can be known exactly. `_lowerType`'s
+  /// `FunctionType` case builds the all-borrowed one from a Dart function
+  /// type, which carries no annotations to read — see the comment there.
+  DCFuncPtr _funcPtrTypeOfNode(FunctionNode node, {required String what}) {
+    if (node.typeParameters.isNotEmpty) {
+      throw DccLowerError(
+        '"$context": $what is generic, so it has no single machine '
+        'representation and no one address to take (ADR-0052)',
+      );
+    }
+    if (node.namedParameters.isNotEmpty ||
+        node.requiredParameterCount != node.positionalParameters.length) {
+      throw DccLowerError(
+        '"$context": $what has named or optional parameters; DCDart lowers '
+        'positional, required parameters only',
+      );
+    }
+    final params = <DCFuncParam>[];
+    for (final p in node.positionalParameters) {
+      final type = _lowerType(p.type, context: '$what param ${p.name}');
+      final isOwned = _hasMarkerAnnotation(p.annotations, '_Owned', preludeUri);
+      if (type is DCWeakPointer && isOwned) {
+        // (ADR-0023) A direct call to such a function is already restricted to
+        // a FRESH `Weak<T>` argument, a check that needs the argument
+        // EXPRESSION. Through a pointer there is no callee declaration at the
+        // call site to re-derive that restriction from, and `DCFuncParam.owned`
+        // deliberately mirrors `Call.argOwnership`, which does not track weak
+        // ownership at all. Refused at the tear-off, where the signature can
+        // still be named, rather than lowered into something that silently
+        // skips the check.
+        throw DccLowerError(
+          '"$context": $what takes an `@owned Weak<T>` parameter, which cannot '
+          'be reached through a function pointer — weak-count ownership has no '
+          'representation in `DCFuncPtr` (docs/known-gaps.md GAP-0057)',
+        );
+      }
+      // `owned` mirrors `Call.argOwnership` EXACTLY: true only for a
+      // DCHeapPointer parameter annotated `@owned`. `@owned` on a scalar is
+      // ignored in both places -- there is no ARC traffic to elide.
+      params.add(DCFuncParam(type, owned: type is DCHeapPointer && isOwned));
+    }
+    final returnType = node.returnType;
+    return DCFuncPtr(
+      params,
+      returnType is VoidType
+          ? const DCVoid()
+          : _lowerType(returnType, context: '$what return type'),
+    );
+  }
+
+  /// Emits a `FuncRef` for [linkName] with the signature [node] declares, and
+  /// returns the resulting function-pointer value.
+  DCValue _lowerFuncRef(String linkName, FunctionNode node, {required String what}) {
+    final dest = DCValue(_allocId(), _funcPtrTypeOfNode(node, what: what));
+    _addInstr(FuncRef(dest: dest, targetName: linkName));
+    return dest;
+  }
+
+  /// `final f = topLevelFn;` — Kernel's `StaticTearOff`.
+  ///
+  /// Restricted to a `@bare` top-level procedure, and both halves of that
+  /// matter. A GENERIC one is refused by `_funcPtrTypeOfNode` (a template has
+  /// no address). An `@extern` C symbol is refused here: its ARC convention is
+  /// whatever the C author decided, and nothing in this compiler can check
+  /// that a C function releases a `@owned` argument — so the `DCFuncPtr` type
+  /// this would produce would be an assertion, not a derivation, which is
+  /// precisely what ADR-0060 is built to avoid.
+  DCValue _lowerStaticTearOff(Procedure target) {
+    final name = target.name.text;
+    if (!_hasMarkerAnnotation(target.annotations, '_Bare', preludeUri)) {
+      throw DccLowerError(
+        '"$context": "$name" is torn off as a function pointer but is not '
+        '`@bare`. Only a `@bare` top-level function has a signature whose ARC '
+        'convention this compiler derived rather than assumed; an `@extern` C '
+        'symbol\'s convention is unverifiable from here '
+        '(docs/known-gaps.md GAP-0059)',
+      );
+    }
+    if (target.isExternal) {
+      throw DccLowerError(
+        '"$context": "$name" is torn off as a function pointer but has no '
+        'body in this unit',
+      );
+    }
+    return _lowerFuncRef(name, target.function, what: 'function "$name"');
+  }
+
+  /// A call through a function-pointer VALUE (ADR-0060) — the counterpart of
+  /// [_lowerLocalCall] and [_lowerCallArgs] for a callee that is an operand
+  /// rather than a name.
+  ///
+  /// The argument path is deliberately IDENTICAL in shape to those two,
+  /// including the `@owned` caller-side `Retain`, and it can be: everything
+  /// those read from the callee's `FunctionNode` is read here from
+  /// `callee.type`'s `DCFuncPtr` instead. That is the claim ADR-0060 makes
+  /// concrete — an indirect call site is not less informed than a direct one,
+  /// it is informed by a different carrier.
+  DCValue? _lowerIndirectCall(
+    DCValue callee,
+    Arguments arguments, {
+    required bool allowVoid,
+    required String what,
+  }) {
+    final signature = callee.type;
+    if (signature is! DCFuncPtr) {
+      throw DccLowerError(
+        '"$context": $what is called, but its type is $signature, not a '
+        'function pointer',
+      );
+    }
+    if (arguments.named.isNotEmpty || arguments.types.isNotEmpty) {
+      throw DccLowerError(
+        '"$context": call through $what passes named or type arguments; '
+        'neither is lowered',
+      );
+    }
+    final callArgs = arguments.positional;
+    if (signature.params.length != callArgs.length) {
+      throw DccLowerError(
+        '"$context": call through $what passes ${callArgs.length} arguments, '
+        'but its type takes ${signature.params.length}',
+      );
+    }
+
+    DCValue? dest;
+    final returnType = signature.returnType;
+    if (returnType is DCVoid) {
+      if (!allowVoid) {
+        throw DccLowerError(
+          '"$context": $what returns void — a void call has no value, so it '
+          'cannot appear inside an expression',
+        );
+      }
+    } else {
+      dest = DCValue(_allocId(), returnType);
+    }
+
+    final loweredArgs = <DCValue>[];
+    for (var i = 0; i < signature.params.length; i++) {
+      final expected = signature.params[i];
+      final arg = _lowerExpression(callArgs[i]);
+      if (arg.type != expected.type) {
+        throw DccLowerError(
+          '"$context": call through $what passes argument $i of type '
+          '${arg.type} for a parameter typed ${expected.type} -- no implicit '
+          'widening (same rule as arithmetic)'
+          '${_funcPtrConventionHint(expected.type, arg.type)}',
+        );
+      }
+      // The `@owned` retain, read off the POINTER's type. `_lowerCallArgs`
+      // reads the same fact off the callee's annotation list; there is no
+      // third possibility and no conservative fallback -- if this were
+      // unknown, the retain could be neither emitted nor omitted correctly.
+      if (expected.owned && !_isFreshHeapOwnership(callArgs[i])) {
+        _addInstr(Retain(object: arg));
+      }
+      loweredArgs.add(arg);
+    }
+
+    // No `argOwnership` argument: `IndirectCall` derives it from
+    // `callee.type`, which is the same `signature` the loop above just
+    // checked every argument against. dc-elide therefore sees exactly the
+    // ownership this lowering acted on, with no second copy to disagree.
+    _addInstr(IndirectCall(dest: dest, callee: callee, args: loweredArgs));
+    return dest;
+  }
+
+  /// Lowers the callee of a `FunctionInvocation` that is NOT a call to a
+  /// hoisted local function (`_calleeOf` returned null), i.e. a call through a
+  /// value.
+  ///
+  /// The receiver is lowered unconditionally, before its type is known to be a
+  /// function pointer. That is safe rather than sloppy: if it turns out not to
+  /// be one, `_lowerIndirectCall` throws and no DC-IR is kept — a
+  /// `DccLowerError` aborts the whole compilation, so there is no path on
+  /// which the instructions emitted here reach the backend.
+  DCValue _lowerCalleeValue(FunctionInvocation expr) =>
+      _lowerExpression(expr.receiver);
 
   /// The hoisted local function a call expression names, or null if the
   /// expression is not a call to one.
@@ -4273,21 +4521,52 @@ DCType _lowerSignatureType(
         return const DCWeakPointer(DCVoid());
       }
     }
-    // (ADR-0057) A FUNCTION type in a signature -- a parameter, return type or
-    // field that would hold a closure as a VALUE. Named separately because the
-    // generic "unsupported type" message points at the type system, and this
-    // is not a type-system gap: DC-IR's `Call` carries a target SYMBOL NAME
-    // rather than a callee operand, so there is no indirect call for such a
-    // value to be used by and no pointer type for it to inhabit.
+    // (ADR-0060) A FUNCTION type in a signature -- a parameter, return type or
+    // field holding a callback as a VALUE. Lowers to `DCFuncPtr`.
+    //
+    // OWNERSHIP IS ALL-BORROWED HERE, AND THAT IS NOT A DEFAULT CHOSEN FOR
+    // CONVENIENCE -- it is the only thing a Dart `FunctionType` says. Kernel's
+    // `FunctionType.positionalParameters` is a `List<DartType>`; annotations
+    // live on `VariableDeclaration`s, which a function TYPE has none of, so
+    // `@owned` is not expressible in `u64 Function(Box)` and there is nothing
+    // to read. The exact convention is read at the `FuncRef` instead
+    // (`_funcPtrTypeOfNode`), where the target's declaration is in hand.
+    //
+    // The consequence, stated where it will be hit: a function pointer whose
+    // callee CONSUMES a heap argument has a `DCFuncPtr` type that is not equal
+    // to the one written here, so it cannot be passed to a parameter declared
+    // with an ordinary Dart function type. That is a real restriction, filed
+    // as GAP-0057, and it is deliberately a hard type error rather than a
+    // silent coercion -- see `DCFuncPtr`'s "no variance" note for why either
+    // direction of coercion is a double-release or a leak.
     if (type is FunctionType) {
-      throw DccLowerError(
-        '"$context": a function type ($type) appears in a signature. DC-IR has '
-        'no function-pointer type and no indirect-call instruction, so a '
-        'closure cannot be passed, returned or stored as a value '
-        '(docs/known-gaps.md GAP-0052). Only CALLING a non-capturing local '
-        'function is lowered (ADR-0057); the design question that gates the '
-        'rest is docs/escalations/0008-closure-capture-and-indirect-call-'
-        'elision.md',
+      if (type.namedParameters.isNotEmpty ||
+          type.requiredParameterCount != type.positionalParameters.length) {
+        throw DccLowerError(
+          '"$context": function type ($type) has named or optional parameters; '
+          'DCDart lowers positional, required parameters only',
+        );
+      }
+      if (type.typeParameters.isNotEmpty) {
+        throw DccLowerError(
+          '"$context": function type ($type) is generic. A generic function '
+          'has no single machine representation, so there is no one pointer '
+          'it could be (ADR-0052\'s reasoning, applied to a value)',
+        );
+      }
+      DCType sub(DartType t, String what) => _lowerSignatureType(
+            t,
+            preludeUri: preludeUri,
+            heapLayouts: heapLayouts,
+            context: '$context $what',
+          );
+      final returnType = type.returnType;
+      return DCFuncPtr(
+        [
+          for (final p in type.positionalParameters)
+            DCFuncParam(sub(p, 'parameter'), owned: false),
+        ],
+        returnType is VoidType ? const DCVoid() : sub(returnType, 'return type'),
       );
     }
     throw DccLowerError(
@@ -5157,4 +5436,31 @@ class DccLowerError extends Error {
 
   @override
   String toString() => 'DccLowerError: $message';
+}
+
+/// An extra sentence appended to a type-mismatch diagnostic when the two types
+/// differ ONLY in ARC convention (ADR-0060).
+///
+/// Without it the message reads `DCFuncPtr(u64 Function(@owned HeapRef<void>))`
+/// versus `DCFuncPtr(u64 Function(HeapRef<void>))`, which is accurate and
+/// completely unhelpful: the reader can see the difference but not why the
+/// compiler will not bridge it, and the obvious next move -- writing `@owned`
+/// inside the Dart function type -- is not expressible. Says so directly.
+String _funcPtrConventionHint(DCType expected, DCType actual) {
+  if (expected is! DCFuncPtr || actual is! DCFuncPtr) return '';
+  if (expected.params.length != actual.params.length) return '';
+  if (expected.returnType != actual.returnType) return '';
+  var ownershipOnly = false;
+  for (var i = 0; i < expected.params.length; i++) {
+    if (expected.params[i].type != actual.params[i].type) return '';
+    if (expected.params[i].owned != actual.params[i].owned) ownershipOnly = true;
+  }
+  if (!ownershipOnly) return '';
+  return '. These two function types differ ONLY in ARC convention (`@owned`), '
+      'and that is part of the type: coercing either direction is a double '
+      'release or a leak (ADR-0060). A Dart function type cannot carry `@owned` '
+      '-- annotations live on parameter DECLARATIONS, and a function type has '
+      'none -- so a slot declared with an ordinary function type can only hold '
+      'a pointer to a BORROWING function. Take the heap argument borrowed, or '
+      'call the consuming function directly (docs/known-gaps.md GAP-0057)';
 }
