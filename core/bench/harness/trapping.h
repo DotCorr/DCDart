@@ -21,12 +21,22 @@
  * benchmark whose C baseline uses different arithmetic semantics is measuring
  * the semantics as much as the compiler, and on a 10% gate that matters.
  *
- * These kernels are therefore a DIAGNOSTIC SECOND BASELINE, never the gate
- * baseline. ROADMAP.md M3 says "the same algorithms in C", and the same
- * algorithm in C does not hand-roll overflow checks -- so `kernel.c` stays
- * idiomatic and the gate stays stated against it. This file exists so the
- * harness can say HOW MUCH of a gap is trapping arithmetic instead of leaving
- * the reader to guess.
+ * STATUS CHANGED 2026-08-26 (ADR-0059). This file was written as a DIAGNOSTIC
+ * second baseline, with the comment "never the gate baseline" and the
+ * reasoning that ROADMAP.md M3 says "the same algorithms in C" and the same
+ * algorithm in C does not hand-roll overflow checks. That reasoning is sound
+ * about what idiomatic C looks like and wrong about what the gate MEASURES.
+ *
+ * The owner decided: THE GATE BASELINE IS THIS FILE. M3's bar is stated as
+ * ARC overhead, and a gate measured against idiomatic C silently charges
+ * DCDart 25-50% on integer-heavy code for arithmetic semantics that have
+ * nothing to do with ARC. The <= 10% bar is therefore measured against
+ * matched semantics, and the trapping-arithmetic cost is published as its own
+ * separate number rather than folded in or dropped.
+ *
+ * `kernel.c` stays, and its number stays published. It is what produces the
+ * separate trapping figure, and the day that figure stops being reported this
+ * choice becomes indistinguishable from having picked an easier baseline.
  */
 
 #ifndef DCBENCH_TRAPPING_H
