@@ -123,13 +123,33 @@ fi
 #                 the outer body's -- which is the inner loop's
 #                 exit block. Peak live is 2 for any n.            2 / 2
 #   lastKept      Alloc 1. Retain 1 is the `Node? keep = null`
-#                 declaration retaining the null. The `keep = node`
-#                 retain and the per-iteration release form a
-#                 redundant pair in one block and ADR-0025's
-#                 elision pass correctly deletes BOTH, which is
-#                 why retain is 1 and not 2. Release 3 = the
-#                 reassignment's release of the previous keep,
-#                 plus one at each of the two returns.             1 / 3 (retain 1)
+#                 declaration retaining the null. Retain 2 is the
+#                 `keep = node` reassignment's retain of the new
+#                 value. Release 4 = the reassignment's release of
+#                 the PREVIOUS keep, the per-iteration release of
+#                 the node local, plus one at each of the two
+#                 returns.                                         2 / 4 (retain 2)
+#
+#                 CHANGED BY ADR-0063, from `retain 1 / release 3`.
+#                 This is an ATTRIBUTED loss of elision, not a
+#                 re-pin to whatever the build now reports.
+#
+#                 Pass 3 used to cancel the `keep = node` retain
+#                 against the per-iteration release, because no
+#                 release OF THAT VALUE appeared between them. The
+#                 reassignment's release of the PREVIOUS keep does
+#                 appear between them, and on the last iteration
+#                 before the loop exits, the previous keep and the
+#                 new one are values whose objects this pass cannot
+#                 tell apart. GAP-0054's rule now invalidates the
+#                 pending retain there, so the pair survives.
+#
+#                 It is +1 retain and +1 release STATICALLY, inside
+#                 a loop body, and it is the price of the fix on
+#                 this target. Nothing else in the file moves --
+#                 the six other functions below are byte-identical,
+#                 which is what says this is the aliasing rule
+#                 firing and not the pass going quiet.
 # ---------------------------------------------------------------------------
 ARC_OUT="$( cd "$CORE_DIR/dc-objdump" && dart bin/dc_objdump.dart --arc "$SRC" 2>&1 )" \
   || { echo "$ARC_OUT" >&2; fail "dc-objdump --arc failed (output above)"; }
@@ -149,14 +169,14 @@ arc_is 'withContinue' 'alloc=1 retain=0 release=2 makeweak=0 weakload=0 dropweak
 arc_is 'withBreak'    'alloc=1 retain=0 release=2 makeweak=0 weakload=0 dropweak=0'
 arc_is 'withReturn'   'alloc=1 retain=0 release=2 makeweak=0 weakload=0 dropweak=0'
 arc_is 'nested'       'alloc=2 retain=0 release=2 makeweak=0 weakload=0 dropweak=0'
-arc_is 'lastKept'     'alloc=1 retain=1 release=3 makeweak=0 weakload=0 dropweak=0'
+arc_is 'lastKept'     'alloc=1 retain=2 release=4 makeweak=0 weakload=0 dropweak=0'
 
 # VACUOUS-PASS GUARD. Every assertion above is an equality against a string,
 # so a `dc-objdump` that printed nothing at all would have been caught by the
 # per-function "printed no counts" check -- but a `dc-objdump` that printed
 # the seven lines and nothing else would not prove the loop bodies were even
 # reached. The TOTAL is asserted separately for that reason.
-arc_is 'TOTAL' 'alloc=8 retain=1 release=13 makeweak=0 weakload=0 dropweak=0'
+arc_is 'TOTAL' 'alloc=8 retain=2 release=14 makeweak=0 weakload=0 dropweak=0'
 
 echo "  ARC ok: every path out of every loop body carries its own release"
 

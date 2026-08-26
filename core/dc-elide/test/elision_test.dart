@@ -433,4 +433,161 @@ void main() {
     expect(owned == borrowed, isFalse);
     expect(owned == const DCFuncPtr([DCFuncParam(DCHeapPointer(DCVoid()), owned: true)], DCInt.u64), isTrue);
   });
+
+  // -------------------------------------------------------------------
+  // ADR-0063 / GAP-0054: a SURVIVING Release of an ALIASING value.
+  //
+  // These four are the mechanism-level statement of the fix. The
+  // end-to-end proof that it was a real miscompilation and not a
+  // theoretical one is tests/conformance/elide-alias/, which runs a
+  // program that returned 198 instead of 110 through `dcc build` at -O2.
+  // -------------------------------------------------------------------
+
+  test('does NOT remove a pair spanning a surviving Release of a DIFFERENT value (GAP-0054)', () {
+    // THE BUG. `%1` and `%2` are distinct DCValues that may denote the same
+    // object -- `%2 = Load %1.field` is exactly how ADR-0017's alias retain
+    // produces one. Pass 3 used to reason "no Release of %2 appears between
+    // the Retain and the Release of %2", which is true and irrelevant: the
+    // Release of %1 in between can drive the SHARED object's refcount to
+    // zero, and cancelling the pair is what removes the +1 that stopped it.
+    final other = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final aliased = DCValue(ValueId(1), const DCHeapPointer(DCVoid()));
+    final fieldPtr = DCValue(ValueId(2), const DCPointer(DCInt.u64));
+    final fieldVal = DCValue(ValueId(3), DCInt.u64);
+
+    final function = DCFunction(
+      linkName: 'test_alias_release',
+      paramTypes: const [DCHeapPointer(DCVoid()), DCHeapPointer(DCVoid())],
+      returnType: DCInt.u64,
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: [other, aliased],
+          body: [
+            Retain(object: aliased),
+            Release(object: other), // may be the SAME object as `aliased`
+            PtrOffset(dest: fieldPtr, base: aliased, offsetBytes: 0),
+            Load(dest: fieldVal, pointer: fieldPtr), // the use-after-free
+            Release(object: aliased),
+            Return(value: fieldVal),
+          ],
+        ),
+      ],
+    );
+
+    final body = elideRedundantRetainReleasePairs(function).blocks.single.body;
+    expect(body.whereType<Retain>().length, 1,
+        reason: 'the Retain protects the object across a Release that may free it');
+    expect(body.whereType<Release>().length, 2, reason: 'both Releases must survive');
+    expect(body.length, function.blocks.single.body.length,
+        reason: 'nothing at all may be removed here');
+  });
+
+  test('the surviving Release rule does NOT depend on a use appearing after it', () {
+    // GAP-0054 recorded that the pass was safe in practice only because
+    // dcc-lower happens to lower the return EXPRESSION before
+    // `_releaseHeapLocals` emits any release -- so there was no use after
+    // the premature free, because there was no use at all. That is a
+    // property of a different file. This block has no use of `aliased`
+    // after the foreign Release, and the pair must STILL survive, because
+    // the invariant the pass now enforces is about refcounts, not uses.
+    final other = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final aliased = DCValue(ValueId(1), const DCHeapPointer(DCVoid()));
+
+    final function = DCFunction(
+      linkName: 'test_alias_release_no_use',
+      paramTypes: const [DCHeapPointer(DCVoid()), DCHeapPointer(DCVoid())],
+      returnType: const DCVoid(),
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: [other, aliased],
+          body: [
+            Retain(object: aliased),
+            Release(object: other),
+            Release(object: aliased),
+            Return(value: null),
+          ],
+        ),
+      ],
+    );
+
+    final body = elideRedundantRetainReleasePairs(function).blocks.single.body;
+    expect(body.whereType<Retain>().length, 1);
+    expect(body.whereType<Release>().length, 2);
+  });
+
+  test('a DELETED Release does not invalidate other pending retains', () {
+    // The other half of the rule, and the reason pass 3 still does
+    // anything at all. An inner pair that cancels never executes, so it
+    // decrements nothing and cannot end any object's life -- an outer
+    // pair enclosing it stays elidable. Getting this wrong in the
+    // conservative direction would turn pass 3 into a near no-op, which
+    // would "pass" every correctness test while costing real performance.
+    final outer = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final inner = DCValue(ValueId(1), const DCHeapPointer(DCVoid()));
+
+    final function = DCFunction(
+      linkName: 'test_nested_pairs',
+      paramTypes: const [DCHeapPointer(DCVoid()), DCHeapPointer(DCVoid())],
+      returnType: const DCVoid(),
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: [outer, inner],
+          body: [
+            Retain(object: outer),
+            Retain(object: inner),
+            Release(object: inner), // cancels -> deleted -> never executes
+            Release(object: outer), // so this pair is still safe to cancel
+            Return(value: null),
+          ],
+        ),
+      ],
+    );
+
+    final body = elideRedundantRetainReleasePairs(function).blocks.single.body;
+    expect(body.whereType<Retain>().length, 0, reason: 'BOTH pairs must still be elided');
+    expect(body.whereType<Release>().length, 0);
+    expect(body, [isA<Return>()]);
+  });
+
+  test('a pair with no Release of anything in between is still elided (no regression)', () {
+    // The case that carries the pass's entire value, restated after the
+    // fix: Alloc, PtrOffset, Load, Store and arithmetic between a Retain
+    // and its Release still cancel, because none of them can decrement a
+    // refcount. If this ever fails, pass 3 has become a no-op.
+    final heapPtr = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final fresh = DCValue(ValueId(1), const DCHeapPointer(DCVoid()));
+    final fieldPtr = DCValue(ValueId(2), const DCPointer(DCInt.u64));
+    final fieldVal = DCValue(ValueId(3), DCInt.u64);
+
+    final function = DCFunction(
+      linkName: 'test_still_elides',
+      paramTypes: const [DCHeapPointer(DCVoid())],
+      returnType: DCInt.u64,
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: [heapPtr],
+          body: [
+            Retain(object: heapPtr),
+            Alloc(dest: fresh, payloadSizeBytes: 8),
+            PtrOffset(dest: fieldPtr, base: heapPtr, offsetBytes: 0),
+            Load(dest: fieldVal, pointer: fieldPtr),
+            Release(object: heapPtr),
+            Return(value: fieldVal),
+          ],
+        ),
+      ],
+    );
+
+    final body = elideRedundantRetainReleasePairs(function).blocks.single.body;
+    expect(body.whereType<Retain>().length, 0, reason: 'pass 3 must still fire here');
+    expect(body.whereType<Release>().length, 0);
+  });
 }

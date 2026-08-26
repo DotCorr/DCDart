@@ -180,16 +180,33 @@ arc_is 'boxBoth'     'alloc=2 retain=0 release=2 makeweak=0 weakload=0 dropweak=
 #                                      return into a local (ADR-0017)
 #   return got.n         Release n, Release b, Release got
 #
-# ADR-0025's pass 3 then deletes the `got` retain/release pair: nothing
-# between them releases `got`, so it is a redundant alias round trip. That
-# elision is why this reads 1/2 and not 2/3, and asserting the ELIDED number
-# is the point -- if the pass ever stops firing here, this line fails.
+# ADR-0025's pass 3 USED TO delete the `got` retain/release pair -- nothing
+# between them releases `got`, so it looked like a redundant alias round trip
+# -- and this line used to assert the elided 1/2.
+#
+# CHANGED BY ADR-0063 to 2/3. This is an ATTRIBUTED loss of elision, not a
+# re-pin to whatever the build now reports, and this function is where
+# GAP-0054 was first noticed.
+#
+# `Release b` sits between the retain and its match, and `Release b` runs
+# `Box$Node_dtor`, which releases `b.value` -- THE VERY OBJECT `got` aliases.
+# So "no release of `got` in between" was true and beside the point: the
+# object could reach zero anyway. It did not actually crash here, and the
+# reason it did not is worth keeping: `got.n` is lowered BEFORE
+# `_releaseHeapLocals` emits anything, so the freed object was never read.
+# That is a property of how dcc-lower orders a return, in a different file,
+# asserted nowhere. `examples/m3-elide-alias` is the same shape with the read
+# moved after the release, and it returned 198 instead of 110.
+#
+# So the +1/+1 here buys the removal of a use-after-free that this target
+# could not have detected, since the counts balanced and the heap returned to
+# baseline either way. Every other function in this file is unchanged.
 #
 # The result is still balanced, which is what makes it correct rather than
-# merely smaller: the Node carries +2 (its Alloc, and the field-store retain)
-# against -2 (the local release, and Box\$Node_dtor's release of the field),
-# and the Box carries +1/-1.
-arc_is 'boxNode'     'alloc=2 retain=1 release=2 makeweak=0 weakload=0 dropweak=0'
+# merely larger: the Node carries +3 (its Alloc, the field-store retain, and
+# the alias retain) against -3 (the local release, Box\$Node_dtor's release of
+# the field, and the alias release), and the Box carries +1/-1.
+arc_is 'boxNode'     'alloc=2 retain=2 release=3 makeweak=0 weakload=0 dropweak=0'
 
 # The synthesized per-instantiation destructor: exactly one Release, for the
 # one heap-typed field the instantiation has.
