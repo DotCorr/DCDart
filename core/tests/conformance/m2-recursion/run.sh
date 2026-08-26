@@ -111,5 +111,5 @@ if [[ $ACTUAL -ne 0 ]]; then
   fail "recursion_test exited $ACTUAL — see core/examples/m2-recursion/main.c for what each code means"
 fi
 
-echo "M2-recursion: PASS — dcc build -> verify-freestanding pass -> $DC_LINK_MODE link -> self-recursive calls (depth 0-60) with a heap object per stack frame, all correct and leak-free"
+echo "M2-recursion: PASS — dcc build -> verify-freestanding pass -> $DC_LINK_MODE link -> self-recursive calls (every depth 0-200, plus 1000/2000/4000) with a heap object per stack frame held simultaneously alive, all correct and dc_heap_live back at zero after each"
 exit 0

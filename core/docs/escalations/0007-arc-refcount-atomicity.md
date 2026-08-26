@@ -227,6 +227,38 @@ iteration, nothing else:
 | DCDart, non-atomic refcounts | 57.5 ms | 1.15× |
 | DCDart, atomic refcounts | 160.6 ms | 3.22× |
 
+### 3.22× IS NOT THE PRICE OF THREAD SAFETY. IT IS THE FLOOR.
+
+Stated first and in these words, because it is the sentence most likely to be lost when someone
+quotes only the headline. **Anyone citing 3.22× as the cost of making DCDart's ARC thread-safe is
+quoting the wrong number.** "Atomic mode" makes each contiguous refcount load/add/store an
+`atomicrmw seq_cst` and changes nothing else. Still non-atomic in that mode:
+
+- `_emitRelease`'s **decide-then-act** sequence (decrement, compare, destruct, check weak, push free
+  slot) — the atomic decrement guarantees exactly one thread sees zero, and then both threads race
+  through everything after it.
+- ADR-0023's **two-counter zombie protocol**, whose invariant spans the strong and weak counts
+  together, which no single-word atomic can establish.
+- The **free-list push** (ADR-0058) — plain loads and stores.
+- **`WeakLoad`'s retain**, which is emitted across a branch and therefore stays non-atomic even in
+  atomic mode. Counted and reported separately by the harness rather than quietly included.
+
+A correct concurrent ARC needs all four. Each is more than an instruction swap, and none of them is
+in the 3.22×.
+
+### And only one of the three consumers has been priced at all
+
+Per §7, refcounts, the allocator and `oscortex_core`'s IPC channels are one concurrency model with
+three consumers. The scoreboard as of 2026-08-26:
+
+| consumer | atomicity | priced? |
+|---|---|---|
+| ARC refcounts | non-atomic | **yes — this section** |
+| The heap (ADR-0058) | non-atomic bump cursors and free-list heads | **no** |
+| `oscortex_core` IPC channels (M20) | SPSC, free-running counters, deliberately no fences | **no** (GAP-0165) |
+
+A real answer pays for all three. One third of the bill is in hand.
+
 **Read this as an upper bound, not a prediction.** `arc-churn` is deliberately unamortised — it does
 nothing but allocate and release, so the refcount update is a large fraction of the work. Real code
 does something between its retains. The honest statement is that atomicity costs **up to** 2.79× on
