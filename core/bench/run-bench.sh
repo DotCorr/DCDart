@@ -237,8 +237,28 @@ print_header | tee "$OUT_DIR/report.txt"
 # Shared timing driver, built once. Identical object linked into every binary.
 # ---------------------------------------------------------------------------
 
+# TWO DRIVER OBJECTS, identical source, differing by one -D.
+#
+# The DCDart side checks `dc_heap_live` (ADR-0058) after the timed region and
+# REFUSES the run if any object is still live. That check is not optional: a
+# leaking kernel never runs the free path, so it is FASTER than a correct one
+# and the ratio comes out better. Without it, leaking is the single easiest
+# way to accidentally publish a flattering M3 number, and nothing else in this
+# harness would notice -- the checksum still matches and the run still
+# completes.
+#
+# The symbol exists only in objects dcc emits, so the C baselines must not
+# reference it. A weak extern was tried first and does not work here: on
+# Mach-O a plain `weak` extern is still a hard link requirement and the C
+# baseline fails with "Undefined symbols", and `weak_import` on a variable
+# behaves the same once its address is taken. Compiling the driver twice is
+# portable, needs no attribute, and cannot silently degrade into a check that
+# does not run.
 DRIVER_OBJ="$OUT_DIR/build/bench_main.o"
+DRIVER_OBJ_DC="$OUT_DIR/build/bench_main_dc.o"
 clang $DRIVER_FLAGS "$DRIVER_SRC" -o "$DRIVER_OBJ" || fail "could not build $DRIVER_SRC"
+clang $DRIVER_FLAGS -DDCBENCH_HEAP_CHECK=1 "$DRIVER_SRC" -o "$DRIVER_OBJ_DC" \
+    || fail "could not build $DRIVER_SRC with -DDCBENCH_HEAP_CHECK"
 
 # ---------------------------------------------------------------------------
 # Benchmark discovery
@@ -389,7 +409,20 @@ for id in $BENCHES; do
             note "$id: DCDart build failed in $mode mode -- see $obd/dcbuild.$mode.err"
             DC_OK=0; break
         fi
-        clang -o "$obd/dcdart.$mode" "$DRIVER_OBJ" "$obd/bench.$mode.o" || { DC_OK=0; break; }
+        # WHICH DRIVER depends on whether this kernel allocates at all. The
+        # heap globals are emitted only for modules containing a heap
+        # instruction (ADR-0058's needsHeap predicate), so a zero-ARC
+        # benchmark like `fib` or `collatz` has no `dc_heap_live` to link
+        # against and must take the plain driver. Detected from the object
+        # rather than assumed from the benchmark's name or its ARC-site count:
+        # those would be two derivations of one fact and could drift.
+        dcdrv="$DRIVER_OBJ"
+        if command -v llvm-nm >/dev/null 2>&1; then
+            if llvm-nm "$obd/bench.$mode.o" 2>/dev/null | grep -qE "[[:space:]]dc_heap_live$"; then
+                dcdrv="$DRIVER_OBJ_DC"
+            fi
+        fi
+        clang -o "$obd/dcdart.$mode" "$dcdrv" "$obd/bench.$mode.o" || { DC_OK=0; break; }
     done
     if [ "$DC_OK" = 0 ]; then record_failed "$id" "$BENCH_SUITE"; FATAL=1; continue; fi
 

@@ -36,6 +36,25 @@
 
 extern uint64_t benchKernel(uint64_t arg);
 
+/* LEAK CHECK. `dc_heap_live` is DCDart's live-object count (ADR-0058); it is
+ * incremented by every allocation and decremented when a block returns to a
+ * free list. It exists only in objects emitted by dcc, so it is declared WEAK
+ * and the check is skipped when this driver is linked into a C baseline,
+ * where the symbol is absent and its address is null.
+ *
+ * WHY THIS IS NOT OPTIONAL. A leaking DCDart kernel does LESS WORK than a
+ * correct one -- it never runs the free path -- so a leak makes the benchmark
+ * FASTER and the ratio better. Without this check, the single most likely way
+ * to accidentally publish a flattering M3 number is to leak, and nothing in
+ * the harness would have noticed: the checksum still matches, the run still
+ * completes, and the number is simply wrong in DCDart's favour.
+ *
+ * Checked AFTER the timed region so it costs nothing in the measurement, and
+ * reported as a line the runner can refuse on rather than as a silent exit. */
+#if DCBENCH_HEAP_CHECK
+extern uint64_t dc_heap_live;
+#endif
+
 #ifdef CLOCK_MONOTONIC_RAW
 #define BENCH_CLOCK CLOCK_MONOTONIC_RAW
 #define BENCH_CLOCK_NAME "CLOCK_MONOTONIC_RAW"
@@ -84,6 +103,23 @@ int main(int argc, char **argv) {
     }
 
     printf("CHECKSUM %llu\n", (unsigned long long)checksum);
+
+#if DCBENCH_HEAP_CHECK
+    {
+        printf("HEAPLIVE %llu\n", (unsigned long long)dc_heap_live);
+        if (dc_heap_live != 0) {
+            fprintf(stderr,
+                    "bench_main: LEAK -- %llu heap objects still live after "
+                    "the kernel returned. A leaking kernel skips the free path "
+                    "and is therefore FASTER than a correct one, so this "
+                    "measurement would flatter DCDart. Refusing.\n",
+                    (unsigned long long)dc_heap_live);
+            return 3;
+        }
+    }
+#else
+    printf("HEAPLIVE n/a\n");
+#endif
     printf("CLOCK %s\n", BENCH_CLOCK_NAME);
     return 0;
 }
