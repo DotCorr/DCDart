@@ -208,3 +208,61 @@ Concretely, for whoever holds this at freeze time: the question is not *"should 
 atomic?"* It is *"what is DCDart's concurrency model, and what do refcounts, the allocator and any
 shared-memory channel each have to guarantee under it?"* Answering the narrow question first and
 deriving the others from it is how the three end up disagreeing.
+
+---
+
+## 8. §5's requested measurement, taken
+
+§5 recommended that this document be reopened with M3's number in hand rather than deciding
+atomicity speculatively. The measurement now exists (`bench/`), so here it is.
+
+**Cost of atomic refcounts on a workload that actually executes ARC: 2.79×.**
+
+`arc-churn` allocates and releases one short-lived heap object per iteration — one `Release` per
+iteration, nothing else:
+
+| configuration | median | vs C |
+|---|---|---|
+| C baseline (`malloc`/`free`) | 49.9 ms | 1.00× |
+| DCDart, non-atomic refcounts | 57.5 ms | 1.15× |
+| DCDart, atomic refcounts | 160.6 ms | 3.22× |
+
+**Read this as an upper bound, not a prediction.** `arc-churn` is deliberately unamortised — it does
+nothing but allocate and release, so the refcount update is a large fraction of the work. Real code
+does something between its retains. The honest statement is that atomicity costs **up to** 2.79× on
+the ARC operations themselves, and what that does to a program depends entirely on how much of its
+time is ARC.
+
+**Three things that make this number smaller than the true cost of "make ARC atomic", and they are
+the reason this section does not close the escalation:**
+
+1. **It prices the instruction, not the correctness.** The rewrite makes each contiguous
+   load/add/store an `atomicrmw seq_cst`. It does **not** touch `_emitRelease`'s decide-then-act
+   sequence, ADR-0023's two-counter zombie protocol, or the free-list push. A concurrency-correct
+   ARC needs all of those, and each is more than an instruction swap.
+2. **`WeakLoad`'s retain is emitted across a branch** and therefore stays non-atomic even in atomic
+   mode. Counted and reported separately by the harness rather than quietly included.
+3. **The allocator is still non-atomic** (ADR-0058). Per §7 above, atomic refcounts over a
+   non-atomic free list is not a partial fix, so any real answer pays for both.
+
+**Verified, not assumed: atomic mode does not violate `CLAUDE.md` rule 1.** `bare-x86_64` emits
+`lock`-prefixed RMW, `bare-aarch64` an `ldaxr`/`stlxr` loop, `macos-arm64` `ldaddal`;
+`verify-freestanding.sh` passes on all three and no `__atomic_*` libcall appears. The cost is
+instructions, not a runtime dependency — which removes the one objection that would have made this a
+non-decision.
+
+### A separate cost the gate will include, which nobody had priced
+
+The harness's own self-test came out at **1.27× C on `fib`** — a benchmark with no heap and no ARC,
+which should have been 1.0×. Chased rather than reported: DCDart's **trapping arithmetic**
+(`llvm.uadd.with.overflow` plus a branch to `llvm.trap`) blocks the accumulator-recursion→loop
+transform LLVM gives the C version at `-O2`. Compiling the same C source with
+`__builtin_add_overflow`/`__builtin_trap` reproduces DCDart's machine-code shape exactly, and against
+*that* baseline the residual is **1.000×** — so the harness's flags, linkage and instrument are
+right, and 100% of the gap is language semantics.
+
+**That means M3's number will include roughly 25–50% overhead on integer-heavy code that has nothing
+to do with ARC.** The gate is stated as "ARC overhead vs C". Trapping arithmetic is not ARC. Whoever
+holds the gate has to decide whether the ≤10% target is against C-with-C-semantics or
+C-with-DCDart-semantics, and that should be a decision taken deliberately rather than a surprise
+discovered while reading a failing gate.

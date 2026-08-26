@@ -2014,3 +2014,39 @@ realistic scale, and no test in it would fail if the allocator were far worse th
 **Next step:** close spec §12 decision 2 and implement a real allocator (ADR-0058). Removing the
 64-object and 48-byte limits is the allocator's job; removing the loop-body restriction was a
 lowering job (per-iteration release policy) and is **done** — see the third row of the table above.
+
+
+---
+
+## GAP-0051b — M3's benchmark suite: 4 of 5 now writable, 0 of 5 written
+
+**Domain:** bench, dcc-lower (M3)
+**Status:** OPEN — this is now the M3 critical path, and it is authoring work rather than compiler work
+
+With the heap (ADR-0058), generic classes (ADR-0054), loop-body heap locals and runtime-sized
+allocation all landed on 2026-08-26, the reason M3 cannot be evaluated changed. It is no longer that
+the language cannot express the benchmarks. It is that **nobody has written them.**
+
+| benchmark | writable | what unblocked it, or what still blocks it |
+|---|---|---|
+| tree/graph traversal | **yes** | ADR-0058 — needed >64 live objects and allocation in a loop |
+| hashmap-heavy | **yes** | ADR-0054 generic classes, plus the heap |
+| JSON parser | **yes** | ADR-0058's `Heap.allocate` — a program writes its own `StrBuf`, as `tests/conformance/rawheap/` does (GAP-0045) |
+| string-processing pass | **yes** | same |
+| closure-heavy functional | **NO** | **GAP-0052** — DC-IR has no indirect call and no function-pointer type, so a closure passed, returned or stored is inexpressible. ADR-0057's non-capturing closures hoist to symbols, which is not what a functional workload is made of |
+
+**A claim made and withdrawn, recorded because the reasoning was the error, not the fact.** A status
+report on 2026-08-26 said all five were writable, on the grounds that the last *heap* blocker had
+cleared. That confused "the allocator no longer blocks anything" with "nothing blocks anything":
+`closure-heavy` was never blocked on memory, it is blocked on a missing call instruction, and no
+amount of allocator work reaches it. The general shape — a blocker clearing, and its clearing being
+read as the last blocker clearing — is the same error as GAP-0050's "one of five is writable."
+
+**Cost of the workaround:** none available. Four benchmarks produce a geometric mean over four
+benchmarks, and `ROADMAP.md` M3's exit criterion is the geometric mean over the five it names. The
+harness enforces this — it prints `*** NO GATE NUMBER IS PRODUCED BY THIS RUN ***` and exits 3 unless
+all five ids are present, specifically so a partial suite cannot be quoted as a gate result.
+
+**Next step:** write `tree-traversal` first — it is the shortest path to the first real M3 data point
+and, with `hashmap`, carries most of the ARC the gate is measuring. `closure-heavy` needs GAP-0052
+closed first, which is an `IndirectCall` instruction and a function-pointer `DCType`, not a lowering.
