@@ -106,13 +106,14 @@ import 'package:dc_ir/dc_ir.dart';
 /// would have aimed at the wrong constraint.
 class ElisionStats {
   int elided = 0;
+  int crossBlockElided = 0;
   int blockLimited = 0;
   int opaqueLimited = 0;
   int releaseLimited = 0;
 
   @override
   String toString() =>
-      'elided=$elided blockLimited=$blockLimited '
+      'elided=$elided crossBlock=$crossBlockElided blockLimited=$blockLimited '
       'opaqueLimited=$opaqueLimited releaseLimited=$releaseLimited';
 }
 
@@ -120,12 +121,207 @@ DCFunction elideRedundantRetainReleasePairs(
   DCFunction function, [
   ElisionStats? stats,
 ]) {
-  return DCFunction(
+  final perBlock = DCFunction(
     linkName: function.linkName,
     paramTypes: function.paramTypes,
     returnType: function.returnType,
     mode: function.mode,
     blocks: function.blocks.map((b) => _elideBlock(b, stats)).toList(),
+  );
+  return _elideCrossBlock(perBlock, stats);
+}
+
+/// Does [instruction] make it unsafe to carry a pending retain past it?
+///
+/// Exactly the file header's rules 2-4, in one place so the cross-block pass
+/// and the per-block pass cannot drift apart on what "opaque" means. The ONLY
+/// three ways a refcount can go down are an executed `Release`, an opaque
+/// callee, and a weak op.
+bool _isOpaqueForPendingRetain(DCInstruction instruction) =>
+    instruction is Call ||
+    instruction is IndirectCall ||
+    instruction is MakeWeak ||
+    instruction is WeakLoad ||
+    instruction is DropWeak ||
+    instruction is Release;
+
+/// Cross-block redundant-pair removal, restricted to a shape that can be
+/// checked without a full dataflow framework (GAP-0062).
+///
+/// THE PROBLEM IT EXISTS FOR. The per-block pass above drops every pending
+/// retain at a block boundary, and **every nullable heap field read ends its
+/// block at the null test** -- so on linked structures (a tree, a sibling
+/// chain, a parser's node graph) it sees a program chopped into pieces
+/// smaller than the pairs it is matching. Measured before this pass:
+/// `json` 19 retains lowered, 19 survive.
+///
+/// THE SAFETY ARGUMENT, which is the whole of this function. A `Retain` in
+/// block A and a `Release` in block Z may be cancelled only if BOTH execute
+/// exactly once per call and nothing between them can decrement the count.
+/// That is established here by four conditions, each cheap to check and each
+/// refusing rather than approximating:
+///
+///   1. NO BACK EDGES. Every branch target has a strictly greater index than
+///      its source, so no instruction executes twice. Without this a retain
+///      inside a loop pairs with one release outside it -- N retains, one
+///      release -- and cancelling them would under-release.
+///   2. EXACTLY ONE `Return` BLOCK, called Z. All paths therefore end at Z,
+///      so a `Release` in Z executes on every path.
+///   3. A DOMINATES Z. The retain's block is on every path to Z, so the
+///      retain also executes on every path. Condition 2 alone is NOT enough:
+///      a retain in a conditional arm with a release in the merge block would
+///      execute zero-or-one times against a release that always executes, and
+///      cancelling that pair deletes a release the other path needed.
+///   4. NOTHING OPAQUE IN BETWEEN, over a deliberate SUPERSET of the blocks
+///      on any A->Z path: every block whose index lies between them, plus the
+///      tail of A after the retain and the head of Z before the release. A
+///      superset can only refuse a safe elision, never permit an unsafe one.
+///
+/// A function failing any of 1-3 is left entirely to the per-block pass.
+DCFunction _elideCrossBlock(DCFunction function, ElisionStats? stats) {
+  final blocks = function.blocks;
+  if (blocks.length < 2) return function;
+
+  final indexOfBlock = <int, int>{};
+  for (var i = 0; i < blocks.length; i++) {
+    indexOfBlock[blocks[i].id.index] = i;
+  }
+
+  // Condition 1: no back edges, and every target must exist.
+  final successors = List<List<int>>.generate(blocks.length, (_) => <int>[]);
+  for (var i = 0; i < blocks.length; i++) {
+    final body = blocks[i].body;
+    if (body.isEmpty) continue;
+    final term = body.last;
+    final targets = <int>[];
+    if (term is Branch) {
+      targets.add(term.target.index);
+    } else if (term is CondBranch) {
+      targets..add(term.trueTarget.index)..add(term.falseTarget.index);
+    }
+    for (final t in targets) {
+      final ti = indexOfBlock[t];
+      if (ti == null || ti <= i) return function; // back edge or unknown
+      successors[i].add(ti);
+    }
+  }
+
+  // Condition 2: exactly one block containing a Return.
+  var exitIndex = -1;
+  for (var i = 0; i < blocks.length; i++) {
+    if (blocks[i].body.any((x) => x is Return)) {
+      if (exitIndex != -1) return function; // more than one exit
+      exitIndex = i;
+    }
+  }
+  if (exitIndex < 0) return function;
+
+  // Condition 3: dominators, over a DAG already in topological order, so one
+  // forward sweep suffices -- no fixpoint iteration needed.
+  final preds = List<List<int>>.generate(blocks.length, (_) => <int>[]);
+  for (var i = 0; i < blocks.length; i++) {
+    for (final sIdx in successors[i]) {
+      preds[sIdx].add(i);
+    }
+  }
+  final dom = List<Set<int>>.generate(blocks.length, (_) => <int>{});
+  dom[0] = {0};
+  for (var i = 1; i < blocks.length; i++) {
+    if (preds[i].isEmpty) {
+      dom[i] = {i}; // unreachable; dominates only itself
+      continue;
+    }
+    Set<int>? acc;
+    for (final p in preds[i]) {
+      acc = acc == null ? Set<int>.from(dom[p]) : acc.intersection(dom[p]);
+    }
+    dom[i] = (acc ?? <int>{})..add(i);
+  }
+  final domOfExit = dom[exitIndex];
+
+  // Collect candidate pairs: a Retain in a block dominating the exit, and a
+  // Release of the same value in the exit block.
+  final removeFrom = <int, Set<int>>{}; // block index -> instruction indices
+  final exitBody = blocks[exitIndex].body;
+
+  for (var a = 0; a < blocks.length; a++) {
+    if (a == exitIndex) continue; // same-block case is the per-block pass's
+    if (!domOfExit.contains(a)) continue;
+    final aBody = blocks[a].body;
+    for (var ai = 0; ai < aBody.length; ai++) {
+      final r = aBody[ai];
+      if (r is! Retain) continue;
+      final vid = r.object.id.index;
+
+      // The matching Release in the exit block: the FIRST one on this value.
+      var zi = -1;
+      for (var k = 0; k < exitBody.length; k++) {
+        final x = exitBody[k];
+        if (x is Release && x.object.id.index == vid) {
+          zi = k;
+          break;
+        }
+      }
+      if (zi < 0) continue;
+
+      // Condition 4, over the superset.
+      var safe = true;
+      for (var k = ai + 1; k < aBody.length && safe; k++) {
+        if (_isOpaqueForPendingRetain(aBody[k])) safe = false;
+      }
+      for (var b = a + 1; b < exitIndex && safe; b++) {
+        for (final x in blocks[b].body) {
+          if (_isOpaqueForPendingRetain(x)) {
+            safe = false;
+            break;
+          }
+        }
+      }
+      for (var k = 0; k < zi && safe; k++) {
+        if (_isOpaqueForPendingRetain(exitBody[k])) safe = false;
+      }
+      // A second Retain on the same value anywhere between would make the
+      // pairing ambiguous; refuse rather than guess which release matches.
+      if (safe) {
+        for (var b = a; b <= exitIndex && safe; b++) {
+          final body = blocks[b].body;
+          for (var k = 0; k < body.length; k++) {
+            if (b == a && k <= ai) continue;
+            final x = body[k];
+            if (x is Retain && x.object.id.index == vid) safe = false;
+          }
+        }
+      }
+      if (!safe) continue;
+
+      // Do not double-claim a Release already matched by an earlier retain.
+      final exitClaimed = removeFrom[exitIndex] ?? <int>{};
+      if (exitClaimed.contains(zi)) continue;
+
+      (removeFrom[a] ??= <int>{}).add(ai);
+      (removeFrom[exitIndex] ??= <int>{}).add(zi);
+      stats?.crossBlockElided += 1;
+      break; // one pair per retain
+    }
+  }
+
+  if (removeFrom.isEmpty) return function;
+
+  return DCFunction(
+    linkName: function.linkName,
+    paramTypes: function.paramTypes,
+    returnType: function.returnType,
+    mode: function.mode,
+    blocks: List<DCBasicBlock>.generate(blocks.length, (i) {
+      final drop = removeFrom[i];
+      if (drop == null) return blocks[i];
+      final body = <DCInstruction>[];
+      for (var k = 0; k < blocks[i].body.length; k++) {
+        if (drop.contains(k)) continue;
+        body.add(blocks[i].body[k]);
+      }
+      return DCBasicBlock(id: blocks[i].id, params: blocks[i].params, body: body);
+    }),
   );
 }
 

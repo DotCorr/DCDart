@@ -2441,6 +2441,51 @@ built on it.
 in one block and re-attempted is counted once per attempt, so the totals exceed the retain count and
 should be read as proportions rather than as a census.
 
+### RESULT: the cross-block extension was built, is correct, and recovers ZERO on real programs
+
+Built and landed (`_elideCrossBlock`). Verified safe — 15/15 dc-elide unit tests, 41/41 conformance —
+and it demonstrably fires: the canonical null-test shape (`final t = n.next; if (t != null) {...}
+return total;`) goes from 1 retain to 0.
+
+**On `json`, `tree-traversal` and `m2-list` it removes nothing at all.** Two distinct reasons, both
+measured rather than reasoned:
+
+| function | retains | returns | back edges | why it does not elide |
+|---|---|---|---|---|
+| `json/parseNumber` | 6 | 3 | 1 | multi-return **and** loop — fails conditions 1 and 2 |
+| `json/parseString` | 4 | 2 | 1 | same |
+| `json/parseArray` | 7 | 2 | 2 | same |
+| **`json/walk`** | **2** | **1** | **0** | **qualifies, then blocked by a `Call`** |
+| `tree-traversal/build` | 4 | 2 | 0 | multi-return |
+| **`tree-traversal/walk`** | **2** | **1** | **0** | **qualifies, then blocked by a `Call`** |
+
+**The second row type is the important one.** `walk` in both benchmarks satisfies the structural
+conditions — one return, no loops — so the block boundary is no longer what stops it. What stops it
+is `walk(f)` sitting between the retain and the release. **That is the `blockLimited → opaqueLimited`
+conversion this entry warned about, now observed instead of predicted.**
+
+So the conclusion recorded above is confirmed in the sharpest possible way:
+
+> **Interprocedural analysis is not ruled out; it was unreached.** It is now reached, and it is the
+> binding constraint on the only functions whose structure the cross-block pass can handle.
+
+**What each fix is actually worth, measured:**
+
+- **Cross-block/null-test extension: zero on current programs.** Correct engineering, verified, and
+  it bought nothing. Kept, because it is the instrument that produced this answer and because the
+  functions it handles will appear as code is written — but it must not be quoted as a gate
+  improvement, because it is not one.
+- **Post-dominance (handling loops and multiple returns): unmeasured.** It would let the pass reach
+  `parseNumber`/`parseString`/`parseArray`, which hold 17 of `json`'s 19 retains — but those are also
+  full of `peek(p)` calls, so it would very likely surface the same `Call` wall one layer down.
+- **Interprocedural analysis, or an ownership convention saying what a callee may do with a borrowed
+  reference: now the load-bearing one.** The ARC ownership carrier the owner ratified is the vehicle
+  for the second option.
+
+**Cost of the workaround:** none. The gate's dominant term is now attributed to a specific, named
+constraint rather than to "ARC is expensive", and the two cheaper fixes have been priced at zero and
+probably-zero respectively — which is worth more than either would have been if it had worked.
+
 **Next step:** extend pass 3 across the null test — a retain and its release separated only by a
 branch on the retained value's nullness is the canonical shape and is worth handling before any
 general cross-block analysis.
