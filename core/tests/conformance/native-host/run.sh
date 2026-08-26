@@ -124,7 +124,7 @@ fi
 # ---------------------------------------------------------------------------
 # Step 4 -- run the native binary. Exit code 0, and stdout must contain the
 # independently-known values (perfect numbers below 10000; pi(10000); the
-# ARC arena back at its 64-slot baseline). Checking stdout as well as the
+# ARC heap back at a zero live-object count). Checking stdout as well as the
 # exit code means a main() that silently returned 0 without doing the work
 # cannot pass this.
 # ---------------------------------------------------------------------------
@@ -148,8 +148,8 @@ EXPECTED_LINES=(
   "triangleU16(300)                   = 44850"
   "gcdU8(252, 105)                    = 21"
   "sumOfSquares matches the closed form for every n in 0..200"
-  "2000 further allocating calls, arena at baseline every time"
-  "ARC arena after all calls: dc_free_top = 64 (baseline 64)"
+  "2000 further allocating calls, heap at baseline every time"
+  "ARC heap after all calls: dc_heap_live = 0 (baseline 0)"
   "ALL CHECKS PASSED"
 )
 for line in "${EXPECTED_LINES[@]}"; do
@@ -172,5 +172,5 @@ fi
 # ---------------------------------------------------------------------------
 # Step 5 -- PASS.
 # ---------------------------------------------------------------------------
-echo "NATIVE-HOST: PASS -- dcc build --mode bare --target host on $HOST_OS/$HOST_ARCH -> freestanding-clean native object -> plain 'clang -o bin main.c native.o' (no -nostdlib, no -ffreestanding, no _start stub, no host gate) -> real execution with libc: perfect numbers below 10000 = {6,28,496,8128}, pi(10000) = 1229, sum-of-squares matches n(n+1)(2n+1)/6 over 0..200, gcd/lcm/digitSum/modPow32/triangleU16/gcdU8 correct at u64/u32/u16/u8, ARC arena back at its 64-slot baseline after 2000+ allocating calls"
+echo "NATIVE-HOST: PASS -- dcc build --mode bare --target host on $HOST_OS/$HOST_ARCH -> freestanding-clean native object -> plain 'clang -o bin main.c native.o' (no -nostdlib, no -ffreestanding, no _start stub, no host gate) -> real execution with libc: perfect numbers below 10000 = {6,28,496,8128}, pi(10000) = 1229, sum-of-squares matches n(n+1)(2n+1)/6 over 0..200, gcd/lcm/digitSum/modPow32/triangleU16/gcdU8 correct at u64/u32/u16/u8, ARC heap live-object count back at zero after 2000+ allocating calls"
 exit 0

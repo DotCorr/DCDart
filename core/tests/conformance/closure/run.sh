@@ -29,8 +29,9 @@
 #                 barrier). It is asserted here while it still holds, so that
 #                 a later change which quietly gives it up cannot pass.
 #
-#   BEHAVIOUR     Ordinary values, plus 500 leak-free heap cycles -- well past
-#                 the 64-slot arena, so a single leaked slot per call could not
+#   BEHAVIOUR     Ordinary values, plus 500 leak-free heap cycles, with
+#                 `dc_heap_live` (ADR-0058) checked back at zero after every
+#                 call, so a single leaked object per call could not
 #                 survive.
 #
 # Usage:
@@ -181,7 +182,7 @@ dc_link "$BIN" "$EXAMPLE_DIR/main.c" "$OBJ" "$EXAMPLE_DIR/closure.dart"
 # ---------------------------------------------------------------------------
 # Step 3 — run. main.c has no stdio (the Linux path links -nostdlib), so the
 # exit code is the report:
-#   1 arena not at baseline before any call
+#   1 heap not at baseline before any call
 #   2 twiceSum (named local function, two call sites)
 #   3 addThree (function expression bound to a final local)
 #   4 clampTo  (block body with a branch inside the hoisted function)

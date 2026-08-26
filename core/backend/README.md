@@ -7,13 +7,18 @@ back edges) — every conformance harness in `core/tests/conformance/` (fourteen
 unqualified PASS under WSL/Ubuntu (real build → real freestanding link → real run on the actual
 `x86_64-unknown-none-elf` target).
 
-**M2 (ADR-0015/0016):** `Alloc`/`Retain`/`Release` now have real codegen against a fixed internal
-arena (`@dc_arena`, `@dc_free_list`, `@dc_free_top` — module-level globals, emitted only when a
-function actually allocates). `PtrOffset` (`base + offsetBytes` as a raw pointer, works on both
+**M2 (ADR-0015/0016), superseded for the allocator by ADR-0058:** `Alloc`/`Retain`/`Release` have
+real codegen against a module-level heap. ADR-0015's fixed `[64 x [64 x i8]]` arena
+(`@dc_arena`/`@dc_free_list`/`@dc_free_top`) is **gone**; ADR-0058 replaced it with a segregated
+size-class heap — `@dc_heap`, `@dc_heap_bump`, `@dc_heap_free`, plus `@dc_heap_live`, all
+module-level globals emitted only when a function actually allocates. `@dc_heap_live` is the
+live-object count that every leak harness reads: `dc_heap_live == 0` means nothing is live, at any
+scale and in every size class. `PtrOffset` (`base + offsetBytes` as a raw pointer, works on both
 `DCPointer` and `DCHeapPointer`) supports heap-object field access. `DCHeapPointer` now maps to `ptr`
 in `_llvmType` (previously deliberately threw, to force ARC codegen to exist first — it does now).
-This arena is explicitly **not** the real `Allocator` (spec §12 open decision 2,
-`docs/escalations/0002-allocator-threading.md`) — see the ADRs for what it is instead and why.
+This heap is explicitly **not** the full `Allocator` story (spec §12 open decision 2,
+`docs/escalations/0002-allocator-threading.md`; ADR-0058 splits that question in two) — see the ADRs
+for what it is instead and why.
 
 **M2 (ADR-0018):** `Call` now has real codegen — a plain LLVM `call` (or `call void` when the callee
 returns nothing), no vtable/dispatch involved. Every function is emitted as a top-level `define` in

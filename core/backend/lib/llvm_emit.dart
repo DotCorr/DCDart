@@ -55,13 +55,90 @@
 
 import 'package:dc_ir/dc_ir.dart';
 
-// M2 ARC arena constants (docs/decisions/0015-m2-minimal-arc-arena.md).
-// Fixed slot size regardless of payload -- a deliberate simplification for
-// this first proof, not the real Allocator (spec §12 open decision 2,
-// docs/escalations/0002-allocator-threading.md).
-const int _arenaSlots = 64;
-const int _slotSizeBytes = 64;
+// ---------------------------------------------------------------------------
+// THE HEAP (docs/decisions/0058-segregated-size-class-heap.md).
+//
+// Replaces ADR-0015's fixed `[64 x [64 x i8]]` arena, which was labelled at
+// the time as a first proof rather than an allocator and had three limits
+// that together made every M3 benchmark unwritable (GAP-0050): 64 live
+// objects, 48 bytes of fields, and a hard refusal to allocate inside a loop.
+//
+// SEGREGATED SIZE CLASSES. The heap is `_heapClassCount` equal-sized regions,
+// one per size class. A block's class is therefore a function of its ADDRESS
+// -- `(addr - heapBase) / regionBytes` -- which is the single design choice
+// everything else falls out of:
+//
+//   * The 16-byte object header (spec §3.1: u32 strong, u32 weak, ptr cls) is
+//     UNCHANGED. A conventional allocator stores the size class in a header
+//     word; doing that here would have meant editing spec §3.1, which is the
+//     memory model and `CLAUDE.md` rule 4. Deriving the class from the address
+//     costs one shift on free and touches no spec text.
+//   * `Alloc`'s class is computed at COMPILE time, because
+//     `Alloc.payloadSizeBytes` is a compile-time constant. Allocation does no
+//     class arithmetic at all -- it is a free-list pop, or a bump.
+//
+// Free lists are INTRUSIVE: a free block stores its successor in its own
+// first 8 bytes, over the dead header. That is why the smallest class is 32
+// and not 16 -- a free block must have room for a pointer.
+/// Size classes are POWERS OF TWO from 32 bytes up to whichever is smaller:
+/// [_maxSizeClassBytes], or the region size itself. They are derived from the
+/// region rather than fixed, because a fixed list forces one of two bad
+/// outcomes: a list sized for a hosted benchmark makes every freestanding
+/// region carry classes it can never satisfy, and a list sized for a kernel
+/// caps a hosted string builder at a few kilobytes.
+///
+/// 32 is the floor because a free block stores its successor in its own first
+/// 8 bytes (intrusive list) on top of the 16-byte header.
+const int _minSizeClassBytes = 32;
+const int _maxSizeClassBytes = 1 << 20; // 1 MiB
+
+List<int> _sizeClassesFor(int regionBytes) {
+  final cap = regionBytes < _maxSizeClassBytes ? regionBytes : _maxSizeClassBytes;
+  final classes = <int>[];
+  for (var size = _minSizeClassBytes; size <= cap; size <<= 1) {
+    classes.add(size);
+  }
+  return classes;
+}
+
 const int _headerSizeBytes = 16; // u32 strong + u32 weak + ptr cls, spec §3.1
+
+/// Bytes per size-class region. Total heap is this times the class count.
+/// Must be a power of two (the class-from-address division is emitted as a
+/// shift) and at least [_minSizeClassBytes].
+///
+/// TWO DEFAULTS, because the right answer differs by orders of magnitude. On
+/// a hosted target `.bss` is backed lazily by the OS: untouched heap costs
+/// address space and nothing else, and a benchmark wants room. On a
+/// FREESTANDING target there is no OS to be lazy -- `oscortex_core` maps its
+/// image with 2 MiB pages and every byte of `.bss` is a byte it must have
+/// physical frames for at boot. A hosted-sized default would silently grow a
+/// kernel image by tens of megabytes, which is the kind of downstream damage
+/// a compiler must not do by default. Both are overridable with
+/// `--heap-region-bytes`.
+const int _defaultHeapRegionBytes = 1 << 21; // 2 MiB per class
+const int _defaultFreestandingHeapRegionBytes = 1 << 16; // 64 KiB per class
+
+int _maxPayloadFor(List<int> classes) => classes.last - _headerSizeBytes;
+
+int _shiftFor(int powerOfTwo) {
+  var shift = 0;
+  var value = powerOfTwo;
+  while (value > 1) {
+    value >>= 1;
+    shift++;
+  }
+  return shift;
+}
+
+/// The size class index for a payload, or -1 if it does not fit.
+int _classForPayload(int payloadBytes, List<int> classes) {
+  final total = payloadBytes + _headerSizeBytes;
+  for (var i = 0; i < classes.length; i++) {
+    if (classes[i] >= total) return i;
+  }
+  return -1;
+}
 
 /// Emits LLVM IR text for [module]. [targetTriple] defaults to the M0
 /// target from m0-target.md §1; callers building for the host instead (see
@@ -72,15 +149,58 @@ String emitModule(
   DCModule module, {
   String? targetTriple = 'x86_64-unknown-none-elf',
   bool noRedZone = false,
+  int? heapRegionBytes,
+  bool freestanding = false,
 }) {
+  heapRegionBytes ??= freestanding
+      ? _defaultFreestandingHeapRegionBytes
+      : _defaultHeapRegionBytes;
+  // Checked rather than assumed: the class-from-address division on the free
+  // path is emitted as a SHIFT, which is only equivalent to a division when
+  // the region size is a power of two. A non-power-of-two would compute the
+  // wrong class and push a block onto the wrong free list -- a later Alloc of
+  // one size handing back a block of another, which is silent heap corruption
+  // rather than a crash. Refuse instead.
+  if (heapRegionBytes & (heapRegionBytes - 1) != 0) {
+    throw BackendError(
+      'heapRegionBytes must be a power of two (got $heapRegionBytes): the '
+      'size-class-from-address computation is emitted as a shift, and a '
+      'non-power-of-two would silently push freed blocks onto the wrong '
+      'free list — see docs/decisions/0058-segregated-size-class-heap.md',
+    );
+  }
+  if (heapRegionBytes < _minSizeClassBytes) {
+    throw BackendError(
+      'heapRegionBytes ($heapRegionBytes) is smaller than the smallest size '
+      'class ($_minSizeClassBytes): no allocation could ever succeed.',
+    );
+  }
+  final regionBytes = heapRegionBytes;
+  final sizeClasses = _sizeClassesFor(regionBytes);
   final declaredIntrinsics = <String>{};
   final functionBuffers = <String>[];
   for (final function in module.functions) {
-    functionBuffers.add(_emitFunction(function, declaredIntrinsics));
+    functionBuffers.add(_emitFunction(function, declaredIntrinsics, regionBytes));
   }
 
-  final needsArena = module.functions.any(
-    (f) => f.blocks.any((b) => b.body.any((i) => i is Alloc || i is Retain || i is Release)),
+  // Every instruction that touches heap storage must be listed here, not
+  // just the ARC ones: a module that only calls `Heap.allocate` emits
+  // references to `@dc_heap` and would otherwise get none of the globals.
+  // Caught by clang ("use of undefined value '@dc_heap'") rather than
+  // silently, but only because LLVM verifies its own module — this predicate
+  // has no exhaustiveness check of its own, so a future heap instruction can
+  // reintroduce the bug (GAP-0051 territory).
+  final needsHeap = module.functions.any(
+    (f) => f.blocks.any(
+      (b) => b.body.any(
+        (i) =>
+            i is Alloc ||
+            i is Retain ||
+            i is Release ||
+            i is AllocRaw ||
+            i is FreeRaw,
+      ),
+    ),
   );
 
   final buffer = StringBuffer();
@@ -100,8 +220,8 @@ String emitModule(
     }
     buffer.writeln();
   }
-  if (needsArena) {
-    buffer.write(_emitArenaGlobals());
+  if (needsHeap) {
+    buffer.write(_emitHeapGlobals(regionBytes, sizeClasses));
   }
   // llvm.trap and the *.with.overflow.* intrinsics are recognized by name --
   // no library symbol backs them (they lower to inline instructions, ud2 /
@@ -215,7 +335,11 @@ Map<int, List<_PredEdge>> _collectPredecessors(
   return preds;
 }
 
-String _emitFunction(DCFunction function, Set<String> declaredIntrinsics) {
+String _emitFunction(
+  DCFunction function,
+  Set<String> declaredIntrinsics,
+  int heapRegionBytes,
+) {
   final entryBlock = function.blocks.first;
   final retType = _llvmType(function.returnType, context: function.linkName);
   // Only the entry block's params are the function's formal parameters
@@ -226,7 +350,7 @@ String _emitFunction(DCFunction function, Set<String> declaredIntrinsics) {
       .map((v) => '${_llvmType(v.type, context: function.linkName)} %v${v.id.index}')
       .join(', ');
 
-  final emitter = _FunctionEmitter(function.linkName, declaredIntrinsics);
+  final emitter = _FunctionEmitter(function.linkName, declaredIntrinsics, heapRegionBytes);
 
   // Pass 1: emit every block's real instructions (NOT phi lines yet — see
   // `_collectPredecessors`'s doc comment for why the real predecessor label
@@ -490,7 +614,11 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
       _emitCall(instruction, e, context);
     case Alloc():
       declareTrapIntrinsic(e.declaredIntrinsics);
-      _emitAlloc(instruction, e, context);
+      _emitAlloc(instruction, e, context, e.heapRegionBytes);
+    case AllocRaw():
+      _emitAllocRaw(instruction, e);
+    case FreeRaw():
+      _emitFreeRaw(instruction, e);
     case Retain():
       _emitRetain(instruction, e, context);
     case Release():
@@ -792,7 +920,13 @@ void declareTrapIntrinsic(Set<String> declared) {
 /// these would produce a duplicate-symbol error at best and silently shadow
 /// ARC arena state at worst — `linkName` goes out verbatim (spec §9) with no
 /// mangling, so nothing else would catch it.
-const _reservedGlobalNames = {'dc_arena', 'dc_free_list', 'dc_free_top'};
+const _reservedGlobalNames = {
+  'dc_heap',
+  'dc_heap_bump',
+  'dc_heap_free',
+  'dc_heap_live',
+  'dc_heap_sizes',
+};
 
 /// One `@rodata` global: `@name = internal constant <init>, align N`.
 ///
@@ -997,82 +1131,158 @@ int _atomicWidthBytes(
 }
 
 /// The M2 ARC arena's global state (docs/decisions/0015): a fixed array of
-/// `_arenaSlots` slots, each `_slotSizeBytes` bytes, plus a LIFO free-list
-/// (`@dc_free_list`, `@dc_free_top`) of available slot indices. Emitted
-/// once per module, only when something in it actually allocates.
-String _emitArenaGlobals() {
-  final indices = List.generate(_arenaSlots, (i) => 'i32 $i').join(', ');
+/// The heap's globals: `_heapClassCount` equal regions, a per-class bump
+/// cursor, and a per-class intrusive free-list head. All zero-initialized, so
+/// all three land in `.bss` and cost nothing in the image. Emitted once per
+/// module, only when something in it actually allocates.
+String _emitHeapGlobals(int regionBytes, List<int> sizeClasses) {
+  final classCount = sizeClasses.length;
   final buffer = StringBuffer();
-  buffer.writeln('@dc_arena = global [$_arenaSlots x [$_slotSizeBytes x i8]] zeroinitializer');
-  buffer.writeln('@dc_free_list = global [$_arenaSlots x i32] [$indices]');
-  buffer.writeln('@dc_free_top = global i32 $_arenaSlots');
+  buffer.writeln(
+    '@dc_heap = global [$classCount x [$regionBytes x i8]] zeroinitializer',
+  );
+  buffer.writeln('@dc_heap_bump = global [$classCount x i64] zeroinitializer');
+  buffer.writeln('@dc_heap_free = global [$classCount x ptr] zeroinitializer');
+  // LIVE-OBJECT COUNT. Incremented by Alloc, decremented when a block goes
+  // back on a free list. It replaces the old arena's `dc_free_top`, which
+  // every leak test read directly: "all 64 slots are free" was a workable
+  // proxy for "nothing is live" only while there was exactly one slot size
+  // and 64 of them. With segregated size classes there is no single number
+  // that means the same thing -- a bump cursor never decreases, and counting
+  // free blocks would mean walking eight lists.
+  //
+  // So this measures the property the tests actually wanted, directly:
+  // `dc_heap_live == 0` is leak-freedom, at any scale, across every class.
+  // `CLAUDE.md`'s testing rules require a leak test for cycle behaviour, so
+  // this is load-bearing rather than diagnostic.
+  //
+  // COST, stated because M3 is a performance gate: one `add` and one `sub`
+  // on paths that already run roughly a dozen instructions. It is emitted
+  // unconditionally, so the M3 measurement includes it. If it ever shows up
+  // in that number, the answer is to measure it and say so -- not to make
+  // leak detection conditional and then measure a build the tests never ran.
+  buffer.writeln('@dc_heap_live = global i64 0');
+  // Block size per class, so the runtime-sized path reads the size rather
+  // than re-deriving it from the class index. Two derivations of one fact can
+  // drift; a table cannot.
+  final sizes = sizeClasses.map((c) => 'i64 $c').join(', ');
+  buffer.writeln('@dc_heap_sizes = constant [$classCount x i64] [$sizes]');
   buffer.writeln();
   return buffer.toString();
 }
 
-/// `Alloc`: pop a free slot (trap if none left — OOM is unrecoverable in
-/// this minimal arena, matching spec §5's `panic()` model for `@bare`),
-/// write the header (strong=1, weak=0, cls=`destructorName`'s address or
-/// null — docs/decisions/0022-destructor-cascade.md), return the payload
-/// pointer (header sits at `payload - _headerSizeBytes`).
-void _emitAlloc(Alloc instruction, _FunctionEmitter e, String context) {
+/// `Alloc`: take a block from this payload's size class -- pop the intrusive
+/// free list if it is non-empty, otherwise bump the region -- write the
+/// header (strong=1, weak=0, cls=destructor address or null, ADR-0022), and
+/// return the payload pointer. The header sits at `payload -
+/// _headerSizeBytes`.
+///
+/// The size class is a COMPILE-TIME constant here: `payloadSizeBytes` is
+/// static, so no class arithmetic is emitted on the allocation path at all.
+void _emitAlloc(
+  Alloc instruction,
+  _FunctionEmitter e,
+  String context,
+  int regionBytes,
+) {
+  final classes = e.sizeClasses;
+  final classCount = classes.length;
+  final classIndex = _classForPayload(instruction.payloadSizeBytes, classes);
+  if (classIndex < 0) {
+    throw BackendError(
+      '"$context": Alloc payload ${instruction.payloadSizeBytes} bytes + '
+      'header $_headerSizeBytes bytes exceeds the largest size class '
+      '(${classes.last} bytes) for a ${e.heapRegionBytes}-byte region, so '
+      'the maximum payload is ${_maxPayloadFor(classes)} bytes. Raise it '
+      'with --heap-region-bytes — see '
+      'docs/decisions/0058-segregated-size-class-heap.md',
+    );
+  }
+  final blockBytes = classes[classIndex];
+
+  final popLabel = e.freshLabel('allocPop');
+  final bumpLabel = e.freshLabel('allocBump');
+  final doBumpLabel = e.freshLabel('allocDoBump');
   final oomLabel = e.freshLabel('allocOom');
-  final okLabel = e.freshLabel('allocOk');
-  final top = e.freshName('top');
-  final empty = e.freshName('empty');
+  final contLabel = e.freshLabel('allocCont');
 
-  e.line('%$top = load i32, ptr @dc_free_top');
-  e.line('%$empty = icmp eq i32 %$top, 0');
-  e.terminate('br i1 %$empty, label %$oomLabel, label %$okLabel');
+  final freeHeadPtr = e.freshName('freeheadptr');
+  final freeHead = e.freshName('freehead');
+  final isEmpty = e.freshName('isempty');
 
+  e.line(
+    '%$freeHeadPtr = getelementptr [$classCount x ptr], ptr @dc_heap_free, '
+    'i64 0, i64 $classIndex',
+  );
+  e.line('%$freeHead = load ptr, ptr %$freeHeadPtr');
+  e.line('%$isEmpty = icmp eq ptr %$freeHead, null');
+  e.terminate('br i1 %$isEmpty, label %$bumpLabel, label %$popLabel');
+
+  // Free list non-empty: pop its head. The successor lives in the block's
+  // own first 8 bytes (intrusive list, written by the pushback below).
+  e.startBlock(popLabel);
+  final next = e.freshName('next');
+  e.line('%$next = load ptr, ptr %$freeHead');
+  e.line('store ptr %$next, ptr %$freeHeadPtr');
+  e.terminate('br label %$contLabel');
+
+  // Free list empty: bump this class's region, trapping if it is exhausted.
+  e.startBlock(bumpLabel);
+  final bumpPtr = e.freshName('bumpptr');
+  final used = e.freshName('used');
+  final newUsed = e.freshName('newused');
+  final over = e.freshName('over');
+  e.line(
+    '%$bumpPtr = getelementptr [$classCount x i64], ptr @dc_heap_bump, '
+    'i64 0, i64 $classIndex',
+  );
+  e.line('%$used = load i64, ptr %$bumpPtr');
+  e.line('%$newUsed = add i64 %$used, $blockBytes');
+  e.line('%$over = icmp ugt i64 %$newUsed, $regionBytes');
+  e.terminate('br i1 %$over, label %$oomLabel, label %$doBumpLabel');
+
+  // OOM is unrecoverable here, matching spec §5's panic() model for @bare.
+  // It is a TRAP rather than a wrong answer: a heap that silently reused a
+  // live block would corrupt rather than stop.
   e.startBlock(oomLabel);
   e.line('call void @llvm.trap()');
   e.terminate('unreachable');
 
-  e.startBlock(okLabel);
-  final newTop = e.freshName('newtop');
-  final newTop64 = e.freshName('newtop64');
-  final idxPtr = e.freshName('idxptr');
-  final idx = e.freshName('idx');
-  final idx64 = e.freshName('idx64');
-  final slot = e.freshName('slot');
+  e.startBlock(doBumpLabel);
+  final fresh = e.freshName('fresh');
+  e.line('store i64 %$newUsed, ptr %$bumpPtr');
+  e.line(
+    '%$fresh = getelementptr [$classCount x [$regionBytes x i8]], '
+    'ptr @dc_heap, i64 0, i64 $classIndex, i64 %$used',
+  );
+  e.terminate('br label %$contLabel');
+
+  e.startBlock(contLabel);
+  final block = e.freshName('block');
+  e.line(
+    '%$block = phi ptr [ %$freeHead, %$popLabel ], [ %$fresh, %$doBumpLabel ]',
+  );
+
   final weakPtr = e.freshName('weakptr');
   final clsPtr = e.freshName('clsptr');
-
-  e.line('%$newTop = sub i32 %$top, 1');
-  e.line('store i32 %$newTop, ptr @dc_free_top');
-  e.line('%$newTop64 = sext i32 %$newTop to i64');
-  e.line(
-    '%$idxPtr = getelementptr [$_arenaSlots x i32], ptr @dc_free_list, i64 0, i64 %$newTop64',
-  );
-  e.line('%$idx = load i32, ptr %$idxPtr');
-  e.line('%$idx64 = sext i32 %$idx to i64');
-  e.line(
-    '%$slot = getelementptr [$_arenaSlots x [$_slotSizeBytes x i8]], ptr @dc_arena, i64 0, i64 %$idx64',
-  );
-  e.line('store i32 1, ptr %$slot'); // strong = 1
-  e.line('%$weakPtr = getelementptr i8, ptr %$slot, i64 4');
+  e.line('store i32 1, ptr %$block'); // strong = 1
+  e.line('%$weakPtr = getelementptr i8, ptr %$block, i64 4');
   e.line('store i32 0, ptr %$weakPtr'); // weak = 0
-  e.line('%$clsPtr = getelementptr i8, ptr %$slot, i64 8');
+  e.line('%$clsPtr = getelementptr i8, ptr %$block, i64 8');
   if (instruction.destructorName != null) {
-    // cls = the destructor's own address -- a real function symbol, valid
-    // as a `ptr` value directly under LLVM's opaque pointers. Not a
-    // ClassInfo indirection (no vtable exists, GAP-0003) -- Release reads
-    // this back and calls straight through it.
     e.line('store ptr @${instruction.destructorName}, ptr %$clsPtr');
   } else {
-    e.line('store ptr null, ptr %$clsPtr'); // no heap-typed fields -- nothing to release on death
+    e.line('store ptr null, ptr %$clsPtr');
   }
+  final liveBefore = e.freshName('livebefore');
+  final liveAfter = e.freshName('liveafter');
+  e.line('%$liveBefore = load i64, ptr @dc_heap_live');
+  e.line('%$liveAfter = add i64 %$liveBefore, 1');
+  e.line('store i64 %$liveAfter, ptr @dc_heap_live');
 
-  if (instruction.payloadSizeBytes + _headerSizeBytes > _slotSizeBytes) {
-    throw BackendError(
-      '"$context": Alloc payload ${instruction.payloadSizeBytes} bytes + '
-      'header $_headerSizeBytes bytes exceeds the M2 arena\'s fixed slot '
-      'size ($_slotSizeBytes bytes) — see docs/decisions/0015-m2-minimal-arc-arena.md',
-    );
-  }
   e.line(
-    '%v${instruction.dest.id.index} = getelementptr i8, ptr %$slot, i64 $_headerSizeBytes',
+    '%v${instruction.dest.id.index} = getelementptr i8, ptr %$block, '
+    'i64 $_headerSizeBytes',
   );
 }
 
@@ -1111,31 +1321,187 @@ void _emitRetain(Retain instruction, _FunctionEmitter e, String context) {
 /// docs/decisions/0023-weak-references.md) — both need the exact same
 /// slot-index-from-pointer arithmetic, and this is the one place it's
 /// written. Emits into whatever block is currently open; does not
-/// terminate it (callers branch onward themselves).
-void _emitFreeSlotPushback(String headerVar, _FunctionEmitter e) {
+//// `AllocRaw`: the same pop-or-bump as `Alloc`, but with the size class
+/// computed at RUNTIME, and with no object header written.
+///
+/// THE CLASS COMPUTATION. Classes are consecutive powers of two starting at
+/// `_minSizeClassBytes`, so the index is
+/// `ceil_log2(max(size, min)) - log2(min)`, and `ceil_log2(n)` is
+/// `64 - ctlz(n - 1)`. Worked, because an off-by-one here hands back a block
+/// smaller than requested and the overflow is silent:
+///
+///   size 32 -> n-1 = 31, ctlz = 59, bits = 5, index 0   (class 32)  ✓
+///   size 33 -> n-1 = 32, ctlz = 58, bits = 6, index 1   (class 64)  ✓
+///   size 64 -> n-1 = 63, ctlz = 58, bits = 6, index 1   (class 64)  ✓
+///
+/// Sizes below the smallest class clamp up to it; sizes above the largest
+/// trap, for the same reason `Alloc` refuses an oversized payload — there is
+/// no large-object path, and returning a too-small block would be silent
+/// corruption rather than a failure.
+void _emitAllocRaw(AllocRaw instruction, _FunctionEmitter e) {
+  final classes = e.sizeClasses;
+  final classCount = classes.length;
+  final regionBytes = e.heapRegionBytes;
+
+  final size = '%v${instruction.sizeBytes.id.index}';
+  final tooBig = e.freshName('toobig');
+  final clamped = e.freshName('clamped');
+  final small = e.freshName('small');
+  final minus1 = e.freshName('minus1');
+  final lz = e.freshName('lz');
+  final bits = e.freshName('bits');
+  final classIdx = e.freshName('classidx');
+
+  final oomLabel = e.freshLabel('rawOom');
+  final sizedLabel = e.freshLabel('rawSized');
+  final popLabel = e.freshLabel('rawPop');
+  final bumpLabel = e.freshLabel('rawBump');
+  final doBumpLabel = e.freshLabel('rawDoBump');
+  final contLabel = e.freshLabel('rawCont');
+
+  e.declaredIntrinsics.add('declare i64 @llvm.ctlz.i64(i64, i1)');
+
+  e.line('%$tooBig = icmp ugt i64 $size, ${classes.last}');
+  e.terminate('br i1 %$tooBig, label %$oomLabel, label %$sizedLabel');
+
+  e.startBlock(oomLabel);
+  e.line('call void @llvm.trap()');
+  e.terminate('unreachable');
+
+  e.startBlock(sizedLabel);
+  e.line('%$small = icmp ult i64 $size, $_minSizeClassBytes');
+  e.line('%$clamped = select i1 %$small, i64 $_minSizeClassBytes, i64 $size');
+  e.line('%$minus1 = sub i64 %$clamped, 1');
+  // is_zero_poison = false: a clamped size is never 0, but poison here would
+  // be undefined behaviour rather than a wrong answer, which is worse.
+  e.line('%$lz = call i64 @llvm.ctlz.i64(i64 %$minus1, i1 false)');
+  e.line('%$bits = sub i64 64, %$lz');
+  e.line('%$classIdx = sub i64 %$bits, ${_shiftFor(_minSizeClassBytes)}');
+
+  final blockBytesPtr = e.freshName('bbptr');
+  final blockBytes = e.freshName('blockbytes');
+  final freeHeadPtr = e.freshName('freeheadptr');
+  final freeHead = e.freshName('freehead');
+  final isEmpty = e.freshName('isempty');
+
+  // Block size for this class, read from an emitted table rather than
+  // recomputed: `1 << (index + log2(min))` would be a second derivation of
+  // the same fact, and the two could drift.
+  e.line(
+    '%$blockBytesPtr = getelementptr [$classCount x i64], ptr @dc_heap_sizes, '
+    'i64 0, i64 %$classIdx',
+  );
+  e.line('%$blockBytes = load i64, ptr %$blockBytesPtr');
+  e.line(
+    '%$freeHeadPtr = getelementptr [$classCount x ptr], ptr @dc_heap_free, '
+    'i64 0, i64 %$classIdx',
+  );
+  e.line('%$freeHead = load ptr, ptr %$freeHeadPtr');
+  e.line('%$isEmpty = icmp eq ptr %$freeHead, null');
+  e.terminate('br i1 %$isEmpty, label %$bumpLabel, label %$popLabel');
+
+  e.startBlock(popLabel);
+  final next = e.freshName('next');
+  e.line('%$next = load ptr, ptr %$freeHead');
+  e.line('store ptr %$next, ptr %$freeHeadPtr');
+  e.terminate('br label %$contLabel');
+
+  e.startBlock(bumpLabel);
+  final bumpPtr = e.freshName('bumpptr');
+  final used = e.freshName('used');
+  final newUsed = e.freshName('newused');
+  final over = e.freshName('over');
+  e.line(
+    '%$bumpPtr = getelementptr [$classCount x i64], ptr @dc_heap_bump, '
+    'i64 0, i64 %$classIdx',
+  );
+  e.line('%$used = load i64, ptr %$bumpPtr');
+  e.line('%$newUsed = add i64 %$used, %$blockBytes');
+  e.line('%$over = icmp ugt i64 %$newUsed, $regionBytes');
+  e.terminate('br i1 %$over, label %$oomLabel, label %$doBumpLabel');
+
+  e.startBlock(doBumpLabel);
+  final fresh = e.freshName('fresh');
+  e.line('store i64 %$newUsed, ptr %$bumpPtr');
+  e.line(
+    '%$fresh = getelementptr [$classCount x [$regionBytes x i8]], '
+    'ptr @dc_heap, i64 0, i64 %$classIdx, i64 %$used',
+  );
+  e.terminate('br label %$contLabel');
+
+  e.startBlock(contLabel);
+  final liveBefore = e.freshName('livebefore');
+  final liveAfter = e.freshName('liveafter');
+  e.line(
+    '%v${instruction.dest.id.index} = phi ptr '
+    '[ %$freeHead, %$popLabel ], [ %$fresh, %$doBumpLabel ]',
+  );
+  e.line('%$liveBefore = load i64, ptr @dc_heap_live');
+  e.line('%$liveAfter = add i64 %$liveBefore, 1');
+  e.line('store i64 %$liveAfter, ptr @dc_heap_live');
+}
+
+/// `FreeRaw`: hand the block straight to the shared pushback, which derives
+/// its size class from its address. Raw blocks and ARC blocks are the same
+/// blocks from the same regions, so there is exactly one free path.
+void _emitFreeRaw(FreeRaw instruction, _FunctionEmitter e) {
+  _emitFreeSlotPushback(
+    'v${instruction.pointer.id.index}',
+    e,
+    e.heapRegionBytes,
+  );
+}
+
+/// Return a block to its size class's free list. Shared by `Release` (the
+/// last strong reference goes away with no weak references outstanding) and
+/// `DropWeak` (the last weak reference to an ALREADY-dead object goes away,
+/// ADR-0023) -- both need the identical arithmetic, and this is the one place
+/// it is written.
+///
+/// THE CLASS COMES FROM THE ADDRESS. `(block - heapBase) / regionBytes` is
+/// the class index, emitted as a shift since `regionBytes` is a power of two.
+/// This is what lets the 16-byte object header stay exactly as spec §3.1
+/// defines it: a conventional allocator would store the class in a header
+/// word, and adding one here would have been a memory-model change under
+/// `CLAUDE.md` rule 4 rather than a backend change.
+///
+/// The successor pointer is written INTO the freed block's first 8 bytes,
+/// over the now-dead strong/weak counts. That is safe precisely because the
+/// block is unreachable -- and it is why the smallest size class is 32 bytes
+/// rather than 16: a free block must have room to hold a pointer.
+///
+/// Emits into whatever block is currently open; does not terminate it.
+void _emitFreeSlotPushback(
+  String headerVar,
+  _FunctionEmitter e,
+  int regionBytes,
+) {
+  final shift = _shiftFor(regionBytes);
+  final classCount = e.sizeClasses.length;
   final headerInt = e.freshName('hdrint');
-  final arenaInt = e.freshName('arenaint');
+  final heapInt = e.freshName('heapint');
   final diff = e.freshName('diff');
-  final slotIdx64 = e.freshName('slotidx64');
-  final slotIdx32 = e.freshName('slotidx32');
-  final top = e.freshName('top');
-  final top64 = e.freshName('top64');
-  final freeSlotPtr = e.freshName('freeslotptr');
-  final newTop = e.freshName('newtop');
+  final classIdx = e.freshName('classidx');
+  final freeHeadPtr = e.freshName('freeheadptr');
+  final oldHead = e.freshName('oldhead');
 
   e.line('%$headerInt = ptrtoint ptr %$headerVar to i64');
-  e.line('%$arenaInt = ptrtoint ptr @dc_arena to i64');
-  e.line('%$diff = sub i64 %$headerInt, %$arenaInt');
-  e.line('%$slotIdx64 = udiv i64 %$diff, $_slotSizeBytes');
-  e.line('%$slotIdx32 = trunc i64 %$slotIdx64 to i32');
-  e.line('%$top = load i32, ptr @dc_free_top');
-  e.line('%$top64 = sext i32 %$top to i64');
+  e.line('%$heapInt = ptrtoint ptr @dc_heap to i64');
+  e.line('%$diff = sub i64 %$headerInt, %$heapInt');
+  e.line('%$classIdx = lshr i64 %$diff, $shift');
   e.line(
-    '%$freeSlotPtr = getelementptr [$_arenaSlots x i32], ptr @dc_free_list, i64 0, i64 %$top64',
+    '%$freeHeadPtr = getelementptr [$classCount x ptr], ptr @dc_heap_free, '
+    'i64 0, i64 %$classIdx',
   );
-  e.line('store i32 %$slotIdx32, ptr %$freeSlotPtr');
-  e.line('%$newTop = add i32 %$top, 1');
-  e.line('store i32 %$newTop, ptr @dc_free_top');
+  e.line('%$oldHead = load ptr, ptr %$freeHeadPtr');
+  e.line('store ptr %$oldHead, ptr %$headerVar');
+  e.line('store ptr %$headerVar, ptr %$freeHeadPtr');
+
+  final liveBefore = e.freshName('livebefore');
+  final liveAfter = e.freshName('liveafter');
+  e.line('%$liveBefore = load i64, ptr @dc_heap_live');
+  e.line('%$liveAfter = sub i64 %$liveBefore, 1');
+  e.line('store i64 %$liveAfter, ptr @dc_heap_live');
 }
 
 /// `Release`: decrement the strong count; at zero, run the destructor
@@ -1201,7 +1567,7 @@ void _emitRelease(Release instruction, _FunctionEmitter e, String context) {
   e.terminate('br i1 %$noWeak, label %$freeSlotLabel, label %$doneLabel');
 
   e.startBlock(freeSlotLabel);
-  _emitFreeSlotPushback(header, e);
+  _emitFreeSlotPushback(header, e, e.heapRegionBytes);
   e.terminate('br label %$doneLabel');
 
   e.startBlock(doneLabel);
@@ -1294,7 +1660,7 @@ void _emitDropWeak(DropWeak instruction, _FunctionEmitter e, String context) {
   e.terminate('br i1 %$strongIsZero, label %$freeSlotLabel, label %$doneLabel');
 
   e.startBlock(freeSlotLabel);
-  _emitFreeSlotPushback(header, e);
+  _emitFreeSlotPushback(header, e, e.heapRegionBytes);
   e.terminate('br label %$doneLabel');
 
   e.startBlock(doneLabel);
@@ -1363,11 +1729,24 @@ String _llvmType(DCType type, {required String context}) {
 class _FunctionEmitter {
   final String context;
   final Set<String> declaredIntrinsics;
+
+  /// Bytes per size-class region. Lives here rather than being threaded
+  /// through every emission helper: `Alloc` and the free-list pushback both
+  /// need it, they sit at opposite ends of the call chain, and a mismatch
+  /// between the two would compute the wrong size class on free.
+  final int heapRegionBytes;
+
+  /// Size classes for [heapRegionBytes]. Derived once here rather than
+  /// recomputed at each use, so `Alloc` and the free-list pushback cannot
+  /// disagree about the class layout -- a disagreement between those two
+  /// would push freed blocks onto the wrong list.
+  late final List<int> sizeClasses = _sizeClassesFor(heapRegionBytes);
+
   final List<_Block> _finished = [];
   _Block? _current;
   int _counter = 0;
 
-  _FunctionEmitter(this.context, this.declaredIntrinsics);
+  _FunctionEmitter(this.context, this.declaredIntrinsics, this.heapRegionBytes);
 
   String freshName(String prefix) => '$prefix${_counter++}';
   String freshLabel(String prefix) => '$prefix${_counter++}';

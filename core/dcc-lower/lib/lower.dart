@@ -914,8 +914,25 @@ class _BareFunctionLowerer {
   /// `LabeledStatement` is the target. A label wrapping the WHILE means
   /// `break` (jump past the loop); a label wrapping the loop's BODY means
   /// `continue` (jump to the header). Nothing else distinguishes them.
-  final Map<LabeledStatement, ({BlockId target, List<VariableDeclaration> vars})>
-      _labelTargets = {};
+  ///
+  /// `heapDepth`/`weakDepth` are the per-iteration release policy's half of
+  /// this map: the `_heapLocals`/`_weakLocals` lengths recorded at the
+  /// moment that loop's BODY began lowering. Both `break` and `continue`
+  /// LEAVE the current iteration, so every heap/weak local declared inside
+  /// the body being left — i.e. everything pushed at or beyond those
+  /// depths — has to be released on that edge, exactly as it is on the
+  /// body's normal fall-through. Recording the depth per LABEL rather than
+  /// using "everything above the innermost loop" is what makes a labelled
+  /// `break outer;` out of a nested loop release the INNER body's objects
+  /// AND the outer body's, in one unwind, with no extra bookkeeping.
+  final Map<
+      LabeledStatement,
+      ({
+        BlockId target,
+        List<VariableDeclaration> vars,
+        int heapDepth,
+        int weakDepth,
+      })> _labelTargets = {};
   final List<DCBasicBlock> _finishedBlocks = [];
   List<DCInstruction> _currentInstructions = [];
   List<DCValue> _currentBlockParams = const [];
@@ -1388,6 +1405,30 @@ class _BareFunctionLowerer {
           return;
         }
 
+        // (ADR-0058) `Heap.free(p);` — void-returning, so it lands here
+        // rather than in the expression path, the same split as
+        // `Port.outb`/`Port.inb` and `Atomic.store`/`Atomic.load`.
+        if (target.isStatic &&
+            target.name.text == 'free' &&
+            target.enclosingClass?.name == 'Heap' &&
+            target.enclosingLibrary.importUri == preludeUri) {
+          final args = expr.arguments.positional;
+          if (args.length != 1) {
+            throw DccLowerError(
+              '"$context": Heap.free takes exactly one argument (the pointer '
+              'Heap.allocate returned)',
+            );
+          }
+          final block = _lowerExpression(args.single);
+          if (block.type is! DCPointer) {
+            throw DccLowerError(
+              '"$context": Heap.free takes a pointer, got ${block.type}',
+            );
+          }
+          _addInstr(FreeRaw(pointer: block));
+          return;
+        }
+
         // (ADR-0055) `Atomic.store(p, v);` — the one void-returning member of
         // `Atomic`, so it lands here for the same reason `Port.outb` does.
         if (target.isStatic &&
@@ -1541,11 +1582,27 @@ class _BareFunctionLowerer {
           'statement is not supported (ADR-0047).',
         );
       }
+      // PER-ITERATION RELEASE, on the `break`/`continue` edge.
+      //
+      // Both spellings leave the current iteration, so every heap/weak local
+      // declared inside the loop body being left dies here, on THIS path,
+      // and must be released BEFORE the edge is taken -- not after, because
+      // the target block is reachable from other paths that already released
+      // their own copies, and a release placed there would run once per
+      // predecessor for objects that no longer exist.
+      //
+      // The stacks are deliberately NOT truncated: lowering continues into
+      // sibling paths (this `break` is typically inside one arm of an `if`,
+      // whose other arm still has the same locals live), and the enclosing
+      // scope -- `_lowerIf`'s own truncation, or `_lowerWhile`'s below --
+      // owns removing them. This block is terminated on the next line, so no
+      // further instruction can be appended to the path just released.
+      _releaseScopeFrom(heapDepth: entry.heapDepth, weakDepth: entry.weakDepth);
       // Carry the CURRENT values of the loop variables across the edge --
       // the whole reason the exit block needs parameters at all.
       _addInstr(Branch(
         target: entry.target,
-        args: [for (final v in entry.vars) _values[v]!],
+        args: [for (final v in entry.vars) _trackedValue(v)],
       ));
       _finishBlock();
       return;
@@ -1763,18 +1820,39 @@ class _BareFunctionLowerer {
   ///     `_values.containsKey` filter below keeps only variables declared
   ///     BEFORE this loop — so an inner loop's own locals are excluded while
   ///     an outer variable the inner loop assigns is correctly carried.
-  ///   - No heap- or weak-typed local may be declared anywhere in the loop
-  ///     body. The naive release policy (ADR-0016/0017) releases tracked
-  ///     locals before each `return` — a loop's back edge is NOT a
-  ///     `return`, so nothing would ever release a heap local declared
-  ///     inside the body on any iteration that isn't the function's last.
-  ///     Getting this right needs real design (release before the back
-  ///     edge? every iteration? what about a heap local escaping via a
-  ///     loop-carried reassignment, which isn't even supported for scalars
-  ///     let alone heap types?) that hasn't happened yet — see
-  ///     docs/known-gaps.md. Enforced by checking `_heapLocals`/
-  ///     `_weakLocals` didn't grow across the body, rather than guessing a
-  ///     policy no one has decided.
+  ///   - Heap- and weak-typed locals declared in the loop BODY are now
+  ///     supported, by a PER-ITERATION release policy. This used to be a
+  ///     hard refusal, and the refusal was correct for the policy that
+  ///     existed: ADR-0016/0017's naive scheme releases tracked locals only
+  ///     before a `return`, and a loop's back edge is not a `return`, so a
+  ///     heap local declared in the body was allocated afresh every
+  ///     iteration and released at most once — one leaked object per
+  ///     iteration, and with a 64-slot arena (ADR-0015) that is a trap at
+  ///     iteration 65, not a slow leak. Refusing was the right call over
+  ///     shipping that.
+  ///
+  ///     What the refusal was protecting is now provided rather than
+  ///     removed: a body-scoped heap/weak local is released on EVERY path
+  ///     that leaves the body — the normal fall-through into the back edge,
+  ///     every `continue`, every `break` (including a labelled one out of a
+  ///     nested loop, which unwinds both bodies), and every `return`
+  ///     (already covered, since `_lowerReturn` releases the whole tracking
+  ///     stack). The scope mark is `_heapLocals`/`_weakLocals`'s length at
+  ///     body entry; `_releaseScopeFrom` emits the releases on a path and
+  ///     `_forgetLocalsFrom` drops the tracking once every path is lowered.
+  ///
+  ///     The invariant this has to hold, and the one the old refusal
+  ///     doubted: releases equal allocations per iteration. A loop of N
+  ///     iterations allocating one object must show N releases at runtime
+  ///     and equal `alloc`/`release` counts under `dc-objdump --arc`, which
+  ///     `tests/conformance/loopheap` asserts both of.
+  ///
+  ///     Still refused, and this is the remaining hole: a heap/weak local
+  ///     declared inside an `if`-branch that FALLS THROUGH to code after
+  ///     the `if` (`_lowerIf`'s own `branchToMerge` check). That is an
+  ///     if/else-merge ownership question, not a loop one, and it is
+  ///     unchanged by this policy — a body-scoped local declared in a
+  ///     branch that `break`s, `continue`s or `return`s instead is fine.
   /// (ADR-0050) `for (init; cond; update) body` -> the `while` machinery.
   ///
   ///     init;  while (cond) { body; update; }
@@ -1889,41 +1967,85 @@ class _BareFunctionLowerer {
     );
     _finishBlock();
 
+    // THE BODY SCOPE MARK, and the whole per-iteration release policy hangs
+    // off it. Everything pushed onto `_heapLocals`/`_weakLocals` from here
+    // until the body finishes lowering was declared INSIDE the body, which
+    // means it is a brand-new object on every iteration — the variable is
+    // overwritten by the next iteration's `Alloc`, so if nothing releases
+    // the previous one it is unreachable and never freed. One leak per
+    // iteration exhausts the arena, so this is a trap, not a slow leak.
+    //
+    // Recorded BEFORE the labels are registered because `break` and
+    // `continue` both unwind to exactly this depth (see `_labelTargets`).
+    final heapLocalsBeforeBody = _heapLocals.length;
+    final weakLocalsBeforeBody = _weakLocals.length;
+
     // Register both label kinds before lowering the body, since a `break` or
     // `continue` inside it resolves through this map.
     if (breakLabel != null) {
-      _labelTargets[breakLabel] = (target: exitBlockId, vars: loopVars);
+      _labelTargets[breakLabel] = (
+        target: exitBlockId,
+        vars: loopVars,
+        heapDepth: heapLocalsBeforeBody,
+        weakDepth: weakLocalsBeforeBody,
+      );
     }
     final body = stmt.body;
     if (body is LabeledStatement) {
       // A label wrapping the loop BODY is `continue`: branch to the header,
       // which is exactly what the back edge below does.
-      _labelTargets[body] = (target: continueTarget, vars: loopVars);
+      _labelTargets[body] = (
+        target: continueTarget,
+        vars: loopVars,
+        heapDepth: heapLocalsBeforeBody,
+        weakDepth: weakLocalsBeforeBody,
+      );
     }
 
     _startBlock(bodyBlockId, const []);
-    final heapLocalsBeforeBody = _heapLocals.length;
-    final weakLocalsBeforeBody = _weakLocals.length;
     // Unwrap the continue-label if present: it was registered above, and
     // what actually needs lowering is the statement inside it.
     _lowerBranchBody(body is LabeledStatement ? body.body : body);
-    if (_heapLocals.length != heapLocalsBeforeBody || _weakLocals.length != weakLocalsBeforeBody) {
-      throw DccLowerError(
-        '"$context": a heap- or weak-typed local was declared inside a '
-        'while-loop body — not supported yet, see docs/known-gaps.md '
-        '(naive ARC has no release policy for a loop back edge yet)',
-      );
-    }
     // Only wire the back edge if some path through the body still falls
     // through (_blockOpen) — a body where every path returns has no
     // reachable back edge at all, which is a legal (if degenerate) program:
     // the loop's condition is checked once, and if the body is entered it
     // always returns before completing a second iteration.
     if (_blockOpen) {
-      final backArgs = [for (final v in loopVars) _values[v]!];
+      // NORMAL FALL-THROUGH out of the body: this iteration's objects die
+      // here. Released BEFORE the back-edge `Branch`, for two reasons that
+      // both matter. Placing them after would be unreachable dead code; and
+      // placing them at the TOP of the header (the "release last
+      // iteration's objects on entry" alternative) is a use-after-free the
+      // moment a loop-carried variable, or the returned value, still refers
+      // to one of them — the header is also reached from the pre-loop entry
+      // edge, where those values do not exist at all.
+      //
+      // For a `for` loop `continueTarget` is the update block, so the update
+      // clause runs AFTER this release. That is fine and is the only correct
+      // order available: the update clause is scalar (ADR-0050 desugars only
+      // `init; cond; update` where the loop-carried set is what the header's
+      // phis carry), so it cannot read a body-scoped heap local — such a
+      // local is out of scope in the update clause by Dart's own rules.
+      _releaseScopeFrom(
+        heapDepth: heapLocalsBeforeBody,
+        weakDepth: weakLocalsBeforeBody,
+      );
+      final backArgs = [for (final v in loopVars) _trackedValue(v)];
       _addInstr(Branch(target: continueTarget, args: backArgs));
       _finishBlock();
     }
+    // Body-scoped locals are gone on EVERY path now — fall-through and every
+    // `break`/`continue` released their own copy, and a `return` inside the
+    // body released the lot through `_lowerReturn`. Drop them from the
+    // tracking stacks so nothing downstream (the update block, the exit
+    // block, the rest of the function, an enclosing `return`) releases them
+    // a second time, and drop their `_values` entries so no later block can
+    // name a DCValue defined in the body block that does not dominate it.
+    _forgetLocalsFrom(
+      heapDepth: heapLocalsBeforeBody,
+      weakDepth: weakLocalsBeforeBody,
+    );
 
     // The update block: lower the update expressions, then close the loop.
     // Its parameters carry the loop variables in, because `continue` may
@@ -2077,6 +2199,67 @@ class _BareFunctionLowerer {
     _releaseHeapLocals(exceptDecl: exceptDecl);
     _releaseWeakLocals(exceptDecl: exceptDecl);
     _addInstr(Return(value: value));
+  }
+
+  /// The current DCValue bound to a local this lowering is still tracking.
+  ///
+  /// A separate accessor rather than `_values[decl]!` because CLAUDE.md rule
+  /// 3 forbids `!`, and because a miss here is a real dcc-lower bug worth
+  /// naming: every declaration in `_heapLocals`/`_weakLocals` was put there
+  /// by the same code path that wrote `_values[decl]`, so a null means the
+  /// two went out of sync.
+  DCValue _trackedValue(VariableDeclaration decl) {
+    final value = _values[decl];
+    if (value == null) {
+      throw DccLowerError(
+        '"$context": tracked local "${decl.name}" has no current DCValue — '
+        'dcc-lower bug: _heapLocals/_weakLocals and _values disagree',
+      );
+    }
+    return value;
+  }
+
+  /// PER-ITERATION (and per-scope) RELEASE: emit a `Release`/`DropWeak` for
+  /// every heap/weak local declared at or beyond the given tracking depths,
+  /// innermost first, WITHOUT truncating the stacks.
+  ///
+  /// Not truncating is the point. This runs on ONE path out of a scope
+  /// (`break`, `continue`, the body's fall-through), while other paths out
+  /// of the same scope are lowered afterwards and need the same locals still
+  /// tracked so they can release their own copies. Whoever owns the scope
+  /// removes them once, after every path has been lowered —
+  /// `_forgetLocalsFrom` below.
+  ///
+  /// Innermost-first (reverse declaration order) mirrors normal scope exit.
+  /// It is not required for correctness — these are independent refcount
+  /// decrements — but a destructor cascade (ADR-0022) freeing an object that
+  /// holds a reference to an earlier one is much easier to read in that
+  /// order.
+  void _releaseScopeFrom({required int heapDepth, required int weakDepth}) {
+    for (var i = _heapLocals.length - 1; i >= heapDepth; i--) {
+      _addInstr(Release(object: _trackedValue(_heapLocals[i])));
+    }
+    for (var i = _weakLocals.length - 1; i >= weakDepth; i--) {
+      _addInstr(DropWeak(object: _trackedValue(_weakLocals[i])));
+    }
+  }
+
+  /// Stop tracking every heap/weak local at or beyond the given depths, and
+  /// forget their `_values` bindings too.
+  ///
+  /// Called once, after EVERY path out of a scope has been lowered and has
+  /// released its own copies. Dropping the `_values` entries as well as the
+  /// stack entries is what keeps a later block from naming a DCValue that
+  /// was defined inside the scope and therefore does not dominate it.
+  void _forgetLocalsFrom({required int heapDepth, required int weakDepth}) {
+    for (var i = _heapLocals.length - 1; i >= heapDepth; i--) {
+      _values.remove(_heapLocals[i]);
+    }
+    _heapLocals.removeRange(heapDepth, _heapLocals.length);
+    for (var i = _weakLocals.length - 1; i >= weakDepth; i--) {
+      _values.remove(_weakLocals[i]);
+    }
+    _weakLocals.removeRange(weakDepth, _weakLocals.length);
   }
 
   void _releaseHeapLocals({required VariableDeclaration? exceptDecl}) {
@@ -2320,6 +2503,33 @@ class _BareFunctionLowerer {
         return _lowerAtomic(expr, target.name.text);
       }
 
+      // (ADR-0058) `Heap.allocate(n)` -- runtime-sized raw allocation. Same
+      // recognition shape as `Atomic.*`: static + enclosing class + prelude
+      // URI. `Heap.free` is void-returning and is handled in
+      // `_lowerStatement`, the same split as `Port.outb`/`Port.inb`.
+      if (target.isStatic &&
+          target.name.text == 'allocate' &&
+          target.enclosingClass?.name == 'Heap' &&
+          target.enclosingLibrary.importUri == preludeUri) {
+        final args = expr.arguments.positional;
+        if (args.length != 1) {
+          throw DccLowerError(
+            '"$context": Heap.allocate takes exactly one argument (a byte '
+            'count)',
+          );
+        }
+        final size = _lowerExpression(args.single);
+        if (size.type != DCInt.u64) {
+          throw DccLowerError(
+            '"$context": Heap.allocate takes a u64 byte count, got '
+            '${size.type}',
+          );
+        }
+        final dest = DCValue(_allocId(), const DCPointer(DCInt.u8));
+        _addInstr(AllocRaw(dest: dest, sizeBytes: size));
+        return dest;
+      }
+
       // `Rodata.addressOf(table)` (ADR-0040) -- a plain static method call,
       // recognized the same way `Port.inb` is: static + enclosing class name
       // + prelude URI. Its argument must be a StaticGet naming a @rodata
@@ -2387,7 +2597,7 @@ class _BareFunctionLowerer {
             throw DccLowerError(
               '"$context": Str(...) needs a string LITERAL. Its bytes are '
               'emitted into .rodata at compile time, so a runtime string has '
-              'nothing to point at (ADR-0055).',
+              'nothing to point at (ADR-0053).',
             );
           }
           return _lowerStringLiteral(arg.value);
@@ -2407,7 +2617,7 @@ class _BareFunctionLowerer {
           }
           // `.address` -- the struct holds a real `ptr` so the C ABI sees
           // `{char*, size_t}`, but the surface hands back a u64 so ordinary
-          // pointer arithmetic works (ADR-0055).
+          // pointer arithmetic works (ADR-0053).
           final ptr = DCValue(_allocId(), const DCPointer(DCInt.u8));
           _addInstr(ExtractField(dest: ptr, struct: receiver, fieldIndex: 0));
           final dest = DCValue(_allocId(), DCInt.u64);
@@ -2594,6 +2804,26 @@ class _BareFunctionLowerer {
         }
         final dest = DCValue(_allocId(), const DCHeapPointer(DCVoid()));
         _addInstr(WeakLoad(dest: dest, weak: weak));
+        return dest;
+      }
+
+      // (ADR-0058) `p.address` -- the inverse of `Pointer.fromAddress`,
+      // which has existed since M1 while this did not: a pointer could be
+      // made from an address but never turned back into one. Needed the
+      // moment raw byte buffers appeared, since indexing one means
+      // `fromAddress(p.address + i)` until `elementAt` lands (GAP-0051).
+      if (target.name.text == 'address' &&
+          target.enclosingClass?.name == 'Pointer' &&
+          target.enclosingLibrary.importUri == preludeUri) {
+        final receiver = _lowerExpression(expr.receiver);
+        if (receiver.type is! DCPointer) {
+          throw DccLowerError(
+            '"$context": .address read on ${receiver.type}, expected a '
+            'Pointer',
+          );
+        }
+        final dest = DCValue(_allocId(), DCInt.u64);
+        _addInstr(PtrToInt(dest: dest, pointer: receiver));
         return dest;
       }
 

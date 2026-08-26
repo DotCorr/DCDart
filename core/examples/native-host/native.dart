@@ -22,9 +22,10 @@
 //   * 3^100 mod 65521 = 23072, 7^4096 mod 65521 = 11838.
 //
 // Features composed here: heap objects with real ARC (`Range` and `Tally`
-// are alive simultaneously across a loop, and every call must return the
-// arena to its 64-slot baseline -- the C harness reads the real `dc_free_top`
-// symbol to check that), a borrowed `HeapObject` parameter, mutable heap
+// are alive simultaneously across a loop, and every call must leave the
+// heap with nothing live -- the C harness reads the real `dc_heap_live`
+// symbol, the allocator's live-object count (docs/decisions/0058), to check
+// that), a borrowed `HeapObject` parameter, mutable heap
 // fields written on every iteration, `while` loops, early `return`,
 // if/else, cross-function calls, and the full operator set at all four
 // widths: `+ - *` (trapping), `~/ %` (trapping on a zero divisor),
@@ -142,7 +143,7 @@ u64 isPrime(u64 n) {
 /// How many perfect numbers (sumProperDivisors(n) == n) lie in [lo, hi).
 /// Two heap objects are live at once here -- an immutable `Range` and a
 /// mutable `Tally` -- and both must be released before the call returns,
-/// which the harness checks against the real arena free-list counter.
+/// which the harness checks against the real `dc_heap_live` counter.
 @bare
 u64 perfectCount(u64 lo, u64 hi) {
   final range = Range(lo, hi);

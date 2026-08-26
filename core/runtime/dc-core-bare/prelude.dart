@@ -725,6 +725,18 @@ class Pointer<T> {
 
   T get value => throw UnimplementedError('dcc-lower substitutes real codegen for this');
   set value(T v) => throw UnimplementedError('dcc-lower substitutes real codegen for this');
+
+  /// This pointer as an integer, so it can be offset arithmetically and
+  /// handed back to [Pointer.fromAddress]. The inverse of `fromAddress`,
+  /// which existed from M1 while this did not — so a pointer could be made
+  /// from an address but never turned back into one.
+  ///
+  /// `Pointer<T>.elementAt(n)` is the right long-term spelling for indexing
+  /// (spec §6, GAP-0051): it knows the element width, where every caller of
+  /// this getter restates the stride by hand. This is the primitive that
+  /// makes byte-level access expressible now; it is not the ergonomic answer.
+  u64 get address =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
 }
 
 /// Marks a class `@packed` (DCDART_SPEC.md §6): fields laid out sequentially
@@ -894,4 +906,46 @@ class Weak<T> {
   const Weak.fromStrong(T target);
 
   T get value => throw UnimplementedError('dcc-lower substitutes real codegen for this');
+}
+
+/// Raw, un-managed bytes from the same segregated size-class heap ARC objects
+/// come from (ADR-0058).
+///
+/// THIS IS THE EXPLICIT HALF OF SPEC §12's ALLOCATOR DECISION. ADR-0058 split
+/// that question in two: ARC object creation is compiler-emitted from
+/// `Node(i)`, so there is no call site to thread an allocator through, and it
+/// draws from the module's heap implicitly. Library data structures that own
+/// their own storage are ordinary calls, and those are explicit — this is the
+/// primitive they are built from, and it is named at every use.
+///
+/// NOTHING HERE IS ARC-MANAGED. No strong count, no weak count, no
+/// destructor, and nothing will ever free these bytes for you. [free] must be
+/// called exactly once, with the pointer [allocate] returned and not an
+/// interior pointer. This is `malloc`/`free` with `malloc`'s hazards, which
+/// is why it is spelled `Heap.allocate` rather than made ambient: a program
+/// cannot acquire raw memory here without naming it.
+///
+/// Freeing takes no size. The heap derives a block's size class from where it
+/// lives, so `free(ptr)` is enough — in a conventional allocator that would
+/// need a header word, and avoiding one is what keeps spec §3.1's object
+/// header unchanged.
+class Heap {
+  Heap._();
+
+  /// [bytes] rounded up to a size class. Sizes below the smallest class get
+  /// the smallest; a size above the largest TRAPS rather than returning a
+  /// short block, because a short block would be silent corruption. The
+  /// largest class depends on the heap region size — see `--heap-region-bytes`.
+  ///
+  /// The returned block's contents are UNSPECIFIED, not zeroed: a block from
+  /// a free list holds whatever the previous owner left, plus the free-list
+  /// successor pointer in its first 8 bytes.
+  static Pointer<u8> allocate(u64 bytes) =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
+
+  /// Returns a block from [allocate]. Double-freeing is NOT detected: the
+  /// block lands on its free list twice, the list develops a cycle, and the
+  /// next two allocations of that class return the same address.
+  static void free(Pointer<u8> block) =>
+      throw UnimplementedError('dcc-lower substitutes real codegen for this');
 }

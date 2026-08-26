@@ -702,6 +702,56 @@ final class Alloc extends DCInstruction {
   DCValue? get result => dest;
 }
 
+/// Allocates `sizeBytes` RAW bytes from the same segregated size-class heap
+/// `Alloc` draws from (ADR-0058), and yields a `DCPointer(DCInt.u8)` to them.
+/// The size is a runtime VALUE, not a compile-time constant — that is the
+/// whole point of this instruction and the reason it cannot be folded into
+/// `Alloc`.
+///
+/// NO OBJECT HEADER. `Alloc` writes spec §3.1's 16-byte header and returns
+/// `block + 16`; this returns `block` itself. Raw bytes are not ARC-managed:
+/// there is no strong count, no weak count, no destructor, and nothing will
+/// ever free them automatically. They exist for library data structures that
+/// own their own storage — a growable byte buffer being the first — and the
+/// owner is responsible for calling [FreeRaw] exactly once.
+///
+/// This is deliberately NOT a general `malloc`. It is the primitive the
+/// explicit-`Allocator` half of ADR-0058's decision is built from, and it is
+/// reachable from source only through the prelude's `Heap` methods, so a
+/// program cannot acquire raw memory without naming it.
+///
+/// Freeing is by ADDRESS, not by size: the heap derives a block's size class
+/// from where it lives, so [FreeRaw] does not need to be told how big the
+/// block was. That is what makes a `free(ptr)` with no size argument correct
+/// here, where in a conventional allocator it would require a header word.
+final class AllocRaw extends DCInstruction {
+  final DCValue dest;
+  final DCValue sizeBytes;
+  const AllocRaw({required this.dest, required this.sizeBytes});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Returns a block obtained from [AllocRaw] to its size class's free list.
+///
+/// Takes the pointer [AllocRaw] returned, unchanged — passing an interior
+/// pointer computes the wrong size class and corrupts the free list, which is
+/// silent rather than a fault, so the prelude does not expose any way to
+/// produce one.
+///
+/// Double-freeing is not detected: the block is pushed onto its free list
+/// twice, producing a cycle in that list, and the next two allocations of
+/// that class return the same address. This is the same class of hazard as
+/// `free()` in C and is why raw allocation is not a general-purpose API.
+final class FreeRaw extends DCInstruction {
+  final DCValue pointer;
+  const FreeRaw({required this.pointer});
+
+  @override
+  DCValue? get result => null;
+}
+
 /// Calls another function by its link name (`DCFunction.linkName`),
 /// passing `args` positionally. `dest` is `null` iff the callee's return
 /// type is `DCVoid`; otherwise its type must equal the callee's declared

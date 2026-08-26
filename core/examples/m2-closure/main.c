@@ -2,8 +2,13 @@
  *
  * Every function below was written with its callee INSIDE its own body. The
  * point of the checks is that this makes no observable difference: the values
- * are the ordinary ones, and the arena returns to baseline after the two
+ * are the ordinary ones, and the heap returns to baseline after the two
  * heap-using paths exactly as it does for the top-level-callee version.
+ *
+ * Baseline is `dc_heap_live == 0`. `dc_heap_live` (docs/decisions/0058) is the
+ * segregated size-class heap's LIVE-object count -- incremented by Alloc,
+ * decremented when a block goes back on its size class's free list -- so zero
+ * means nothing at all is live, at any scale and in every size class.
  *
  * `viaTopLevel` and `viaClosure` are run against each other rather than only
  * against constants -- they are the same program written two ways, so they
@@ -18,7 +23,7 @@
  */
 #include <stdint.h>
 
-extern uint32_t dc_free_top;
+extern uint64_t dc_heap_live;
 
 extern uint64_t twiceSum(uint64_t a, uint64_t b);
 extern uint64_t addThree(uint64_t x);
@@ -31,7 +36,7 @@ extern uint64_t makeViaTopLevel(uint64_t v);
 extern uint64_t makeViaClosure(uint64_t v);
 
 int main(void) {
-    if (dc_free_top != 64) return 1; /* not at baseline before any call */
+    if (dc_heap_live != 0) return 1; /* not at baseline before any call */
 
     /* Shape 1 -- a named local function, two call sites, one hoisted symbol. */
     for (uint64_t a = 0; a < 40; a++) {
@@ -68,26 +73,27 @@ int main(void) {
     }
 
     /* Shape 6 -- the ARC pair. Both must agree with each other AND with the
-       input, and both must leave the arena exactly as they found it. 500
-       iterations is well past the arena's 64-slot capacity (ADR-0015), so a
-       single leaked slot per call could not survive this loop. */
+       input, and both must leave the heap exactly as they found it. The
+       live count is checked after EVERY call, so a single leaked object per
+       call is caught on the first iteration rather than having to accumulate
+       until something runs out. */
     for (uint64_t v = 0; v < 500; v++) {
         uint64_t top = viaTopLevel(v);
-        if (dc_free_top != 64) return 7;
+        if (dc_heap_live != 0) return 7;
         uint64_t clo = viaClosure(v);
-        if (dc_free_top != 64) return 8;
+        if (dc_heap_live != 0) return 8;
         if (top != v || clo != v) return 9;
     }
 
     /* Shape 7 -- a local function that CONSTRUCTS the heap object. Ownership
        has to transfer out of it unreleased, exactly as out of a top-level
        function; if it did not, `b` would be retained once too often here and
-       one arena slot would leak per call. */
+       one object would leak per call and the live count would climb. */
     for (uint64_t v = 0; v < 500; v++) {
         uint64_t top = makeViaTopLevel(v);
-        if (dc_free_top != 64) return 10;
+        if (dc_heap_live != 0) return 10;
         uint64_t clo = makeViaClosure(v);
-        if (dc_free_top != 64) return 11;
+        if (dc_heap_live != 0) return 11;
         if (top != v || clo != v) return 12;
     }
 

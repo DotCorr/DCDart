@@ -141,8 +141,22 @@ body composes for free). After the body closes, `_values` for loop-carried varia
 the header's own params — the exit block is only reachable via the header's false edge, never through
 the body, so what's live there is the header's phi params, not whatever the body last computed (same
 restore-after-branch reasoning ADR-0027 established for `_lowerIf`, specialized to a loop header).
-Heap/weak locals inside the body are explicitly rejected (checked via `_heapLocals`/`_weakLocals`
-length before/after) — the naive release policy has no policy for a back edge that isn't a `return`.
+Heap/weak locals inside the body were explicitly rejected (checked via `_heapLocals`/`_weakLocals`
+length before/after) — the naive release policy had no policy for a back edge that isn't a `return`.
+
+**Addition (2026-08-26): per-iteration release, `tests/conformance/loopheap/`.** That rejection is
+gone and the policy it was standing in for now exists. `_heapLocals`/`_weakLocals`'s length at body
+entry is the body's SCOPE MARK; `_releaseScopeFrom` emits a `Release`/`DropWeak` for everything at
+or beyond it on each path OUT of the body, and `_forgetLocalsFrom` drops the tracking once every
+path has been lowered. The paths, all of which had to be covered because a miss on any one of them
+is either a leak or a use-after-free: the body's normal fall-through (released before the back
+edge — for a `for`, before the branch into the update block, so ADR-0050's update still runs);
+`break` and `continue`, which release before their `Branch` in `_lowerStatement`'s `BreakStatement`
+case; and `return`, already covered by `_lowerReturn`'s whole-stack release. The unwind depth is
+stored per LABEL in `_labelTargets`, not per innermost loop, which is what makes a labelled
+`break outer;` out of a nested loop release the inner body's objects and the outer body's in one
+go. Unchanged and still rejected: a heap/weak local declared in an `if`-branch that FALLS THROUGH
+(`_lowerIf`'s `branchToMerge` check) — an if/else-merge ownership question, not a loop one.
 
 ## File map
 

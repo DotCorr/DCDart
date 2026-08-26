@@ -66,6 +66,12 @@ Future<void> runBuild(BuildOptions options) async {
     module,
     targetTriple: target.triple,
     noRedZone: target.forbidsRedZone,
+    // The heap default is target-dependent: hosted `.bss` is lazily backed by
+    // the OS, freestanding `.bss` is physical frames a kernel must find at
+    // boot (ADR-0058). Derived from the target rather than passed by hand,
+    // the same way `noRedZone` is.
+    freestanding: target.isFreestanding,
+    heapRegionBytes: options.heapRegionBytes,
   );
 
   final tempDir = Directory.systemTemp.createTempSync('dcc_backend_');

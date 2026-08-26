@@ -245,6 +245,13 @@ Set<int> referencedValueIds(DCInstruction instruction) {
       break; // names a symbol, not a value; no operands
     case Alloc():
       break; // always a fresh header; no operands
+    case AllocRaw(:final sizeBytes):
+      // The SIZE is a real operand, unlike Alloc's compile-time constant.
+      // Missing it here would let the elision pass treat the value computing
+      // the size as dead between its definition and this use (ADR-0058).
+      ref(sizeBytes);
+    case FreeRaw(:final pointer):
+      ref(pointer);
     case Call(:final args):
       args.forEach(ref);
     case Retain(:final object):

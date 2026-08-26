@@ -5,7 +5,7 @@ capture convention *is* an ARC convention; and because the enabling mechanism (i
 removes a fact every elision pass currently relies on.
 
 **No current work is blocked by this document.** The non-capturing subset has since landed
-(ADR-0057) and is deliberately built so that it answers none of the questions below — see §6, which
+(ADR-0058) and is deliberately built so that it answers none of the questions below — see §6, which
 also reports the one number that makes §3 concrete rather than theoretical. What should not happen
 is a *capturing* closure lowering landing that answers §2 and §3 by default rather than by decision.
 

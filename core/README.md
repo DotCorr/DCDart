@@ -11,7 +11,7 @@ Layout follows the compiler pipeline's own stages (frontend → lowering → IR 
 | `dcc-lower/` | Kernel IR → DC-IR | **implemented, working, fully verified** for M0/M1 (all clauses) and M2's sixteen ARC/elision/recursion/mutability/control-flow/port-io/bitwise/move-semantics/if-else-merge slices, ADR-0016 through ADR-0032 (real heap objects, alias retain, calls, heap-typed signatures, heap-typed fields, `@owned` parameters, destructor cascade, weak references, redundant-pair elision, verified recursion, scalar reassignment, real `while`-loop control flow, x86 port I/O, move semantics, if/else merge blocks, heap field stores) |
 | `dc-ir/` | DC-IR: typed SSA, explicit retain/release | real pub package (`dc_ir`), plain hosted Dart per ADR-0006. Arithmetic, `Load`/`Store`/`IntToPtr`/`PtrOffset`, `ICmp`, `Branch`/`CondBranch`, `MakeStruct`/`ExtractField`, `Alloc`/`Retain`/`Release`, `Call` (now carrying `argOwnership`, ADR-0031), `MakeWeak`/`WeakLoad`/`DropWeak`, `PortOut`/`PortIn` (M2, ADR-0018/0022/0023/0029), and `IDiv`/`IRem` (ADR-0036 — the only new instructions the whole operator-completion effort needed; `IMul` and all ten `ICmpPredicate` values had existed since M0 with no source operator wired to them). Consumed for real by `dcc-lower` and `backend` — `while`-loop back edges (ADR-0028) needed no new instructions, just real use of the block-parameter merge points already there |
 | `dc-elide/` | Elision passes (spec §3.2) | **`elideRedundantRetainReleasePairs` implemented and verified** for pass 3 (ADR-0025) and pass 4's call-consumed case (ADR-0031) — a separate small package (only depends on `dc_ir`) purely so its own test suite can use `package:test`, which `dcc_lower`'s vendored-`kernel` dependency can't reconcile. 6 unit tests (3 positive, 3 negative/safety, including the critical "used again after an owned call" case) plus real end-to-end firing verified via `dc-objdump --arc` |
-| `backend/` | DC-IR → LLVM IR → object file | **implemented, working, fully verified** for M0/M1, plus M2's real ARC codegen (`Alloc`/`Retain`/`Release` against a fixed arena, ADR-0015), real function-call codegen (`Call`, ADR-0018), a real destructor-dispatch call through the object header's `cls` field (ADR-0022), real weak-reference codegen with zombie-slot semantics (ADR-0023), correct `phi`-predecessor tracking across internally-split blocks (ADR-0028, a real latent bug fixed), and real x86 port-I/O codegen via fixed inline asm (ADR-0029, verified against a real disassembly) — compiled via `clang -c` |
+| `backend/` | DC-IR → LLVM IR → object file | **implemented, working, fully verified** for M0/M1, plus M2's real ARC codegen (`Alloc`/`Retain`/`Release` against a real segregated size-class heap, ADR-0058 — which replaced ADR-0015's fixed 64-slot arena; see the note below the table, because that arena's limits were why every M3 benchmark was unwritable), real function-call codegen (`Call`, ADR-0018), a real destructor-dispatch call through the object header's `cls` field (ADR-0022), real weak-reference codegen with zombie-slot semantics (ADR-0023), correct `phi`-predecessor tracking across internally-split blocks (ADR-0028, a real latent bug fixed), and real x86 port-I/O codegen via fixed inline asm (ADR-0029, verified against a real disassembly) — compiled via `clang -c` |
 | `dcc/` | the `dcc` CLI driver | **`--target` selects the machine/OS (ADR-0033): `host`, `macos-arm64`, `linux-x86_64`, `windows-x86_64` and four more, defaulting to the original `bare-x86_64` so nothing that predates the flag changes. `--emit-header` writes a C header for FFI (ADR-0034).** **`dcc build --mode bare` produces real object files** for all thirty-six example targets below, all passing their conformance harnesses. `--mode hosted` still throws (no backend target designed for it) |
 | `dc-objdump/` | ARC instruction counter (`CLAUDE.md`'s testing rules) | **`dc-objdump --arc <source.dart>` implemented and verified** (ADR-0024) — counts `Alloc`/`Retain`/`Release`/`MakeWeak`/`WeakLoad`/`DropWeak` per function at the DC-IR level (the only place these are countable at all — they're inlined, not symbols, by the time `backend` is done). Every count cross-checked exactly against every M2 ADR's own hand-derived trace, zero mismatches. Now also what proves ADR-0025's elision pass actually fires |
 | `runtime/dc-core-bare/` | `dc:core.bare` — zero-dependency freestanding subset | `prelude.dart`: `bare`, `u64` (`+`, `-`, `<`, `&`, `|`, `^`, `<<`, `>>`), `u32`/`u16`/`u8` (`&`, `|`, `^`, `<<`, `>>`), `Pointer<T>`, `@packed`/`Struct`, `Result` (`.ok`/`.err`/`.propagate()`), `HeapObject`, `@owned`, `Weak<T>`, `Port` (`.outb`/`.inb`) — see ADR-0008, 0010, 0011, 0014, 0016–0023, 0029, 0030. **All four sized-int widths now carry the full operator set** — `+ - * ~/ %` (all trapping) and `< <= > >= == !=` (ADR-0035/0036), where before only u64 had `+ - <` and the narrower widths had no arithmetic or comparison at all |
@@ -33,6 +33,30 @@ Layout follows the compiler pipeline's own stages (frontend → lowering → IR 
 >
 > Run it yourself with `bash core/tests/run-conformance.sh`; the summary line names the host and the
 > link mode so no future reader repeats the mistake.
+
+> **The heap was replaced on 2026-08-26 (ADR-0058), and the reason matters more than the change.**
+> Until then DCDart allocated from ADR-0015's fixed `[64 x [64 x i8]]` arena — labelled at the time
+> as a first proof of ARC codegen rather than an allocator, and never revisited. It permitted **64
+> live objects, 48 bytes of fields, and no allocation inside a loop body at all.** All three failed
+> loudly, so no wrong answer was ever produced and nothing drew attention to the aggregate — which
+> was that **none of M3's five benchmarks could be written**, including the tree/graph traversal that
+> needs no `String`, no generics and no closures and had been reported as the one that was fine.
+> GAP-0050.
+>
+> Two consequences for reading the rows below:
+>
+> - **Every target here that allocates was sized to fit under 64** — most visibly `m2-recursion` at
+>   depths 0–60. Those tests are correct and were honestly written, but the suite's green state
+>   carried no information about allocation at any realistic scale, and no test in it would have
+>   failed if the allocator had been far worse than it looked.
+> - **`dc_free_top` is gone.** Leak tests now assert `dc_heap_live == 0`, which measures the property
+>   they always wanted — nothing live — at any scale and across every size class, rather than "all 64
+>   slots are free."
+>
+> Limits now: **65,536 live objects and 1 MiB per object** hosted (2,048 and 64 KiB freestanding,
+> where `.bss` is physical frames a kernel must find at boot rather than address space an OS backs
+> lazily). Still no coalescing and no cross-class reuse — stated in ADR-0058 because it is the single
+> most likely thing to make an M3 number look better than a real allocator would.
 
 | `examples/m0-seam/` | M0 target (`add.dart`, `main.c`) | **`tests/conformance/m0/run.sh`: unqualified PASS** |
 | `examples/m1-pointer/` | M1 target (`mmio.dart`, `main.c`) | **`tests/conformance/m1-pointer/run.sh`: unqualified PASS** |

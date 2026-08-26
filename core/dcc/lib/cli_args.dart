@@ -51,12 +51,25 @@ class BuildOptions {
   /// file; both are produced.
   final String? headerPath;
 
+  /// Bytes per size-class heap region (ADR-0058), or null to take the
+  /// target-dependent default: 2 MiB per class hosted, 64 KiB per class
+  /// freestanding, because freestanding `.bss` is physical frames a kernel
+  /// must find at boot rather than address space an OS backs lazily.
+  ///
+  /// Exposed mainly so a test can ask for a DELIBERATELY TINY heap and reach
+  /// the out-of-memory boundary in a few allocations. Without it, proving the
+  /// OOM path means allocating 65,536 objects, which is slow and — since
+  /// allocation inside a loop is not yet supported — would have to be done by
+  /// recursing 65,537 frames deep, testing the C stack as much as the heap.
+  final int? heapRegionBytes;
+
   const BuildOptions({
     required this.mode,
     required this.inputPath,
     required this.outputPath,
     this.target = DCTarget.defaultTarget,
     this.headerPath,
+    this.heapRegionBytes,
   });
 
   @override
@@ -98,6 +111,12 @@ Options for build:
                            Orthogonal to --mode: a @bare object is a plain
                            C-ABI object and links into an ordinary native
                            program on any of these.
+  --heap-region-bytes <n>  Bytes per size-class heap region (ADR-0058).
+                           Power of two, >= 4096. Total heap is 8x this.
+                           Default: 2 MiB per class hosted (16 MiB total),
+                           64 KiB per class freestanding (512 KiB total) --
+                           freestanding .bss is physical frames a kernel must
+                           find at boot, not address space an OS backs lazily.
   --emit-header <path>     Also write a C header declaring every exported
                            function, so C/Rust/Python can FFI into it.
   -o, --output <path>      Output object file path. Required.
@@ -150,6 +169,7 @@ BuildOptions _parseBuildArgs(
   String? inputPath;
   DCTarget? target;
   String? headerPath;
+  int? heapRegionBytes;
 
   var i = 0;
   while (i < args.length) {
@@ -196,6 +216,38 @@ BuildOptions _parseBuildArgs(
         // lists every supported target, so it is passed through unchanged.
         throw CliUsageError('dcc build: ${e.message}');
       }
+      i += 2;
+      continue;
+    }
+
+    if (arg == '--heap-region-bytes') {
+      if (i + 1 >= args.length) {
+        throw CliUsageError(
+          'dcc build: --heap-region-bytes requires a value (bytes per size '
+          'class, a power of two >= 4096)',
+        );
+      }
+      final raw = args[i + 1];
+      final parsed = int.tryParse(raw);
+      if (parsed == null || parsed <= 0) {
+        throw CliUsageError(
+          'dcc build: --heap-region-bytes must be a positive integer, got '
+          '"$raw"',
+        );
+      }
+      // The power-of-two requirement is enforced again in the backend, which
+      // is where the shift is actually emitted. Checked here too so a typo is
+      // a usage error at the CLI rather than a compiler error deep in
+      // emission -- the two messages explain the same constraint from the two
+      // ends a reader might hit it from.
+      if (parsed & (parsed - 1) != 0) {
+        throw CliUsageError(
+          'dcc build: --heap-region-bytes must be a power of two, got $parsed. '
+          'The size-class-from-address computation is emitted as a shift; a '
+          'non-power-of-two would push freed blocks onto the wrong free list.',
+        );
+      }
+      heapRegionBytes = parsed;
       i += 2;
       continue;
     }
@@ -251,5 +303,6 @@ BuildOptions _parseBuildArgs(
     outputPath: outputPath!,
     target: target ?? DCTarget.defaultTarget,
     headerPath: headerPath,
+    heapRegionBytes: heapRegionBytes,
   );
 }

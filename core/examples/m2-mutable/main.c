@@ -1,6 +1,8 @@
 // M2 scalar-reassignment harness (docs/decisions/0027-scalar-
 // reassignment.md). Pure scalar arithmetic, no heap involved -- no
-// dc_free_top check needed, just correctness.
+// `dc_heap_live` check needed (the heap globals, docs/decisions/0058, are
+// only emitted for a module that actually allocates, so the symbol does not
+// even exist here), just correctness.
 #include <stdint.h>
 
 extern uint64_t mutateStraightLine(uint64_t v);

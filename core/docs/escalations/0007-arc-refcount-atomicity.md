@@ -164,3 +164,47 @@ through raw pointers, which raises no §3 question, the same boundary ADR-0051 d
 kernel's tick counter and frame bitmap are fixed today regardless of how this is answered. The only
 thing that must not happen is M3 being declared green on a number measured without knowing which
 language it measured.
+
+---
+
+## 7. This is one concurrency model with three consumers, not three questions
+
+**Added after the fact, from the DCDart side, because this document is what gets read at freeze
+time and the scope above is narrower than the decision actually is.**
+
+Sections 1–6 frame this as a question about refcounts. It is not. Three separate mechanisms have now
+been built that each assume single-threaded, interrupt-free execution, each for locally good reasons,
+each recorded honestly — and **they cannot be answered independently without ending up mutually
+incoherent:**
+
+| # | mechanism | what is non-atomic | recorded in |
+|---|---|---|---|
+| 1 | **ARC refcounts** | `retain`/`release` are load-add-store | this escalation |
+| 2 | **The heap** | bump cursors and free-list heads are plain loads and stores | ADR-0058 |
+| 3 | **IPC channels** (`oscortex_core` M20) | SPSC free-running counters with a stated publication order and deliberately no fences | `oscortex_core` GAP-0165 |
+
+**Why they are one decision.** A design with atomic refcounts and a non-atomic free list is not a
+partial fix, it is an incoherent one: `release` would correctly reach zero from two threads exactly
+once, then both would race on the free-list head and produce a cycle in the list or a double-free.
+The refcount's atomicity buys nothing unless the allocator's does too. The same holds in the other
+direction — a thread-safe allocator under non-atomic refcounts protects the wrong layer, since the
+corruption happens before `free` is ever called.
+
+**The IPC case is worth reading closely, because the agent that built it made the right call for a
+reason that generalises.** It declined to use ADR-0055's atomics. Not from ignorance: on one core
+with interrupts clear they are pure cost, and using them would have **disguised** the single-core
+dependency rather than removed it — a fence that does not actually establish the property still
+looks, to a later reader, exactly like one that does. So the dependency is recorded explicitly
+instead of being papered over. That is the correct treatment for all three, and it is why none of
+this is an incident: every one of them is a *stated* assumption, not a hidden one.
+
+**What this changes about the recommendation.** §5 recommends reopening this document with M3's
+measurement in hand. That still holds, with one addition: the measurement and the decision must cover
+the allocator as well as the refcounts, because **the cost of atomicity is not a refcount property —
+it is the sum across all three mechanisms**, and measuring only the refcount half would understate it
+in exactly the direction that makes "just make it atomic later" sound cheaper than it is.
+
+Concretely, for whoever holds this at freeze time: the question is not *"should retain/release be
+atomic?"* It is *"what is DCDart's concurrency model, and what do refcounts, the allocator and any
+shared-memory channel each have to guarantee under it?"* Answering the narrow question first and
+deriving the others from it is how the three end up disagreeing.

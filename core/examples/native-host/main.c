@@ -13,7 +13,7 @@
 //
 // Exit codes (each identifies exactly which claim broke):
 //    0  all correct
-//    1  arena not at baseline before any DCDart call
+//    1  heap not at baseline before any DCDart call
 //    2  perfectCount(2,10000) wrong           (must be 4)
 //    3  perfectSum(2,10000) wrong             (must be 8658)
 //    4  primeCount(10000) wrong               (must be 1229)
@@ -25,7 +25,7 @@
 //   10  modPow32 wrong
 //   11  triangleU16 wrong
 //   12  gcdU8 wrong
-//   13  ARC leak: arena free-list did not return to baseline
+//   13  ARC leak: live-object count did not return to baseline
 #include <stdint.h>
 #include <stdio.h>
 
@@ -44,13 +44,15 @@ extern uint32_t modPow32(uint32_t base, uint32_t exp, uint32_t mod);
 extern uint16_t triangleU16(uint16_t n);
 extern uint8_t  gcdU8(uint8_t a, uint8_t b);
 
-/* The M2 ARC arena's free-list counter -- a real symbol in the object file
- * (core/backend, docs/decisions/0015-m2-minimal-arc-arena.md). 64 = every
- * slot free. Reading it from ordinary C is itself part of the proof that
- * this is a normal native object. */
-extern uint32_t dc_free_top;
+/* The ARC heap's LIVE-OBJECT counter -- a real symbol in the object file
+ * (core/backend, docs/decisions/0058-segregated-size-class-heap.md).
+ * Incremented by every Alloc, decremented when a block goes back on its size
+ * class's free list, so 0 = nothing live: an exact leak assertion at any
+ * scale and in every size class, not a proxy. Reading it from ordinary C is
+ * itself part of the proof that this is a normal native object. */
+extern uint64_t dc_heap_live;
 
-#define ARENA_SLOTS 64u
+#define LIVE_BASELINE 0u
 
 /* Closed form for 1^2 + 2^2 + ... + n^2. Shares no code with the DCDart
  * loop that computes the same sum by accumulation. */
@@ -76,12 +78,13 @@ int main(void) {
     printf("A @bare DCDart object built with --target host, linked into this\n");
     printf("ordinary C program by plain clang and executed natively.\n\n");
 
-    if (dc_free_top != ARENA_SLOTS) {
-        printf("FAIL arena not at baseline before any call: dc_free_top = %u\n",
-               dc_free_top);
+    if (dc_heap_live != LIVE_BASELINE) {
+        printf("FAIL heap not at baseline before any call: dc_heap_live = %llu\n",
+               (unsigned long long)dc_heap_live);
         return 1;
     }
-    printf("ARC arena baseline before any call: dc_free_top = %u\n\n", dc_free_top);
+    printf("ARC heap baseline before any call: dc_heap_live = %llu\n\n",
+           (unsigned long long)dc_heap_live);
 
     /* --- perfect numbers: 6, 28, 496, 8128 are the only ones below 10000,
        a classical result, so 4 and 8658 are known independently. --- */
@@ -181,24 +184,25 @@ int main(void) {
     if (gcdU8(252, 105) != 21 || gcdU8(255, 128) != 1) return 12;
 
     /* --- ARC: every call above allocated two heap objects (a Range and a
-       Tally). If any release were missed the 64-slot arena would have been
-       exhausted long ago; check it landed back exactly at baseline. --- */
-    printf("\nARC arena after all calls: dc_free_top = %u (baseline %u)\n",
-           dc_free_top, ARENA_SLOTS);
-    if (dc_free_top != ARENA_SLOTS) {
-        printf("FAIL ARC leak: arena did not return to baseline\n");
+       Tally). Thousands of calls have run by now, so a single missed release
+       anywhere above leaves the live count far from zero; check it landed
+       back exactly at baseline. --- */
+    printf("\nARC heap after all calls: dc_heap_live = %llu (baseline %u)\n",
+           (unsigned long long)dc_heap_live, LIVE_BASELINE);
+    if (dc_heap_live != LIVE_BASELINE) {
+        printf("FAIL ARC leak: live-object count did not return to baseline\n");
         return 13;
     }
     /* Hammer it: 2000 more allocating calls, checking baseline every time. */
     for (uint64_t i = 0; i < 2000; i++) {
         if (perfectCount(2, 30) != 2) return 2;   /* 6 and 28 */
-        if (dc_free_top != ARENA_SLOTS) {
-            printf("FAIL ARC leak after %llu repeat calls: dc_free_top = %u\n",
-                   (unsigned long long)i, dc_free_top);
+        if (dc_heap_live != LIVE_BASELINE) {
+            printf("FAIL ARC leak after %llu repeat calls: dc_heap_live = %llu\n",
+                   (unsigned long long)i, (unsigned long long)dc_heap_live);
             return 13;
         }
     }
-    printf("  ok   2000 further allocating calls, arena at baseline every time\n");
+    printf("  ok   2000 further allocating calls, heap at baseline every time\n");
 
     if (failures != 0) {
         printf("\n%d check(s) failed\n", failures);

@@ -175,14 +175,14 @@ void main() {
     expect(ll, contains('getelementptr (i8, ptr @base, i64 16)'));
   });
 
-  test('a global colliding with an ARC arena name is rejected, not emitted', () {
+  test('a global colliding with an ARC heap name is rejected, not emitted', () {
     // linkName goes out verbatim (spec §9) with no mangling, so nothing
     // downstream would catch this collision.
     expect(
       () => emitModule(
         moduleWith([
           DCGlobal(
-            linkName: 'dc_free_top',
+            linkName: 'dc_heap_live',
             initializer: const DCConstArray(DCInt.u64, [DCConstInt(DCInt.u64, 0)]),
             alignBytes: 8,
           ),

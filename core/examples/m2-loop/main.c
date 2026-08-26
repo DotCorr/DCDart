@@ -1,5 +1,7 @@
 // M2 real-loop-control-flow harness (docs/decisions/0028-while-loop.md).
-// Pure scalar arithmetic, no heap involved -- no dc_free_top check needed,
+// Pure scalar arithmetic, no heap involved -- no `dc_heap_live` check
+// needed (the heap globals, docs/decisions/0058, are only emitted for a
+// module that actually allocates, so the symbol does not even exist here),
 // just correctness of both loop-carried-variable threading and a nested
 // early-return inside a loop body.
 #include <stdint.h>

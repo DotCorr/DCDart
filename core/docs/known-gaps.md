@@ -335,6 +335,10 @@ mode: the better the comment, the longer the wrong refusal survives.
 `dcc-lower` contains several more of these — `break`/`continue`, heap locals in loop bodies,
 getters/setters on `HeapObject` (ADR-0043), heap-typed field stores (escalation 0006). Some are
 genuinely unresolved design questions; at least one was not. They have never been audited as a group.
+Two have since been audited individually, and they came out opposite ways, which is the useful part:
+`break`/`continue` (ADR-0047) was a refusal that had stopped being real, while heap locals in loop
+bodies (2026-08-26, GAP-0050) was a refusal that WAS real and stayed real right up until the
+guarantee behind it was actually built. "Audit the refusal" does not mean "delete the refusal".
 
 **A SECOND question, added 2026-08-22.** The audit question below assumes the thing being audited is
 a refusal. Two of ADR-0050's silent hangs had no refusal at all: the loop-carried walker was correct,
@@ -397,9 +401,13 @@ would do so silently — the emitted IR is still well-formed, the values are jus
 
 **Cost of the workaround:** each refusal is individually honest, so nothing is hidden. The cost is
 that downstream consumers discover which ones were merely untested, mid-way through building
-something else. The remaining unaudited refusals: heap locals in loop bodies (ARC policy — genuinely
-unresolved, belongs with escalation 0006), getters/setters on `HeapObject` (ADR-0043 — untested, not
-unresolved), and heap-typed field stores (escalation 0006).
+something else. The remaining unaudited refusals: getters/setters on `HeapObject` (ADR-0043 —
+untested, not unresolved) and heap-typed field stores (escalation 0006). Heap locals in loop bodies
+used to head this list as "genuinely unresolved"; it was, and auditing it produced the
+per-iteration release policy (GAP-0050) rather than another sentence — the refusal was correct for
+the release policy that existed, so removing it meant supplying the guarantee, not deleting the
+check. The remaining sliver, a heap local declared in an `if`-branch that falls through, is an
+if/else-merge refusal and is recorded under GAP-0050 with the others.
 
 ---
 
@@ -463,6 +471,7 @@ inferring from the gaps file:
 | `null` / nullable heap refs | **RESOLVED 2026-08-22 (ADR-0049)** | — |
 | heap-typed field **store** | **RESOLVED 2026-08-22 (ADR-0048)** | — |
 | `for` loops | **RESOLVED 2026-08-22 (ADR-0050)** | — |
+| heap-typed local declared in a loop BODY (allocating in a loop) | **RESOLVED 2026-08-26** — per-iteration release policy, `tests/conformance/loopheap/`, recorded under GAP-0050 | — (it blocked every benchmark that builds a structure in a loop, which is all five) |
 
 Only `bool` locals passed at the time. Since then: instance methods (ADR-0043), nested loops
 (ADR-0044), `break`/`continue` (ADR-0047), nullable heap references (ADR-0049), heap-typed field
@@ -1212,10 +1221,11 @@ should prevent it.
 ## GAP-0017 — M2's naive Retain/Release insertion + weak references + first elision pass (RESOLVED); passes 1/2/4/5 + unowned/cycles/heap-in-loop remain
 
 **Domain:** dcc-lower, backend (M2, M3+)
-**Status:** items 1, 2 (pass 3 only), 3 (weak only), 5, AND item 6 (scalar-only `while` loops)
-RESOLVED (2026-08-14/15/16, ADR-0017/0019/0020/0021/0022/0023/0025/0027/0028) — item 4 (plus
-`unowned` within item 3, passes 1/2/4/5 within item 2, and heap/weak locals inside a loop body within
-item 6) remain, correctly later-milestone/optional/sequenced-after-the-first-pass.
+**Status:** items 1, 2 (pass 3 only), 3 (weak only), 5, AND item 6 (`while` loops, now INCLUDING
+heap/weak locals in the body) RESOLVED (2026-08-14/15/16/26,
+ADR-0017/0019/0020/0021/0022/0023/0025/0027/0028 + the per-iteration release policy recorded under
+GAP-0050) — item 4 (plus `unowned` within item 3 and passes 1/2/4/5 within item 2) remain, correctly
+later-milestone/optional/sequenced-after-the-first-pass.
 
 `core/tests/conformance/m2-heap/run.sh` proves the *core mechanism* (real `Alloc`/`Retain`/`Release`
 codegen, real heap object construction/field access from source, a real leak test passing 1000 real
@@ -1306,12 +1316,13 @@ cycles under Linux) — genuinely the highest-risk part of M2 per `AGENTS.md`. W
    `Release`'s destructor path, `WeakLoad`'s dead/alive split all do this) — latent since M0, invisible
    until a loop's back edge became the first non-empty-args branch to follow a block containing
    arithmetic. Fixed via a two-pass emission restructure in `core/backend/lib/llvm_emit.dart`; zero
-   regressions across the full 14-target suite. **Still explicitly unsupported, enforced by a real
-   check (not silently mishandled):** heap- or weak-typed locals declared inside a loop body (the
-   naive release policy has no policy for a back edge that isn't a `return` — see item 2's move
-   semantics note for the shape of the ownership-policy question this raises), `for`/`do-while`
-   (different Kernel AST shapes), `break`/`continue`, and nested loops. Each throws a clear
-   `DccLowerError` rather than mis-scoping. **What was already proven before this ADR, closing
+   regressions across the full 14-target suite. **What was unsupported when this was written, and
+   what became of it:** nested loops (ADR-0044), `break`/`continue` (ADR-0047), `for` (ADR-0050) and
+   — as of 2026-08-26 — heap/weak locals declared inside a loop body, via the per-iteration release
+   policy recorded under GAP-0050 and asserted by `tests/conformance/loopheap/`. Each was a real
+   `DccLowerError` rather than a mis-scoping while it stood, which is why removing them was a
+   matter of supplying the missing guarantee rather than of hunting silent wrong answers.
+   `do-while` and `for-in` remain unsupported. **What was already proven before this ADR, closing
    ADR-0018's own "recursion is untested" flag**: a self-recursive `@bare` function works with ZERO new
    lowering logic (`Call`'s design, ADR-0018, already handled it correctly) —
    `core/examples/m2-recursion/recursion.dart` verifies recursive calls plus a heap object allocated
@@ -1641,10 +1652,33 @@ host Dart runtime doesn't have.
 
 ---
 
-## GAP-0045 — `String` and `StrBuf` not implemented; only borrowed `Str` exists
+## GAP-0045 — no owning `String` TYPE; `StrBuf` is now writable but is not in the prelude
 
 **Domain:** dcc-lower, runtime, spec §7
-**Status:** OPEN — blocked on spec §12 open decision 2 (the allocator)
+**Status:** NARROWED 2026-08-26 (ADR-0058) — the blocker was the allocator, and the allocator exists
+
+**What changed.** This entry said "blocked on spec §12 open decision 2." That decision is closed
+(ADR-0058) and `Heap.allocate(n)`/`Heap.free(p)` are real, so **growable text is now expressible**:
+`tests/conformance/rawheap/` builds a `StrBuf` from capacity 1 to 500,000 bytes across ~19
+reallocations, leak-free. M3's string-processing pass and JSON parser are writable.
+
+**What is still missing** is narrower than before and worth stating precisely, because "strings work
+now" would be wrong:
+
+- **No `String` or `StrBuf` TYPE in the prelude.** Every program that wants one writes it, as the
+  conformance target does. The prelude cannot hold it yet: its members are stubs that lowering
+  substitutes codegen for, and a real DCDart implementation there would need prelude function bodies
+  to be lowered like any other library, which they are not.
+- **No concatenation, formatting, comparison beyond bytes, or `toString`.**
+- **No UTF-8 validation.** A `StrBuf` filled with arbitrary bytes and read as text is not checked.
+
+**Cost of the workaround:** every program needing growable text carries its own copy of the same
+twenty lines, and each copy is a chance to get the ownership wrong — a `StrBuf` whose backing block
+is freed twice is a corrupted free list, not a crash.
+
+**Next step:** decide how library types live in the prelude (lowered bodies, or a second `dc:core`
+library the driver compiles alongside the user's), then move `StrBuf` there. That is a driver/library
+question, not a language one.
 
 ADR-0053 implements spec §7's borrowed `Str` slice. It does not implement spec §7's owning
 `String` or mutable `StrBuf`, both of which are heap types and therefore blocked on the allocator
@@ -1904,3 +1938,79 @@ DC-IR (one field on `DCFunction`, honoured by `llvm_emit.dart` as LLVM `internal
 `c_header.dart`) — which is also the right mechanism for letting a user mark a `@bare` function
 module-private, so it should be designed once for both rather than bolted on for synthesized
 functions alone.
+
+---
+
+## GAP-0050 — there is no heap: ZERO of M3's five benchmarks are writable, and the reason is not the one being tracked
+
+**Domain:** backend (`llvm_emit.dart`), dcc-lower, spec §12 decision 2
+**Status:** OPEN — this is the M3 critical path
+
+GAP-0035 tracks M3's prerequisites as a list of missing language features: closures, generic classes,
+`String`. That framing is incomplete in a way that matters, because fixing all three would still
+leave every benchmark unwritable.
+
+**DCDart's heap is a fixed `[64 x [64 x i8]]` static array** (ADR-0015's "minimal ARC arena",
+correctly labelled at the time as a first proof rather than an allocator). Measured, not inferred:
+
+| limit | value | how it fails |
+|---|---|---|
+| live objects | **64** | runtime trap. `deep(64)` returns 2080; `deep(65)` traps (SIGTRAP) |
+| object size | **48 bytes of fields** (64 − 16 header) | compile-time refusal, by name |
+| allocation site | ~~**not inside a loop body**~~ **RESOLVED 2026-08-26** | was a compile-time refusal: "naive ARC has no release policy for a loop back edge yet". See below. |
+
+All three fail loudly rather than silently, which is why this went unnoticed rather than producing
+wrong answers — and the oversized-object case in particular is caught at compile time with the
+arithmetic spelled out, which is good engineering worth preserving through any replacement.
+
+**The third row is now closed: PER-ITERATION RELEASE (`tests/conformance/loopheap/`).** The refusal
+was a lowering restriction, not an allocator one, and it was correct for the policy it guarded:
+ADR-0016/0017 release tracked locals only before a `return`, so a heap local declared in a loop body
+was a fresh object every iteration that nothing ever released — one leaked object per iteration.
+`dcc-lower` now releases a body-scoped heap/weak local on **every path that leaves the body**: the
+normal fall-through into the back edge (for a `for`, into the update block, so the update still
+runs), every `continue`, every `break` — including a labelled one out of a nested loop, which
+unwinds both bodies because the release depth is recorded per LABEL, not per innermost loop — and
+every `return`, which was already covered by `_lowerReturn`'s whole-stack release and is now
+asserted rather than assumed. `while` and `for` both, since ADR-0050 desugars one to the other.
+
+Verified two ways, because neither alone is sufficient. `dc-objdump --arc` pins the release SITES
+per function, which is what catches a release silently dropped from one path (`liveChain` 1/1,
+`withContinue` 1/2, `withBreak` 1/2, `withReturn` 1/2, `nested` 2/2). And 1000-iteration runs check
+`dc_heap_live` back at baseline after every call plus the computed value, which separates the two
+failure modes: a missing release moves the live count, while a release placed one instruction too
+early is a use-after-free that keeps the count perfectly balanced and shows up only in the
+arithmetic. Both were confirmed by mutation — deleting either release site turns the target red.
+
+**Still refused, and it is an if/else question rather than a loop one:** a heap/weak local declared
+inside an `if`-branch that FALLS THROUGH to code after the `if` (`_lowerIf`'s `branchToMerge`
+check). Inside a loop body that means `while (c) { if (p) { final n = Node(); use(n); } }` is
+rejected while the same declaration at body scope, or in a branch that `break`s/`continue`s/
+`return`s, is fine. Cost of the workaround: hoist the declaration to the top of the body. No ADR was
+written for the per-iteration policy — `docs/decisions/` was owned by a concurrent session at the
+time — so this entry is the record until one is.
+
+**What it means for the gate.** M3 requires a JSON parser, a hashmap workload, a tree/graph
+traversal, a string pass and a closure-heavy workload, measured at ≤10% geometric mean ARC overhead
+vs C. A tree traversal is the one that looks writable today — it needs no `String`, no generics and
+no closures. It is not: a tree with more than 64 live nodes exceeds the arena, and building one in a
+loop is refused outright. **The benchmark that appeared unblocked is blocked by the heap, and so is
+every other one.** An earlier status report in this project said "one of five is writable"; that was
+wrong, and it was wrong because the arena's limits were never put next to the benchmark
+requirements.
+
+**Why an ARC gate cannot be measured on this arena even if the benchmarks were writable.** The
+number M3 exists to produce is ARC overhead vs C, and C's baseline is `malloc`/`free`. A fixed-slot
+LIFO free-list over a static array is not a comparable allocator: it has no size classes, no
+coalescing, no fragmentation, and O(1) allocation with a two-instruction free. Measuring against it
+would produce a *flattering* number that describes a program no one can write. The allocator is not
+a prerequisite of the benchmarks; it is part of what the benchmarks measure.
+
+**Cost of the workaround:** every conformance target that allocates was sized to fit under 64 — most
+visibly `m2-recursion`, which tests depths 0–60. Those tests are correct and were not written
+dishonestly, but the suite's green state carries no information about allocation behaviour at any
+realistic scale, and no test in it would fail if the allocator were far worse than it looks.
+
+**Next step:** close spec §12 decision 2 and implement a real allocator (ADR-0058). Removing the
+64-object and 48-byte limits is the allocator's job; removing the loop-body restriction was a
+lowering job (per-iteration release policy) and is **done** — see the third row of the table above.
