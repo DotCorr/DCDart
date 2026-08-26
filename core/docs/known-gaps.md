@@ -2210,3 +2210,59 @@ must take heap arguments BORROWED (GAP-0057) — which is what `map`/`filter`/`f
 
 **Still zero of five written.** The row above changing from NO to yes is not progress toward the
 gate; it removes the last reason the gate cannot be attempted.
+
+---
+
+## GAP-0062 — elision removes 1 of 19 retains on the JSON parser, and nothing could measure that until now
+
+**Domain:** dc-elide, dcc-lower (M3 gate)
+**Status:** OPEN — measured, and it is the M3 gate's dominant term
+
+`dc-sys-21`'s `hashmap` benchmark found that ADR-0025's pass 3 elides **none** of its ~30
+executed retain/release pairs, and attributed the gate's ~2.4× to that rather than to ARC being
+expensive in principle. Checked independently against the three benchmarks written on this side:
+
+| benchmark | retains after lowering | after elision | removed |
+|---|---|---|---|
+| `tree-traversal` | 6 | 4 | 2 (33%) |
+| `json` | **19** | **18** | **1 (5%)** |
+| `string-pass` | 0 | 0 | — nothing to remove |
+
+**The cause is structural, not a tuning problem.** Pass 3 is intra-block, and **every nullable heap
+field read ends its block at the null test**. Idiomatic linked structures — a tree, a sibling chain,
+a parser's node graph — are nothing but null tests, so the pass is looking at a program that has
+been chopped into pieces smaller than the pairs it is trying to match.
+
+`string-pass` is the control that makes this legible: it has **zero** retains, because its buffer is
+raw bytes from `Heap.allocate` and its fields are integers rather than heap references. It does not
+chase pointers, so it has no alias-retain traffic, and it is also the only one of the three where
+DCDart is *slower* than C. The benchmark with no ARC traffic is the one that loses; the two full of
+unelided pairs both win. Which brings up the finding that matters most here:
+
+**`json` is masking this problem behind an allocator advantage.** Its ratio is ~0.62× — DCDart
+comfortably faster — while carrying 18 unelided retain/release pairs. ADR-0058's heap (no
+coalescing, no cross-class reuse, bump-allocated) is winning by more than the missing elision is
+losing. **Two errors of opposite sign, and the net number looks fine.** A gate read off that number
+alone would conclude ARC is cheap and the allocator is good, when the honest statement is that one
+is flattering and the other is expensive.
+
+**Nothing in this tree could measure this before.** `elideRedundantRetainReleasePairs` ran
+unconditionally inside `lowerToDCModule`, so `dc-objdump --arc` only ever saw post-elision counts.
+Its unit tests prove *the pass fires*; they say nothing about *how much it removes on a real
+program*, and those are different questions. `lowerToDCModule` now takes `elide:` and `dc-objdump`
+takes `--no-elide`, so the diff above is reproducible by anyone:
+
+```
+dart dc-objdump/bin/dc_objdump.dart --arc --no-elide <src>.dart   # what lowering produced
+dart dc-objdump/bin/dc_objdump.dart --arc            <src>.dart   # what survived
+```
+
+**Cost of the workaround:** none available. This is the M3 gate's dominant term on any benchmark
+that chases pointers, and it is a fixable optimiser limitation rather than a language verdict —
+which is the good news, and also why publishing a gate number before fixing it would be publishing
+the wrong number.
+
+**Next step:** extend pass 3 across the null test — a retain and its release separated only by a
+branch on the retained value's nullness is the canonical shape and is worth handling before any
+general cross-block analysis. Note `dc-sys-21` reports pass 3's *surrender* count measures zero on
+`hashmap`, so the pass is not declining to act on these pairs; it never sees them as pairs at all.

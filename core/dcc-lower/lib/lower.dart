@@ -62,6 +62,17 @@ const DCStruct strStructType = DCStruct('Str', [
 Future<DCModule> lowerToDCModule(
   String dartSourcePath, {
   required Uri preludeUri,
+  /// Run ADR-0025's redundant-pair elision. Always true for a real build.
+  ///
+  /// Exists so elision EFFECTIVENESS can be measured: nothing in this tree
+  /// could previously answer "how many pairs does the pass actually remove on
+  /// this program", because the pass ran unconditionally inside lowering and
+  /// `dc-objdump --arc` therefore only ever saw the post-elision counts.
+  /// Comparing the two is what turns "elision fires" -- which its unit tests
+  /// prove -- into "elision removes N of M pairs HERE", which is the number
+  /// that decides whether an ARC benchmark is measuring ARC or measuring a
+  /// missing optimisation.
+  bool elide = true,
 }) async {
   final compileResult = await compileToKernel(dartSourcePath);
   try {
@@ -354,7 +365,9 @@ Future<DCModule> lowerToDCModule(
     // user-lowered and synthesized destructors alike. Real M2 exit-
     // criterion scope (ROADMAP.md), not M3-only, per docs/known-gaps.md
     // GAP-0017 item 2's correction.
-    final elidedFunctions = functions.map(elideRedundantRetainReleasePairs).toList();
+    final elidedFunctions = elide
+        ? functions.map(elideRedundantRetainReleasePairs).toList()
+        : functions;
 
     // (ADR-0055) Emit one .rodata global per distinct string literal. Done
     // after ALL lowering so every literal -- including those inside

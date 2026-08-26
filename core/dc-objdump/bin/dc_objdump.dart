@@ -36,20 +36,32 @@ import 'package:dc_ir/dc_ir.dart';
 import 'package:dcc_lower/lower.dart';
 
 const String _usage = '''
-Usage: dc-objdump --arc <source.dart>
+Usage: dc-objdump --arc [--no-elide] <source.dart>
 
 Lowers <source.dart> through dcc-lower and prints, per function, how many
 of each ARC-relevant DC-IR instruction it contains: Alloc, Retain,
 Release, MakeWeak, WeakLoad, DropWeak.
+
+  --no-elide   Skip ADR-0025's redundant-pair elision, so the counts are what
+               lowering PRODUCED rather than what survived. Diffing the two
+               runs is how you measure what the pass actually removes on a
+               given program -- which nothing could do before, because
+               elision ran unconditionally inside lowering and this tool only
+               ever saw the post-elision numbers. "The pass fires" is proved
+               by its unit tests; "the pass removes N of M pairs HERE" is a
+               different question and decides whether an ARC benchmark is
+               measuring ARC or measuring a missing optimisation.
 ''';
 
 Future<void> main(List<String> argv) async {
-  if (argv.length != 2 || argv[0] != '--arc') {
+  final noElide = argv.contains('--no-elide');
+  final positional = argv.where((a) => a != '--no-elide').toList();
+  if (positional.length != 2 || positional[0] != '--arc') {
     stderr.writeln(_usage);
     exit(64);
   }
 
-  final inputPath = argv[1];
+  final inputPath = positional[1];
   final inputFile = File(inputPath);
   if (!inputFile.existsSync()) {
     stderr.writeln('dc-objdump: input file not found: $inputPath');
@@ -60,7 +72,11 @@ Future<void> main(List<String> argv) async {
 
   final DCModule module;
   try {
-    module = await lowerToDCModule(inputPath, preludeUri: preludeUri);
+    module = await lowerToDCModule(
+      inputPath,
+      preludeUri: preludeUri,
+      elide: !noElide,
+    );
   } catch (e) {
     stderr.writeln('dc-objdump: $e');
     exit(1);
