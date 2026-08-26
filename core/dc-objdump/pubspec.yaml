@@ -13,6 +13,8 @@ environment:
   sdk: '>=3.0.0 <4.0.0'
 
 dependencies:
+  dc_elide:
+    path: ../dc-elide
   dc_ir:
     path: ../dc-ir
   dcc_lower:

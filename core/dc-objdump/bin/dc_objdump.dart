@@ -33,6 +33,7 @@
 import 'dart:io';
 
 import 'package:dc_ir/dc_ir.dart';
+import 'package:dc_elide/elide.dart';
 import 'package:dcc_lower/lower.dart';
 
 const String _usage = '''
@@ -41,6 +42,14 @@ Usage: dc-objdump --arc [--no-elide] <source.dart>
 Lowers <source.dart> through dcc-lower and prints, per function, how many
 of each ARC-relevant DC-IR instruction it contains: Alloc, Retain,
 Release, MakeWeak, WeakLoad, DropWeak.
+
+  --why        Report, per function, WHY pending retains failed to pair:
+               blockLimited (reached the end of a block unmatched -- what the
+               null-test extension would fix), opaqueLimited (a Call,
+               IndirectCall or weak op invalidated them -- what it would NOT
+               fix, needing interprocedural analysis or an ownership
+               convention), releaseLimited (a surviving Release, ADR-0063).
+               "Elision removes 5% here" does not say what to fix; this does.
 
   --no-elide   Skip ADR-0025's redundant-pair elision, so the counts are what
                lowering PRODUCED rather than what survived. Diffing the two
@@ -54,8 +63,11 @@ Release, MakeWeak, WeakLoad, DropWeak.
 ''';
 
 Future<void> main(List<String> argv) async {
+  final elisionStats = <String, ElisionStats>{};
   final noElide = argv.contains('--no-elide');
-  final positional = argv.where((a) => a != '--no-elide').toList();
+  final why = argv.contains('--why');
+  final positional =
+      argv.where((a) => a != '--no-elide' && a != '--why').toList();
   if (positional.length != 2 || positional[0] != '--arc') {
     stderr.writeln(_usage);
     exit(64);
@@ -76,6 +88,7 @@ Future<void> main(List<String> argv) async {
       inputPath,
       preludeUri: preludeUri,
       elide: !noElide,
+      elisionStats: why ? elisionStats : null,
     );
   } catch (e) {
     stderr.writeln('dc-objdump: $e');
@@ -95,6 +108,30 @@ Future<void> main(List<String> argv) async {
     stdout.writeln('  ${function.linkName}: ${counts.format()}');
   }
   stdout.writeln('  TOTAL: ${totals.format()}');
+
+  if (why) {
+    stdout.writeln();
+    stdout.writeln('  WHY pending retains failed to pair:');
+    var elided = 0, blockLimited = 0, opaqueLimited = 0, releaseLimited = 0;
+    for (final entry in elisionStats.entries) {
+      final st = entry.value;
+      if (st.elided == 0 &&
+          st.blockLimited == 0 &&
+          st.opaqueLimited == 0 &&
+          st.releaseLimited == 0) {
+        continue;
+      }
+      stdout.writeln('    ${entry.key}: $st');
+      elided += st.elided;
+      blockLimited += st.blockLimited;
+      opaqueLimited += st.opaqueLimited;
+      releaseLimited += st.releaseLimited;
+    }
+    stdout.writeln(
+      '    WHY-TOTAL: elided=$elided blockLimited=$blockLimited '
+      'opaqueLimited=$opaqueLimited releaseLimited=$releaseLimited',
+    );
+  }
 }
 
 /// Per-function (or aggregate) counts of every ARC-relevant DC-IR

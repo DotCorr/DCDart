@@ -85,17 +85,51 @@ import 'package:dc_ir/dc_ir.dart';
 /// Applies redundant-pair removal to every block of [function], returning
 /// a new `DCFunction` with the same signature and (functionally) the same
 /// behavior, minus any provably-redundant `Retain`/`Release` pairs.
-DCFunction elideRedundantRetainReleasePairs(DCFunction function) {
+/// Why a pending `Retain` failed to pair, counted per function.
+///
+/// EXISTS BECAUSE "elision removes 5% here" does not say WHAT TO FIX. Two
+/// unrelated constraints stop a pair, they need different fixes, and the
+/// ratio between them was unknown until this was measured:
+///
+///   * [blockLimited] -- the retain reached the end of its block unmatched.
+///     Fixed by cross-block tracking (the null-test extension), because
+///     every nullable field read ends its block at the null test.
+///   * [opaqueLimited] -- a `Call`, `IndirectCall` or weak op invalidated it.
+///     NOT fixed by cross-block tracking at all: it needs interprocedural
+///     analysis, or an ownership convention that says what a callee may do
+///     with a borrowed reference.
+///
+/// A worked example of why the distinction matters: `json`'s `walk` reads a
+/// nullable child, null-tests it, and CALLS `walk` on it. That looks like the
+/// canonical null-test shape and is actually opaque-limited -- so the
+/// null-test extension would not move it, and a plan built on the shape alone
+/// would have aimed at the wrong constraint.
+class ElisionStats {
+  int elided = 0;
+  int blockLimited = 0;
+  int opaqueLimited = 0;
+  int releaseLimited = 0;
+
+  @override
+  String toString() =>
+      'elided=$elided blockLimited=$blockLimited '
+      'opaqueLimited=$opaqueLimited releaseLimited=$releaseLimited';
+}
+
+DCFunction elideRedundantRetainReleasePairs(
+  DCFunction function, [
+  ElisionStats? stats,
+]) {
   return DCFunction(
     linkName: function.linkName,
     paramTypes: function.paramTypes,
     returnType: function.returnType,
     mode: function.mode,
-    blocks: function.blocks.map(_elideBlock).toList(),
+    blocks: function.blocks.map((b) => _elideBlock(b, stats)).toList(),
   );
 }
 
-DCBasicBlock _elideBlock(DCBasicBlock block) {
+DCBasicBlock _elideBlock(DCBasicBlock block, [ElisionStats? stats]) {
   // pendingRetain[valueId] = index into `kept` of an as-yet-unmatched
   // Retain on that value (or absent if none is currently pending).
   final pendingRetain = <int, int>{};
@@ -149,6 +183,7 @@ DCBasicBlock _elideBlock(DCBasicBlock block) {
         final pendingIndex = pendingRetain.remove(id);
         callConsumed.remove(id);
         if (pendingIndex != null) {
+          stats?.elided += 1;
           kept[pendingIndex] = null; // drop the matched Retain
           kept.add(null); // drop this Release too
           // Deliberately NO invalidation of the OTHER pending retains here:
@@ -218,11 +253,13 @@ DCBasicBlock _elideBlock(DCBasicBlock block) {
           // which DCDart's ARC conventions do not currently carry.
           // ADR-0063 records it, escalation 0011 asks for it, and it is a
           // spec §3 question rather than something to invent here.
+          stats?.releaseLimited += pendingRetain.length;
           pendingRetain.clear();
           callConsumed.clear();
           kept.add(instruction);
         }
       case Call():
+        stats?.opaqueLimited += pendingRetain.length;
         _invalidateAcrossCall(
           args: instruction.args,
           argOwnership: instruction.argOwnership,
@@ -254,6 +291,7 @@ DCBasicBlock _elideBlock(DCBasicBlock block) {
         // never be the object of a pending retain. `referencedValueIds`
         // still reports it, which is where it matters (the `callConsumed`
         // sweep at the top of this loop).
+        stats?.opaqueLimited += pendingRetain.length;
         _invalidateAcrossCall(
           args: instruction.args,
           argOwnership: instruction.argOwnership,
@@ -268,6 +306,7 @@ DCBasicBlock _elideBlock(DCBasicBlock block) {
         // header for why each of these specifically can't be skipped
         // over safely. No argOwnership-style exception exists for these
         // (spec's weak-count elision is a separate, unstarted question).
+        stats?.opaqueLimited += pendingRetain.length;
         pendingRetain.clear();
         callConsumed.clear();
         kept.add(instruction);
@@ -275,6 +314,11 @@ DCBasicBlock _elideBlock(DCBasicBlock block) {
         kept.add(instruction);
     }
   }
+
+  // Whatever is still pending when the block ends is BLOCK-limited: scope
+  // rule 1. This is the count the null-test extension would reduce; the
+  // opaque count above is the one it would not touch.
+  stats?.blockLimited += pendingRetain.length;
 
   return DCBasicBlock(
     id: block.id,

@@ -73,6 +73,9 @@ Future<DCModule> lowerToDCModule(
   /// that decides whether an ARC benchmark is measuring ARC or measuring a
   /// missing optimisation.
   bool elide = true,
+  /// Filled with per-function elision statistics when supplied. Diagnostic
+  /// only; nothing in a build reads it.
+  Map<String, ElisionStats>? elisionStats,
 }) async {
   final compileResult = await compileToKernel(dartSourcePath);
   try {
@@ -365,9 +368,25 @@ Future<DCModule> lowerToDCModule(
     // user-lowered and synthesized destructors alike. Real M2 exit-
     // criterion scope (ROADMAP.md), not M3-only, per docs/known-gaps.md
     // GAP-0017 item 2's correction.
-    final elidedFunctions = elide
-        ? functions.map(elideRedundantRetainReleasePairs).toList()
-        : functions;
+    final List<DCFunction> elidedFunctions;
+    if (!elide) {
+      elidedFunctions = functions;
+    } else {
+      // The stats map is bound to a non-nullable local before the closure so
+      // the closure never has to re-prove it is non-null -- no `!`, per
+      // CLAUDE.md rule 3.
+      final statsSink = elisionStats;
+      if (statsSink == null) {
+        elidedFunctions = functions.map(elideRedundantRetainReleasePairs).toList();
+      } else {
+        elidedFunctions = functions.map((f) {
+          final stats = ElisionStats();
+          final out = elideRedundantRetainReleasePairs(f, stats);
+          statsSink[f.linkName] = stats;
+          return out;
+        }).toList();
+      }
+    }
 
     // (ADR-0055) Emit one .rodata global per distinct string literal. Done
     // after ALL lowering so every literal -- including those inside

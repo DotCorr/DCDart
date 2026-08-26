@@ -2383,6 +2383,40 @@ that chases pointers, and it is a fixable optimiser limitation rather than a lan
 which is the good news, and also why publishing a gate number before fixing it would be publishing
 the wrong number.
 
+### WHICH constraint, measured: `dc-objdump --arc --why`
+
+"Elision removes 5% here" does not say what to fix. Three unrelated constraints stop a pair and they
+need three different fixes, so the pass now counts which one fired. Measured on main at `91ce735`:
+
+| program | elided | **blockLimited** | **opaqueLimited** | releaseLimited |
+|---|---|---|---|---|
+| `json` | 0 | **16** | **0** | 3 |
+| `m2-list` | 3 | 6 | **0** | 3 |
+| `tree-traversal` | 2 | 4 | **0** | 0 |
+
+**`opaqueLimited` is ZERO on every real program measured.** That is the decisive result, and it was
+not what the reasoning predicted. `json`'s `walk` reads a nullable child, null-tests it and **calls
+`walk` on it** — which reads exactly like the case rule 2 exists for, and an argument was made
+mid-analysis that the null-test extension therefore would not help it. Wrong: the retain and the
+call land in *different blocks*, so the retain is lost at the block boundary before rule 2 is ever
+consulted. **Scope rule 1 fires first and hides rule 2 completely.**
+
+The practical consequence is worth more than the number: **interprocedural analysis is not needed.**
+It is the expensive fix, it was the one the shape suggested, and it would have bought nothing —
+because no pending retain in any of these programs ever survives long enough to meet a `Call`.
+
+What the three counts mean for planning:
+
+- **blockLimited (16 of 19 on `json`)** — the cross-block/null-test extension. This is the whole
+  gate-relevant term.
+- **releaseLimited (3 of 19)** — ADR-0063's surviving-`Release` rule, the correctness fix. Recovering
+  these needs a way to express a return value's **uniqueness**: escalation 0011, spec §3, rule 4.
+- **opaqueLimited (0)** — nothing to do.
+
+**A caution on reading `--why`: the counts are attempts, not distinct pairs.** A retain invalidated
+in one block and re-attempted is counted once per attempt, so the totals exceed the retain count and
+should be read as proportions rather than as a census.
+
 **Next step:** extend pass 3 across the null test — a retain and its release separated only by a
 branch on the retained value's nullness is the canonical shape and is worth handling before any
 general cross-block analysis.
