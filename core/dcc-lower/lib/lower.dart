@@ -137,6 +137,12 @@ Future<DCModule> lowerToDCModule(
     // (contrast ADR-0040's descriptors, where identity matters).
     final stringLiterals = <String, String>{};
 
+    // (ADR-0057) Non-capturing local functions discovered while lowering,
+    // hoisted to top-level symbols. Seeded with every top-level procedure
+    // name first, so a hoisted symbol can never silently shadow one.
+    final hoister = _ClosureHoister();
+    hoister.claimed.addAll(targetLibrary.procedures.map((p) => p.name.text));
+
     final functions = <DCFunction>[];
     for (final proc in targetLibrary.procedures) {
       if (!_hasMarkerAnnotation(proc.annotations, '_Bare', preludeUri)) continue;
@@ -157,7 +163,7 @@ Future<DCModule> lowerToDCModule(
       }
       functions.add(
         _BareFunctionLowerer(proc, preludeUri, structLayouts, heapLayouts, externNames,
-                globalNames, null, pendingSpecializations, const {}, stringLiterals)
+                globalNames, hoister, null, pendingSpecializations, const {}, stringLiterals)
             .lower(),
       );
     }
@@ -194,6 +200,7 @@ Future<DCModule> lowerToDCModule(
           heapLayouts,
           externNames,
           globalNames,
+          hoister,
           entry.key.enclosingClass,
           pendingSpecializations,
           const {},
@@ -208,24 +215,59 @@ Future<DCModule> lowerToDCModule(
     // `_pendingSpecializations` is keyed by mangled name, so each distinct
     // (function, type arguments) pair is emitted exactly once no matter how
     // many call sites request it.
-    while (pendingSpecializations.isNotEmpty) {
-      final entry = pendingSpecializations.entries.first;
-      pendingSpecializations.remove(entry.key);
-      if (emittedSpecializations.contains(entry.key)) continue;
-      emittedSpecializations.add(entry.key);
+    //
+    // (ADR-0057) The hoisted-local-function queue is drained by the SAME loop,
+    // not a second one after it, because the two feed each other: a
+    // specialization's body may declare a local function, and a local
+    // function's body may call a generic. Two sequential loops would emit
+    // whichever kind the second loop handled and silently drop anything the
+    // first kind discovered afterwards.
+    while (pendingSpecializations.isNotEmpty || hoister.pending.isNotEmpty) {
+      if (pendingSpecializations.isNotEmpty) {
+        final entry = pendingSpecializations.entries.first;
+        pendingSpecializations.remove(entry.key);
+        if (emittedSpecializations.contains(entry.key)) continue;
+        emittedSpecializations.add(entry.key);
+        functions.add(
+          _BareFunctionLowerer(
+            entry.value.proc,
+            preludeUri,
+            structLayouts,
+            heapLayouts,
+            externNames,
+            globalNames,
+            hoister,
+            null,
+            pendingSpecializations,
+            entry.value.substitution,
+            stringLiterals,
+          ).lower(linkNameOverride: entry.key),
+        );
+        continue;
+      }
+
+      final entry = hoister.pending.entries.first;
+      hoister.pending.remove(entry.key);
+      if (hoister.emitted.contains(entry.key)) continue;
+      hoister.emitted.add(entry.key);
       functions.add(
         _BareFunctionLowerer(
-          entry.value.proc,
+          entry.value.enclosingProc,
           preludeUri,
           structLayouts,
           heapLayouts,
           externNames,
           globalNames,
+          hoister,
+          // Deliberately NO receiverClass, even when the local function was
+          // written inside an instance method: a body that mentioned `this`
+          // would be capturing, and is rejected at the hoist site.
           null,
           pendingSpecializations,
-          entry.value.substitution,
+          entry.value.typeSubstitution,
           stringLiterals,
-        ).lower(linkNameOverride: entry.key),
+          entry.value,
+        ).lower(),
       );
     }
 
@@ -748,7 +790,7 @@ class _BareFunctionLowerer {
   final Uri preludeUri;
   final _StructLayouts structLayouts;
   final _HeapLayouts heapLayouts;
-  late final String context = proc.name.text;
+  late final String context = hoistedBody?.linkName ?? proc.name.text;
   late final DCType _declaredReturnType;
 
   final Map<VariableDeclaration, DCValue> _values = {};
@@ -836,17 +878,43 @@ class _BareFunctionLowerer {
   /// Interned by content across the whole module.
   final Map<String, String> stringLiterals;
 
+  /// (ADR-0057) Where non-capturing local functions found in this body are
+  /// queued for emission as top-level symbols, and where their names are kept
+  /// unique across the whole module.
+  final _ClosureHoister hoister;
+
+  /// (ADR-0057) Set when this lowerer is emitting a HOISTED local function
+  /// rather than a `Procedure`: [proc] is then only the enclosing procedure,
+  /// present for nothing but its identity, and the body and link name come
+  /// from here instead.
+  final _HoistedClosure? hoistedBody;
+
+  /// (ADR-0057) Local functions in scope, by the `VariableDeclaration` that
+  /// names them. Seeded from [hoistedBody] so a hoisted body can call its
+  /// siblings and recurse into itself.
+  final Map<VariableDeclaration, _LocalFunction> _localFunctions = {};
+
+  /// (ADR-0057) The symbol this body is actually EMITTED under, set at the top
+  /// of [lower]. Differs from [context] for an instance method (`Box_doubled`
+  /// vs `doubled`, ADR-0043) and for a specialization (`pick$u64` vs `pick`,
+  /// ADR-0052). Hoisted names must qualify by this, not by [context]: a local
+  /// `g` inside `Box.doubled` and a local `g` inside a top-level `doubled`
+  /// would otherwise both want `doubled$g`.
+  String _emittedLinkName = '';
+
   _BareFunctionLowerer(
     this.proc,
     this.preludeUri,
     this.structLayouts,
     this.heapLayouts,
     this.externNames,
-    this.globalNames, [
+    this.globalNames,
+    this.hoister, [
     this.receiverClass,
     this.pendingSpecializations = const {},
     this.typeSubstitution = const {},
     this.stringLiterals = const {},
+    this.hoistedBody,
   ]);
 
   ValueId _allocId() => ValueId(_nextValueIndex++);
@@ -889,7 +957,14 @@ class _BareFunctionLowerer {
   }
 
   DCFunction lower({String? linkNameOverride}) {
-    final fn = proc.function;
+    // (ADR-0057) Set FIRST: a local function discovered anywhere in this body
+    // qualifies its hoisted symbol by the name this body is emitted under.
+    _emittedLinkName = linkNameOverride ?? context;
+
+    // (ADR-0057) A hoisted local function's body, not the procedure's.
+    final hoisted = hoistedBody;
+    final fn = hoisted == null ? proc.function : hoisted.node;
+    if (hoisted != null) _localFunctions.addAll(hoisted.visibleLocalFunctions);
 
     final paramTypes = <DCType>[];
     final paramValues = <DCValue>[];
@@ -992,8 +1067,26 @@ class _BareFunctionLowerer {
   }
 
   void _lowerStatement(Statement stmt) {
+    // (ADR-0057) A named local function: `u64 dbl(u64 v) => v + v;` inside a
+    // body. Emits NO instructions here -- the declaration itself is not code.
+    // The body is hoisted to its own top-level symbol and every call site
+    // resolves to it directly.
+    if (stmt is FunctionDeclaration) {
+      _hoistLocalFunction(stmt.variable, stmt.function, stmt.variable.name);
+      return;
+    }
+
     if (stmt is VariableDeclaration) {
       final init = stmt.initializer;
+      // (ADR-0057) `final f = (u64 v) => ...;` -- the other spelling of the
+      // same thing. Checked BEFORE `_lowerExpression`, because a function
+      // expression is not a value this compiler can produce (that would need
+      // a function-pointer type and an indirect call, GAP-0052); it is only
+      // ever a definition bound to a name.
+      if (init is FunctionExpression) {
+        _hoistLocalFunction(stmt, init.function, stmt.name);
+        return;
+      }
       if (init == null) {
         throw DccLowerError(
           '"$context": local "${stmt.name}" has no initializer — every '
@@ -1248,6 +1341,19 @@ class _BareFunctionLowerer {
           _lowerCallTo(expr, target, allowVoid: true);
           return;
         }
+      }
+      // (ADR-0057) A local function called for effect rather than for a value.
+      // Not lowered: nothing in examples/m2-closure needs it, and this file's
+      // scope rule is to extend on a real target rather than speculatively.
+      // Named explicitly so the diagnostic points at the actual restriction
+      // instead of the generic list below.
+      if (expr is LocalFunctionInvocation || expr is FunctionInvocation) {
+        throw DccLowerError(
+          '"$context": a call to a local function is only lowered in '
+          'EXPRESSION position — bind the result to a local '
+          '(`final _unused = f(...);`). A void local function called as a '
+          'statement is not implemented (ADR-0057)',
+        );
       }
       throw DccLowerError(
         '"$context": unsupported expression statement $expr '
@@ -1896,6 +2002,12 @@ class _BareFunctionLowerer {
   /// re-deriving it per site as each was discovered.
   bool _isFreshHeapOwnership(Expression expr) {
     if (expr is ConstructorInvocation || expr is StaticInvocation) return true;
+    // (ADR-0057) A call to a hoisted local function is a call to a `@bare`
+    // function under a different spelling, so it transfers ownership out by
+    // the same ADR-0019 convention. Leaving these two node types out would
+    // make `final b = mk(v);` retain a reference nobody else holds and leak
+    // it — the exact bug the StaticInvocation case above exists to prevent.
+    if (expr is LocalFunctionInvocation || expr is FunctionInvocation) return true;
     if (expr is InstanceGet) {
       final target = expr.interfaceTarget;
       return target.name.text == 'value' &&
@@ -1909,11 +2021,65 @@ class _BareFunctionLowerer {
     if (expr is VariableGet) {
       final value = _values[expr.variable];
       if (value == null) {
+        // (ADR-0057) A local function's name reaching value position. It has
+        // a symbol, but no VALUE: DC-IR has no function-pointer type, so
+        // there is nothing to produce here. Say that, rather than the generic
+        // "unrecognized variable", which would point at the wrong problem.
+        if (_localFunctions.containsKey(expr.variable)) {
+          throw DccLowerError(
+            '"$context": local function "${expr.variable.name}" is used as a '
+            'VALUE (passed, returned or stored) rather than called. DC-IR has '
+            'no function-pointer type and no indirect call, so a closure '
+            'cannot be a value yet (docs/known-gaps.md GAP-0052); and once it '
+            'could, every such call site would be an elision barrier — see '
+            'docs/escalations/0008-closure-capture-and-indirect-call-elision.md',
+          );
+        }
         throw DccLowerError(
           '"$context": reference to unrecognized variable "${expr.variable.name}"',
         );
       }
       return value;
+    }
+
+    // (ADR-0057) A call to a hoisted local function, in either of Kernel's two
+    // spellings: `LocalFunctionInvocation` for a named local function, and
+    // `FunctionInvocation` on a `VariableGet` for a function expression bound
+    // to a local.
+    if (expr is LocalFunctionInvocation || expr is FunctionInvocation) {
+      final callee = _calleeOf(expr);
+      if (callee == null) {
+        throw DccLowerError(
+          '"$context": call through a function VALUE. DC-IR\'s `Call` carries '
+          'a target SYMBOL NAME, not a callee operand — there is no indirect '
+          'call instruction and no function-pointer type '
+          '(docs/known-gaps.md GAP-0052). Only a call to a non-capturing '
+          'local function declared in an enclosing scope is lowered '
+          '(ADR-0057)',
+        );
+      }
+      final arguments =
+          expr is LocalFunctionInvocation ? expr.arguments : (expr as FunctionInvocation).arguments;
+      final result = _lowerLocalCall(callee, arguments, allowVoid: false);
+      if (result == null) {
+        throw DccLowerError(
+          '"$context": internal error — _lowerLocalCall returned no value '
+          'with allowVoid: false (dcc-lower bug, not a source error)',
+        );
+      }
+      return result;
+    }
+
+    // (ADR-0057) A function expression anywhere OTHER than a local variable's
+    // initializer. There is no value to produce for it.
+    if (expr is FunctionExpression) {
+      throw DccLowerError(
+        '"$context": a function expression is only lowered as the initializer '
+        'of a local (`final f = (u64 v) => ...;`), where it names a function '
+        'rather than producing a value. Here it would have to BE a value, '
+        'which needs a function-pointer type DC-IR does not have '
+        '(docs/known-gaps.md GAP-0052, ADR-0057)',
+      );
     }
 
     if (expr is StaticInvocation) {
@@ -2911,6 +3077,221 @@ class _BareFunctionLowerer {
     ));
   }
 
+  // -------------------------------------------------------------------
+  // Non-capturing local functions (ADR-0057).
+  //
+  // The whole feature is two operations: HOIST a definition to a top-level
+  // symbol, and lower a CALL to it as an ordinary direct `Call`. There is no
+  // third operation, and that is the point -- a closure that needed a
+  // representation as a VALUE would need a DC-IR instruction that does not
+  // exist (GAP-0052) and a capture convention that is not a lowering decision
+  // (docs/escalations/0008-closure-capture-and-indirect-call-elision.md).
+  // -------------------------------------------------------------------
+
+  /// Hoists one local function to a top-level symbol, or rejects it, naming
+  /// which of the two open questions it runs into.
+  ///
+  /// Rejection here is the load-bearing half. Everything this refuses is
+  /// refused because implementing it would decide something an implementation
+  /// unit does not get to decide -- not because it is hard.
+  void _hoistLocalFunction(VariableDeclaration decl, FunctionNode node, String? name) {
+    final what = 'local function "${name ?? '<anonymous>'}" in "$context"';
+
+    if (node.typeParameters.isNotEmpty) {
+      throw DccLowerError(
+        '$what is generic — monomorphization (ADR-0052) discovers '
+        'specializations from call sites naming a top-level target, and a '
+        'local function has no such name to discover',
+      );
+    }
+    if (node.namedParameters.isNotEmpty ||
+        node.requiredParameterCount != node.positionalParameters.length) {
+      throw DccLowerError(
+        '$what has named or optional parameters — DCDart lowers positional, '
+        'required parameters only (the same restriction top-level `@bare` '
+        'functions carry)',
+      );
+    }
+    if (node.asyncMarker != AsyncMarker.Sync) {
+      throw DccLowerError('$what is ${node.asyncMarker.name}; DCDart has no async or generators');
+    }
+    final body = node.body;
+    if (body == null) {
+      throw DccLowerError('$what has no body');
+    }
+
+    // Reserved and registered BEFORE the capture scan, so that a body which
+    // calls ITSELF sees its own name as a known static symbol rather than as
+    // a free variable. Self-recursion is the case that makes the ordering
+    // matter (examples/m2-closure/closure.dart shape 4).
+    final linkName = hoister.reserve(_emittedLinkName, name);
+    _localFunctions[decl] = _LocalFunction(linkName, node);
+
+    final scan = _ClosureScan();
+    scan.declared.addAll(node.positionalParameters);
+    body.accept(scan);
+
+    if (scan.usesThis) {
+      throw DccLowerError(
+        '$what reads `this` from the enclosing method — that is a capture. A '
+        'captured value needs an environment object, which needs a heap, and '
+        'the only heap this project has is ADR-0015\'s module-global arena '
+        '(escalation 0002 is still open). See '
+        'docs/escalations/0008-closure-capture-and-indirect-call-elision.md',
+      );
+    }
+
+    for (final used in scan.valueUses) {
+      if (scan.declared.contains(used)) continue;
+      if (_localFunctions.containsKey(used)) {
+        throw DccLowerError(
+          '$what uses local function "${used.name}" as a VALUE rather than '
+          'calling it — DC-IR has no function-pointer type and no indirect '
+          'call, so there is nothing for that value to be '
+          '(docs/known-gaps.md GAP-0052)',
+        );
+      }
+      throw DccLowerError(
+        '$what captures "${used.name}" from an enclosing scope. Only '
+        'NON-CAPTURING local functions are lowered (ADR-0057): a captured '
+        'value needs an environment object, which needs a heap, and the only '
+        'heap this project has is ADR-0015\'s module-global arena — exactly '
+        'what CLAUDE.md rule 1 forbids a `@bare` object to depend on '
+        '(escalation 0002, still open). Pass it as a parameter instead. See '
+        'docs/escalations/0008-closure-capture-and-indirect-call-elision.md',
+      );
+    }
+
+    for (final called in scan.callUses) {
+      if (scan.declared.contains(called)) continue;
+      if (_localFunctions.containsKey(called)) continue;
+      throw DccLowerError(
+        '$what calls "${called.name}", which is not a local function declared '
+        'before it in an enclosing scope. Either it is a function VALUE (no '
+        'DC-IR indirect call exists, GAP-0052) or it is a forward reference '
+        'to a sibling declared later — move the declaration above this one',
+      );
+    }
+
+    hoister.pending[linkName] = _HoistedClosure(
+      node,
+      linkName,
+      {..._localFunctions},
+      proc,
+      typeSubstitution,
+    );
+  }
+
+  /// A call to a hoisted local function. An ordinary direct `Call` — the
+  /// callee's `FunctionNode` is right there, so parameter types are checked
+  /// and `argOwnership` is computed EXACTLY, the same way `_lowerCallArgs`
+  /// does it for a top-level target.
+  ///
+  /// That exactness is the reason this subset is worth landing on its own:
+  /// dc-elide's pass-4 call-consumed case (ADR-0031) fires through a call to
+  /// a non-capturing closure exactly as it does through any other call, so
+  /// `examples/m2-closure`'s `viaTopLevel`/`viaClosure` pair emits identical
+  /// ARC counts. Nothing about that survives a call through a VALUE, where
+  /// the callee is unknown and ownership is not conservatively derivable at
+  /// all — see docs/escalations/0008.
+  ///
+  /// Deliberately NOT shared with `_lowerCallArgs`: that path is threaded
+  /// through `StaticInvocation`/`Procedure` for `@extern` manifest checks and
+  /// generic type-argument resolution (`_lowerCalleeType`), neither of which
+  /// can apply here. Merging them would mean parameterizing every one of
+  /// those steps on "is this really a Procedure", which is more code, not
+  /// less.
+  DCValue? _lowerLocalCall(
+    _LocalFunction callee,
+    Arguments arguments, {
+    required bool allowVoid,
+  }) {
+    final calleeFn = callee.node;
+    if (arguments.named.isNotEmpty || arguments.types.isNotEmpty) {
+      throw DccLowerError(
+        '"$context": call to local function "${callee.linkName}" passes named '
+        'or type arguments; neither is lowered',
+      );
+    }
+    final calleeParams = calleeFn.positionalParameters;
+    final callArgs = arguments.positional;
+    if (calleeParams.length != callArgs.length) {
+      throw DccLowerError(
+        '"$context": call to local function "${callee.linkName}" passes '
+        '${callArgs.length} arguments, but it takes ${calleeParams.length}',
+      );
+    }
+
+    final returnType = calleeFn.returnType;
+    DCValue? dest;
+    if (returnType is VoidType) {
+      if (!allowVoid) {
+        throw DccLowerError(
+          '"$context": local function "${callee.linkName}" returns void — a '
+          'void call has no value, so it cannot appear inside an expression',
+        );
+      }
+    } else {
+      dest = DCValue(
+        _allocId(),
+        _lowerType(returnType,
+            context: '"${callee.linkName}" return type (called from "$context")'),
+      );
+    }
+
+    final loweredArgs = <DCValue>[];
+    final argOwnership = <bool>[];
+    for (var i = 0; i < calleeParams.length; i++) {
+      final expectedType = _lowerType(
+        calleeParams[i].type,
+        context: '"${callee.linkName}" param ${calleeParams[i].name} '
+            '(called from "$context")',
+      );
+      final arg = _lowerExpression(callArgs[i]);
+      if (arg.type != expectedType) {
+        throw DccLowerError(
+          '"$context": call to local function "${callee.linkName}" passes '
+          'argument $i of type ${arg.type} for a parameter declared '
+          '$expectedType -- no implicit widening (same rule as arithmetic)',
+        );
+      }
+      final isOwnedParam =
+          _hasMarkerAnnotation(calleeParams[i].annotations, '_Owned', preludeUri);
+      if (expectedType is DCHeapPointer && isOwnedParam && !_isFreshHeapOwnership(callArgs[i])) {
+        _addInstr(Retain(object: arg));
+      }
+      if (expectedType is DCWeakPointer && isOwnedParam && !_isFreshHeapOwnership(callArgs[i])) {
+        throw DccLowerError(
+          '"$context": call to local function "${callee.linkName}" passes an '
+          'existing Weak<T> local to an @owned Weak<T> parameter -- only a '
+          'fresh Weak.fromStrong(...) construction or a call returning '
+          'Weak<T> can be passed directly (same restriction as ADR-0023)',
+        );
+      }
+      argOwnership.add(expectedType is DCHeapPointer && isOwnedParam);
+      loweredArgs.add(arg);
+    }
+
+    _addInstr(Call(
+      dest: dest,
+      targetName: callee.linkName,
+      args: loweredArgs,
+      argOwnership: argOwnership,
+    ));
+    return dest;
+  }
+
+  /// The hoisted local function a call expression names, or null if the
+  /// expression is not a call to one.
+  _LocalFunction? _calleeOf(Expression expr) {
+    if (expr is LocalFunctionInvocation) return _localFunctions[expr.variable];
+    if (expr is FunctionInvocation) {
+      final receiver = expr.receiver;
+      if (receiver is VariableGet) return _localFunctions[receiver.variable];
+    }
+    return null;
+  }
+
   DCValue _lowerU64Binary(
     StaticInvocation expr,
     void Function(DCValue dest, DCValue lhs, DCValue rhs) emit,
@@ -3352,6 +3733,23 @@ DCType _lowerSignatureType(
         return const DCWeakPointer(DCVoid());
       }
     }
+    // (ADR-0057) A FUNCTION type in a signature -- a parameter, return type or
+    // field that would hold a closure as a VALUE. Named separately because the
+    // generic "unsupported type" message points at the type system, and this
+    // is not a type-system gap: DC-IR's `Call` carries a target SYMBOL NAME
+    // rather than a callee operand, so there is no indirect call for such a
+    // value to be used by and no pointer type for it to inhabit.
+    if (type is FunctionType) {
+      throw DccLowerError(
+        '"$context": a function type ($type) appears in a signature. DC-IR has '
+        'no function-pointer type and no indirect-call instruction, so a '
+        'closure cannot be passed, returned or stored as a value '
+        '(docs/known-gaps.md GAP-0052). Only CALLING a non-capturing local '
+        'function is lowered (ADR-0057); the design question that gates the '
+        'rest is docs/escalations/0008-closure-capture-and-indirect-call-'
+        'elision.md',
+      );
+    }
     throw DccLowerError(
       '"$context": unsupported type $type (${type.runtimeType}) — dcc-lower '
       'only understands u8/u32/u64/Result/HeapObject subclasses/Weak<T> '
@@ -3679,6 +4077,171 @@ int? _tryFoldConstInt(Expression expr) {
     }
   }
   return null;
+}
+
+/// A local function that has been HOISTED to a top-level symbol (ADR-0057).
+///
+/// [node] is the Kernel `FunctionNode` of the function expression or local
+/// function declaration; [linkName] is the symbol it will be emitted under;
+/// [visibleLocalFunctions] is the set of sibling (and own) hoisted names in
+/// scope where it was declared, so a body may call a sibling or recurse.
+///
+/// This exists only for the NON-CAPTURING case. See
+/// docs/escalations/0008-closure-capture-and-indirect-call-elision.md for why
+/// the capturing case is not an extension of this and cannot be decided here.
+final class _HoistedClosure {
+  final FunctionNode node;
+  final String linkName;
+  final Map<VariableDeclaration, _LocalFunction> visibleLocalFunctions;
+
+  /// The enclosing top-level `Procedure`. Carried only because
+  /// `_BareFunctionLowerer` is constructed from one and uses it for nothing
+  /// else once [node] is supplied.
+  final Procedure enclosingProc;
+
+  /// The enclosing function's `T` -> concrete-type map (ADR-0052), inherited
+  /// so a local function declared inside a specialization resolves its own
+  /// signature the same way its enclosing body does.
+  final Map<String, DartType> typeSubstitution;
+
+  const _HoistedClosure(
+    this.node,
+    this.linkName,
+    this.visibleLocalFunctions,
+    this.enclosingProc,
+    this.typeSubstitution,
+  );
+}
+
+/// A local function in scope: what symbol it hoisted to, and its Kernel
+/// signature, which a call site needs in order to type-check its arguments
+/// and compute `Call.argOwnership` EXACTLY (ADR-0057). The signature is
+/// available because the callee is statically known -- that is the entire
+/// difference between this and a call through a function VALUE, which has no
+/// known callee and therefore no derivable ownership (escalation 0008).
+final class _LocalFunction {
+  final String linkName;
+  final FunctionNode node;
+  const _LocalFunction(this.linkName, this.node);
+}
+
+/// Module-level state for hoisting local functions (ADR-0057): the queue of
+/// bodies still to emit, and every symbol name already claimed.
+///
+/// Shaped like ADR-0052's specialization queue on purpose -- both discover
+/// new top-level functions while lowering an existing one, and both must emit
+/// each discovered function exactly once however many times it is referenced.
+final class _ClosureHoister {
+  final Map<String, _HoistedClosure> pending = {};
+  final Set<String> emitted = {};
+
+  /// Every symbol name already spoken for: this module's own top-level
+  /// procedures, seeded before any body is lowered, plus every hoisted name
+  /// handed out so far.
+  final Set<String> claimed = {};
+
+  /// Reserves a unique symbol for a local function named [localName] declared
+  /// inside [enclosingLinkName].
+  ///
+  /// `twiceSum$dbl`, not `dbl`: two enclosing functions may each declare a
+  /// local named `f`, and `linkName` is emitted verbatim (spec §9) with no
+  /// mangling anywhere downstream, so an unqualified hoist would silently let
+  /// one definition win. `$` IS legal in a Dart identifier, so a qualified
+  /// name is not collision-proof on its own -- hence [claimed], which
+  /// resolves a collision by appending `$2`, `$3`, ... deterministically in
+  /// lowering order rather than resting on an assumption about identifiers.
+  String reserve(String enclosingLinkName, String? localName) {
+    final base = '$enclosingLinkName\$${localName ?? 'anon'}';
+    var name = base;
+    var n = 2;
+    while (claimed.contains(name)) {
+      name = '$base\$$n';
+      n++;
+    }
+    claimed.add(name);
+    return name;
+  }
+}
+
+/// Decides whether one local function CAPTURES anything (ADR-0057).
+///
+/// Deliberately does NOT descend into a nested function's own body: each
+/// nested function is hoisted (and therefore scanned) in its own right when
+/// the enclosing body is lowered, so descending here would only report the
+/// inner function's capture against the OUTER function's name, which is the
+/// wrong place to point at.
+///
+/// Two kinds of reference are tracked separately, because they have opposite
+/// answers:
+///
+///   VALUE position   (`VariableGet`/`VariableSet`) -- a free one is a real
+///                    capture. It needs an environment, therefore an
+///                    allocator, therefore escalation 0002.
+///   CALL position    (`LocalFunctionInvocation`, or a `FunctionInvocation`
+///                    whose receiver is a plain `VariableGet`) -- a free one
+///                    is NOT a capture if it names another hoisted local
+///                    function, because that name resolves to a static
+///                    symbol, not to a value in a frame. This is what makes
+///                    self-recursion and sibling calls work.
+final class _ClosureScan extends RecursiveVisitor {
+  final Set<VariableDeclaration> declared = {};
+  final Set<VariableDeclaration> valueUses = {};
+  final Set<VariableDeclaration> callUses = {};
+  bool usesThis = false;
+
+  @override
+  void visitVariableDeclaration(VariableDeclaration node) {
+    declared.add(node);
+    super.visitVariableDeclaration(node);
+  }
+
+  @override
+  void visitVariableGet(VariableGet node) {
+    valueUses.add(node.variable);
+    super.visitVariableGet(node);
+  }
+
+  @override
+  void visitVariableSet(VariableSet node) {
+    valueUses.add(node.variable);
+    super.visitVariableSet(node);
+  }
+
+  @override
+  void visitLocalFunctionInvocation(LocalFunctionInvocation node) {
+    callUses.add(node.variable);
+    node.arguments.accept(this);
+  }
+
+  @override
+  void visitFunctionInvocation(FunctionInvocation node) {
+    final receiver = node.receiver;
+    if (receiver is VariableGet) {
+      // Call position, not value position: `f(x)` where `f` is a local bound
+      // to a function expression reads as a VariableGet in Kernel, but the
+      // value is never materialized -- it is the callee.
+      callUses.add(receiver.variable);
+    } else {
+      receiver.accept(this);
+    }
+    node.arguments.accept(this);
+  }
+
+  @override
+  void visitThisExpression(ThisExpression node) {
+    usesThis = true;
+  }
+
+  // Stop at a nested function boundary (see this class's doc comment). A
+  // local function DECLARATION still contributes its own name to `declared`,
+  // so a sibling call to it is not reported as free.
+  @override
+  void visitFunctionExpression(FunctionExpression node) {}
+
+  @override
+  void visitFunctionDeclaration(FunctionDeclaration node) {
+    declared.add(node.variable);
+  }
 }
 
 /// A generic function plus the concrete types to specialize it at

@@ -254,9 +254,30 @@ re-derivable by rerunning it):
   body for `VariableSet` targets already tracked before the loop starts. `for`/`do-while`,
   `break`/`continue`, nested loops, and heap/weak locals inside the body all throw explicitly.
 
+- (M2, ADR-0057) NON-CAPTURING local functions, in both Kernel spellings: `u64 dbl(u64 v) => v + v;`
+  inside a body is a `FunctionDeclaration` statement called through `LocalFunctionInvocation`;
+  `final f = (u64 v) => ...;` is a `VariableDeclaration` with a `FunctionExpression` initializer,
+  called through `FunctionInvocation` on a `VariableGet`. Neither emits an instruction at the
+  declaration: the body is HOISTED to its own top-level `DCFunction` named `enclosing$local`
+  (`twiceSum$dbl`, qualified by the EMITTED name of the enclosing body so a local inside
+  `Box.doubled` becomes `Box_doubled$g`), queued in the same drain loop as ADR-0052's
+  specializations, and every call site lowers to an ordinary direct `Call`. Because the callee is
+  statically known, `argOwnership` is exact and elision is unaffected — `tests/conformance/closure/`
+  asserts the ARC counts are identical to writing the same callee at top level.
+
+  A `_ClosureScan` over the function's own body (deliberately not descending into nested functions,
+  each of which is scanned when it is itself hoisted) separates VALUE references from CALL
+  references: a free value reference — or `this` — is a real capture and is **rejected**; a free call
+  reference naming another hoisted local function is not, which is what makes self-recursion and
+  sibling calls work. **Rejected, each with a diagnostic naming the reason:** any capture
+  (escalation 0002/0008 — needs an environment, needs a heap), a function used as a value or a
+  function type in any signature (GAP-0052 — DC-IR has no function-pointer type and no indirect
+  call), a function expression anywhere but a local's initializer, a local function called as a bare
+  statement, and generic/named-parameter/`async` local functions.
+
 Anything else — a different operator, a non-`u8`/`u32`/`u64`/`Result` type, a second `Pointer<T>`
 instantiation, natural-alignment (non-packed) struct layout, merging control flow back together after
-an `if` — throws `DccLowerError` naming exactly what it hit and why it's unsupported, rather than
+an `if`, a CAPTURING closure or a function value — throws `DccLowerError` naming exactly what it hit and why it's unsupported, rather than
 silently mishandling it. Extend this file when a real conformance target actually needs more, per
 this project's own convention (see `core/dc-ir/instructions.dart`'s identical discipline) — not
 speculatively.

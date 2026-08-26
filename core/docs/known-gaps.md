@@ -348,7 +348,7 @@ inferring from the gaps file:
 | prerequisite | status | blocks |
 |---|---|---|
 | generics / monomorphization | **RESOLVED 2026-08-22 (ADR-0052)** — functions only | generic CLASSES remain, GAP-0040 |
-| closures | `unsupported expression FunctionExpression` | the functional workload |
+| closures | **PARTIALLY RESOLVED 2026-08-26 (ADR-0057)** — non-capturing local functions hoist to static symbols and call directly; CAPTURING closures and closures-as-VALUES are not implemented and are not one lowering each (GAP-0052, escalation 0008) | the functional workload, still |
 | `String` | **PARTIALLY RESOLVED 2026-08-26 (ADR-0053)** — borrowed `Str` slices work; owning `String`/`StrBuf` still blocked on the allocator, GAP-0045 | JSON parser and the string pass still blocked (both need to *build* text, not only read it) |
 | instance methods | **RESOLVED 2026-08-21 (ADR-0043)** | — |
 | `null` / nullable heap refs | **RESOLVED 2026-08-22 (ADR-0049)** | — |
@@ -357,9 +357,23 @@ inferring from the gaps file:
 
 Only `bool` locals passed at the time. Since then: instance methods (ADR-0043), nested loops
 (ADR-0044), `break`/`continue` (ADR-0047), nullable heap references (ADR-0049), heap-typed field
-stores (ADR-0048) and `for` loops (ADR-0050) have all landed. **Two prerequisites remain: generics
-and `String`.** A tree/graph traversal benchmark is now writable; a JSON parser and a hashmap
-workload are not.
+stores (ADR-0048), `for` loops (ADR-0050), monomorphized generic FUNCTIONS (ADR-0052), borrowed
+`Str` slices (ADR-0053) and non-capturing closures (ADR-0057) have all landed.
+
+**The prose here used to say "two prerequisites remain: generics and `String`", which contradicted
+the table directly above it on two counts** — it omitted closures, which the table lists as an open
+row, and it was written before ADR-0053 landed `Str`. Corrected, and stated as the table states it:
+
+> **Three prerequisites remain open, none of them whole:** generic CLASSES (GAP-0040 — generic
+> functions are done), owning `String`/`StrBuf` (GAP-0045 — borrowed `Str` is done), and CAPTURING
+> closures plus closures-as-values (GAP-0052 and escalation 0008 — non-capturing ones are done).
+
+A tree/graph traversal benchmark is now writable. A JSON parser and a string-processing pass still
+need text that can be *built*, not only read. A hashmap workload still needs generic classes. **The
+closure-heavy functional workload is the one that got no closer**, because passing a function to a
+function is precisely the part ADR-0057 does not do — and per escalation 0008 §3, it is also the
+benchmark where the elision model is structurally weakest, so it should be scoped with that document
+open.
 
 **So M3 is not one unit away. It is most of the remaining language.** That is worth stating plainly
 because "the gate is unblocked" reads as "the gate is next", and it is not — the benchmarks are
@@ -1690,3 +1704,83 @@ immediately) or a real `dc:core.bare` URI resolved by the driver (correct, more 
 not preclude the URI. Found while writing `docs/testing-setup.md` — worth noting that the gap
 surfaced from *documenting the workflow end to end*, not from any test, because every existing
 consumer lives inside the repo where the relative path happens to work.
+
+---
+
+## GAP-0052 — DC-IR cannot call through a value: no indirect call, no function-pointer type
+
+**Domain:** dc-ir, backend (M3 prerequisite)
+**Status:** OPEN — and until 2026-08-26 it was **unrecorded**, which is why closures kept being
+estimated as one lowering
+
+`dc-ir/lib/instructions.dart`'s `Call` carries `final String targetName` — a symbol name, not an
+operand. There is no `IndirectCall` instruction, no function-pointer `DCType`, no `FuncPtr`: grepped
+across `dc-ir/` and `backend/`, zero hits. **Every call DCDart can emit is a direct call to a symbol
+known at compile time.**
+
+So anything that is *reached* rather than *named* is inexpressible: a closure passed to a function,
+returned from one, or stored in a field; a callback table; a real vtable (GAP-0003/§4.3's dynamic
+dispatch is the same missing mechanism seen from the other side); a function pointer coming in from
+C through the FFI surface ADR-0038 built.
+
+**What is NOT missing, and this matters for scoping:** the backend already emits a genuine indirect
+call. ADR-0022's destructor cascade loads a function pointer out of the object header's `cls` field
+and emits `call void %clsVal(ptr …)` (`backend/lib/llvm_emit.dart`). The LLVM half is therefore
+known-good — it is special-cased inside `Release`'s codegen for one fixed signature (`void (ptr)`)
+with no DC-IR instruction driving it. What is missing is the instruction, a type to give the callee
+value, and signature variance. This is real work in `dc-ir/` and `backend/`, but it is not research.
+
+**Why it was invisible.** GAP-0035's table lists `closures` as one row among seven, next to rows like
+`for` loops that genuinely were one lowering each. Nothing anywhere recorded that the closure row
+alone needed a new IR instruction, so every plan that touched closures under-counted them. ADR-0057
+landed the subset that needs none of this (non-capturing local functions, called directly) and this
+gap is what the rest of the row is.
+
+**The consequence that is bigger than the missing instruction.** `Call.argOwnership` exists so an
+elision pass can tell a load-bearing borrowed pair apart from a redundant owned-consuming one
+(ADR-0025's worked example, ADR-0031's pass). `dcc-lower` computes it **from the known callee's
+signature**. For an indirect call there is no known callee, so `argOwnership` is not conservatively
+derivable — it is not derivable at all, and every such call site becomes an elision barrier. That is
+`docs/escalations/0008-closure-capture-and-indirect-call-elision.md` §3, and it is the reason this
+gap is escalation-adjacent rather than ordinary backlog: `ROADMAP.md`'s M3 suite names a
+closure-heavy workload against a ≤10% gate, so the benchmark that most exercises closures is exactly
+where elision is structurally weakest.
+
+**Cost of the workaround:** there is no workaround — the shapes above are rejected at compile time,
+with diagnostics naming this gap rather than a generic "unsupported type". `tests/conformance/closure/`
+records the elision baseline (`viaTopLevel`/`viaClosure`, identical ARC counts, pair elided) so that
+whoever builds the indirect call can diff against a program that already exists and see the barrier
+arrive, instead of discovering it in a benchmark.
+
+---
+
+## GAP-0053 — Compiler-synthesized symbols are externally visible and land in the generated C header
+
+**Domain:** dc-ir, backend, dcc (`--emit-header`)
+**Status:** OPEN — cosmetic today, an ABI-surface problem at scale
+
+`DCFunction` has no linkage field. Every function in a module is emitted as an LLVM `define` with
+default external linkage and, if `--emit-header` is used, gets a prototype in the generated header.
+That is correct for functions the user wrote. It is wrong for the ones the compiler invents:
+
+- ADR-0022 destructors — `void BoxHolder_dtor(DCHeapRef a0);` appears in `examples/m2-heap-field`'s
+  header today.
+- ADR-0052 specializations — `pick$u64`, which the `generics` harness's `main.c` already compiles.
+- ADR-0057 hoisted local functions — `twiceSum$dbl`, `viaClosure$dropLocal`, a whole new population.
+
+Two costs. **The header describes an ABI larger than the API**: a C caller can see and call
+`viaClosure$dropLocal`, which is an implementation detail of one function body and can be renamed by
+an unrelated edit. **And the identifiers contain `$`**, which is not a valid C identifier character
+in standard C (clang and gcc accept it as an extension), so a strictly conforming consumer cannot
+compile the header at all.
+
+This predates ADR-0057 — destructors and specializations already did it — but ADR-0057 is what makes
+it worth filing, because hoisting turns "a few synthesized symbols" into "one per local function in
+the program".
+
+**Cost of the workaround:** none is applied; the symbols are simply public. Nothing is incorrect
+today, and the `generics`/`ffi-header` harnesses pass. The fix is an `internal`-linkage concept in
+DC-IR (one field on `DCFunction`, honoured by `llvm_emit.dart` as LLVM `internal` and skipped by
+`c_header.dart`) — which is also the right mechanism for letting a user mark a `@bare` function
+module-private, so it should be designed once for both rather than bolted on for synthesized
+functions alone.
