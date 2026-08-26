@@ -4,6 +4,84 @@ Work queue, not a confession log (`CLAUDE.md`). Every entry: what was worked aro
 
 ---
 
+## GAP-0054 — ADR-0025 can elide a retain/release pair across a `Release` of an ALIASING value
+
+**Domain:** dc-elide (M2). **Pre-existing — not introduced by ADR-0054, but found by it.**
+**Status:** OPEN — not reachable today, and the reason it is not reachable is a property of the
+lowering rather than of the pass
+
+Spec §3.2 pass 3, as implemented, deletes `retain(x) … release(x)` when **no release of x** appears
+between them. It reasons over DCValues. Two DCValues can refer to the same runtime object — that is
+the entire premise of ADR-0017's alias retain — so "no release of `x`" is not the same statement as
+"nothing released this object".
+
+Found while deriving `boxNode`'s expected ARC counts for `tests/conformance/generic-class/`. There,
+the elided pair sits across `Release n` and `Release b`, and `Release b` runs `Box$Node_dtor`, which
+releases the very object the elided retain was protecting. It is **safe there**, and the reason is
+worth stating precisely: the last *use* of the value (`got.n`) is lowered before any of the releases,
+because `_releaseHeapLocals` only runs at return, after the return expression. So there is no use
+after the premature free, because there is no use at all.
+
+That is a property of how `dcc-lower` orders a return, not of the elision pass. The shape that breaks
+it already exists in the language: a heap-field store (ADR-0048) emits a `Release` of the old value
+**mid-function**. `final got = b.unwrap(); a.next = other; return got.n;` would put a release of a
+potentially-aliasing object between the retain and the use, with the pass still deleting the pair
+because it never sees a release of `got` itself.
+
+**Cost of the workaround:** none paid, because nothing was worked around — this is a recorded finding,
+not a repair. The cost is that the safety argument for pass 3 currently depends on an invariant that
+lives in a different file from the pass and is not asserted anywhere. Generic containers make the
+shape much easier to reach: `map.get(k)` returning a borrowed reference, followed by a mutation of the
+map, is the canonical form and it is exactly what M3's hashmap benchmark will write. Worth settling
+before that benchmark, not after — and the honest fix is probably for pass 3 to invalidate pending
+retains on ANY `Release`, not only a matching one, which costs some elision and is measurable.
+
+---
+
+## GAP-0055 — Generic METHODS on classes are not implemented
+
+**Domain:** dcc-lower (M3)
+**Status:** OPEN — refused by name at the call site, not half-handled
+
+ADR-0052 monomorphizes generic top-level functions; ADR-0054 monomorphizes generic classes. A generic
+*method* — `R map<R>(R seed)` on `Box<T>` — is neither. It would need one body per (class
+instantiation × method type arguments) pair, which is a product neither drain produces.
+
+Before it was refused explicitly, it failed with ADR-0052's *"type parameter R has no binding … which
+is a dcc-lower bug"* — both confusing and untrue: it is an unimplemented shape, not a broken
+invariant. The call site now names it and says what to do instead.
+
+**Cost of the workaround:** write it as a generic top-level function taking the receiver as its first
+parameter, which is what the method lowers to anyway (ADR-0043). Ergonomically worse and exactly as
+fast. The shape that will want this first is a container's `map`/`fold`, which M3's benchmarks may or
+may not need depending on how the hashmap is written.
+
+---
+
+## GAP-0056 — A generic receiver's type arguments are recovered structurally, from a finite set of expression shapes
+
+**Domain:** dcc-lower (M3)
+**Status:** OPEN — a diagnostic, not a silent wrong answer
+
+Kernel does not record a receiver's type arguments on the access node: `InstanceGet` and
+`InstanceInvocation` carry an interface target whose enclosing class is the *template*. ADR-0054
+recovers them by walking the receiver expression instead — `this`, a local (via its declared type), a
+constructor call, a field read, a method result — and refuses anything else by name.
+
+The obvious alternative, a `StaticTypeContext`, needs `CoreTypes`/`ClassHierarchy` over a component
+compiled `--no-link-platform`, where `dart:core` is not linked at all (`kernel_frontend.dart`). It is
+the same constraint that makes `_lowerSignatureType` inspect `.classNode` directly rather than ask a
+type environment anything, so this is not a shortcut around an available API — the API is not
+available.
+
+**Cost of the workaround:** the set of receiver shapes is finite and will need extending as the
+language grows; each extension is a new branch in `_receiverInstanceOrNull`. A shape it does not
+understand is a compile error telling the author to bind the receiver to a typed local first, which
+is a real ergonomic cost but never a wrong layout. If DCDart ever links the platform (or grows its
+own type environment), this collapses into one call.
+
+---
+
 ## GAP-0026 — No signed sized-integer types, so a C `int` parameter has to be declared `u32`
 
 **Domain:** dcc-lower, runtime prelude (M1/M2, surfaced by ADR-0038's extern FFI)
@@ -106,7 +184,8 @@ clean run. The kernel side has offered to run exactly that.
 ## GAP-0040 — Generic CLASSES are not monomorphized, only generic functions
 
 **Domain:** dcc-lower (M2/M3)
-**Status:** OPEN
+**Status:** RESOLVED (2026-08-26) — ADR-0054. Both halves: per-instantiation layout AND the
+recursion bound this entry said must land at the same time. See the resolution note at the end.
 
 ADR-0052 monomorphizes generic FUNCTIONS. A generic class — `Box<T>`, and therefore every container
 M3's hashmap benchmark would want — is not implemented.
@@ -126,6 +205,36 @@ speculatively. Whoever adds generic classes must add a depth or set bound at the
 **Cost of the workaround:** a container is written concretely per element type, which is what C does
 and what the kernel already does. Fine for a handful of types, and exactly the duplication generics
 exist to remove.
+
+**Resolution.** ADR-0054, `tests/conformance/generic-class/`. `_HeapLayouts` is keyed by a
+`_ClassInstance` (class + type arguments) exactly as this entry predicted it would have to be, and a
+non-generic class is the degenerate instantiation with an empty argument list — which is what let
+every M2 symbol keep its name and body while flowing through the new path. The destructor cascade is
+synthesized per instantiation, so `Box<u64>` gets **no** destructor and `Box<Node>` gets
+`Box$Node_dtor`, from the same class.
+
+The ARC half is the part worth reading before touching this code again, because this entry
+under-stated it. It is not only that each instantiation needs *a* destructor; it is that `Box<u64>`
+and `Box<Node>` have **identical payload sizes and opposite ARC obligations**. Getting it wrong in
+one direction leaks an arena slot per construction; getting it wrong in the other releases a `u64` as
+if it were a heap pointer. Only the second is invisible to a leak test, which is why the conformance
+target asserts the *absence* of `Box$u64_dtor` in the symbol table rather than trusting the heap
+baseline to catch it.
+
+The unguarded recursion this entry flagged is guarded: a type-argument nesting bound and a total
+instantiation bound, both compile errors naming what ran away, with
+`examples/m3-generic-class/recursive_reject.dart` as a permanent negative fixture run under a
+timeout — because for that program the only two possible behaviours are "reject" and "hang", and a
+bound that is merely slow is not a bound.
+
+Two pre-existing bugs fell out, neither in new code, both latent until a type argument could itself
+be generic: ADR-0052's mangling dropped a type argument's own type arguments (`pick<Box<u64>>` and
+`pick<Box<Node>>` collided on one symbol, and the queue deduplicates by symbol), and
+`_lowerCalleeType` only substituted a bare `T`, so a callee signature saying `Box<T>` passed through
+unbound. Both fixed in the same commit; see the ADR.
+
+What this did NOT do: generic methods (GAP-0055), generic class hierarchies, and any measurement of
+the code-size cost of monomorphization (escalation 0009).
 
 ---
 
@@ -347,7 +456,7 @@ inferring from the gaps file:
 
 | prerequisite | status | blocks |
 |---|---|---|
-| generics / monomorphization | **RESOLVED 2026-08-22 (ADR-0052)** — functions only | generic CLASSES remain, GAP-0040 |
+| generics / monomorphization | **RESOLVED** — functions 2026-08-22 (ADR-0052), generic CLASSES 2026-08-26 (ADR-0054, GAP-0040 closed) | — (but see GAP-0054: a generic container is what makes the pass-3 aliasing hazard easy to reach) |
 | closures | **PARTIALLY RESOLVED 2026-08-26 (ADR-0057)** — non-capturing local functions hoist to static symbols and call directly; CAPTURING closures and closures-as-VALUES are not implemented and are not one lowering each (GAP-0052, escalation 0008) | the functional workload, still |
 | `String` | **PARTIALLY RESOLVED 2026-08-26 (ADR-0053)** — borrowed `Str` slices work; owning `String`/`StrBuf` still blocked on the allocator, GAP-0045 | JSON parser and the string pass still blocked (both need to *build* text, not only read it) |
 | instance methods | **RESOLVED 2026-08-21 (ADR-0043)** | — |
@@ -358,18 +467,29 @@ inferring from the gaps file:
 Only `bool` locals passed at the time. Since then: instance methods (ADR-0043), nested loops
 (ADR-0044), `break`/`continue` (ADR-0047), nullable heap references (ADR-0049), heap-typed field
 stores (ADR-0048), `for` loops (ADR-0050), monomorphized generic FUNCTIONS (ADR-0052), borrowed
-`Str` slices (ADR-0053) and non-capturing closures (ADR-0057) have all landed.
+`Str` slices (ADR-0053), non-capturing closures (ADR-0057) and generic CLASSES (ADR-0054) have all
+landed.
 
 **The prose here used to say "two prerequisites remain: generics and `String`", which contradicted
 the table directly above it on two counts** — it omitted closures, which the table lists as an open
 row, and it was written before ADR-0053 landed `Str`. Corrected, and stated as the table states it:
 
-> **Three prerequisites remain open, none of them whole:** generic CLASSES (GAP-0040 — generic
-> functions are done), owning `String`/`StrBuf` (GAP-0045 — borrowed `Str` is done), and CAPTURING
-> closures plus closures-as-values (GAP-0052 and escalation 0008 — non-capturing ones are done).
+> **Two prerequisites remain open, neither of them whole:** owning `String`/`StrBuf` (GAP-0045 —
+> borrowed `Str` is done), and CAPTURING closures plus closures-as-values (GAP-0052 and escalation
+> 0008 — non-capturing ones are done).
 
-A tree/graph traversal benchmark is now writable. A JSON parser and a string-processing pass still
-need text that can be *built*, not only read. A hashmap workload still needs generic classes. **The
+Revised again when ADR-0057 and ADR-0054 were integrated together: the third row above, generic
+CLASSES, closed in the same integration (GAP-0040), which is why this now reads *two* and not
+*three*. Generic METHODS on a class are still not implemented (GAP-0055).
+
+A tree/graph traversal benchmark is now writable, and so — as of ADR-0054 — is a hashmap workload.
+**Do not write the hashmap one without reading GAP-0054 first.** Its canonical shape, `map.get(k)`
+followed by a mutation of the map, is precisely the get-then-mutate pattern that can put a `Release`
+of an *aliasing* value between an elided retain and its use. That pass-3 elision is safe today only
+because `_releaseHeapLocals` runs after the return expression — a property of how `dcc-lower` orders
+a return, not a property of the pass — so the benchmark that most wants a hashmap is the one standing
+closest to the hazard. A JSON parser and a string-processing pass still need text that can be
+*built*, not only read. **The
 closure-heavy functional workload is the one that got no closer**, because passing a function to a
 function is precisely the part ADR-0057 does not do — and per escalation 0008 §3, it is also the
 benchmark where the elision model is structurally weakest, so it should be scoped with that document

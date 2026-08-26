@@ -168,66 +168,52 @@ Future<DCModule> lowerToDCModule(
       );
     }
 
-    // (ADR-0043) Instance methods on HeapObject subclasses, lowered as
-    // ordinary functions with the receiver as parameter 0. Collected AFTER
-    // the top-level walk so a method may call a top-level function and vice
-    // versa -- both end up in the same `functions` list and `Call` resolves
-    // by name at emission.
-    final methodNames = <Procedure, String>{};
+    // (ADR-0043 + ADR-0054) Every NON-generic HeapObject subclass in this
+    // library is its own single instantiation, registered here so that the
+    // drain below emits its methods and destructor whether or not anything
+    // constructs it -- which is exactly what the pre-ADR-0054 code did by
+    // walking `targetLibrary.classes` directly. A GENERIC class is
+    // deliberately NOT registered here: it is a template with no layout, and
+    // its instantiations arrive from use sites during lowering, the same way
+    // ADR-0052's function specializations do.
     for (final cls in targetLibrary.classes) {
       if (!heapLayouts.extendsHeapObject(cls)) continue;
-      for (final proc in cls.procedures) {
-        if (proc.isStatic || proc.isAbstract || proc.isExternal) continue;
-        if (proc.kind != ProcedureKind.Method) {
-          // Getters/setters/operators on a HeapObject are not lowered yet;
-          // saying so beats emitting nothing and letting the call site fail
-          // with a confusing "has no field" error later.
-          throw DccLowerError(
-            '"${cls.name}.${proc.name.text}" is a ${proc.kind.name}; only '
-            'plain instance methods are lowered on a HeapObject subclass '
-            '(docs/decisions/0043-instance-methods.md)',
-          );
-        }
-        methodNames[proc] = methodLinkName(cls.name, proc.name.text);
-      }
-    }
-    for (final entry in methodNames.entries) {
-      functions.add(
-        _BareFunctionLowerer(
-          entry.key,
-          preludeUri,
-          structLayouts,
-          heapLayouts,
-          externNames,
-          globalNames,
-          hoister,
-          entry.key.enclosingClass,
-          pendingSpecializations,
-          const {},
-          stringLiterals,
-        ).lower(linkNameOverride: entry.value),
-      );
+      if (cls.typeParameters.isNotEmpty) continue;
+      heapLayouts.register(_ClassInstance(cls, const []));
     }
 
-    // (ADR-0052) Drain the monomorphization queue. Lowering a specialization
-    // can discover further ones (a generic calling another generic), so this
-    // loops until nothing new appears rather than making a single pass.
-    // `_pendingSpecializations` is keyed by mangled name, so each distinct
-    // (function, type arguments) pair is emitted exactly once no matter how
-    // many call sites request it.
+    // (ADR-0052, extended by ADR-0054, extended again by ADR-0057) Drain the
+    // monomorphization queues.
     //
-    // (ADR-0057) The hoisted-local-function queue is drained by the SAME loop,
-    // not a second one after it, because the two feed each other: a
-    // specialization's body may declare a local function, and a local
-    // function's body may call a generic. Two sequential loops would emit
-    // whichever kind the second loop handled and silently drop anything the
-    // first kind discovered afterwards.
-    while (pendingSpecializations.isNotEmpty || hoister.pending.isNotEmpty) {
-      if (pendingSpecializations.isNotEmpty) {
+    // There are THREE of them and they feed each other, which is why this is
+    // one fixpoint loop rather than three sequential drains:
+    //
+    //   * lowering a function specialization can construct `Box<u64>`,
+    //     adding a CLASS instantiation;
+    //   * lowering `Box<u64>`'s methods can call `pick<u64>`, adding a
+    //     FUNCTION specialization;
+    //   * either of those bodies can declare a local function, adding a
+    //     HOISTED body -- whose own body can in turn call a generic or
+    //     construct a generic class, feeding both queues above.
+    //
+    // Sequential drains would emit whichever kind the later drain handled and
+    // silently drop anything an earlier kind discovered after its own drain
+    // had finished. All three queues are keyed by mangled/link name, so each
+    // distinct (function or class, type arguments) pair is emitted exactly
+    // once no matter how many sites request it. That keying IS the
+    // deduplication -- there is no separate identical-body merge step, and
+    // none is needed.
+    final emittedInstantiations = <String>{};
+    var progressed = true;
+    while (progressed) {
+      progressed = false;
+
+      while (pendingSpecializations.isNotEmpty) {
         final entry = pendingSpecializations.entries.first;
         pendingSpecializations.remove(entry.key);
         if (emittedSpecializations.contains(entry.key)) continue;
         emittedSpecializations.add(entry.key);
+        progressed = true;
         functions.add(
           _BareFunctionLowerer(
             entry.value.proc,
@@ -243,32 +229,91 @@ Future<DCModule> lowerToDCModule(
             stringLiterals,
           ).lower(linkNameOverride: entry.key),
         );
-        continue;
       }
 
-      final entry = hoister.pending.entries.first;
-      hoister.pending.remove(entry.key);
-      if (hoister.emitted.contains(entry.key)) continue;
-      hoister.emitted.add(entry.key);
-      functions.add(
-        _BareFunctionLowerer(
-          entry.value.enclosingProc,
-          preludeUri,
-          structLayouts,
-          heapLayouts,
-          externNames,
-          globalNames,
-          hoister,
-          // Deliberately NO receiverClass, even when the local function was
-          // written inside an instance method: a body that mentioned `this`
-          // would be capturing, and is rejected at the hoist site.
-          null,
-          pendingSpecializations,
-          entry.value.typeSubstitution,
-          stringLiterals,
-          entry.value,
-        ).lower(),
-      );
+      // (ADR-0057) Hoisted non-capturing local functions.
+      while (hoister.pending.isNotEmpty) {
+        final entry = hoister.pending.entries.first;
+        hoister.pending.remove(entry.key);
+        if (hoister.emitted.contains(entry.key)) continue;
+        hoister.emitted.add(entry.key);
+        progressed = true;
+        functions.add(
+          _BareFunctionLowerer(
+            entry.value.enclosingProc,
+            preludeUri,
+            structLayouts,
+            heapLayouts,
+            externNames,
+            globalNames,
+            hoister,
+            // Deliberately NO receiver instance, even when the local function
+            // was written inside an instance method: a body that mentioned
+            // `this` would be capturing, and is rejected at the hoist site.
+            null,
+            pendingSpecializations,
+            entry.value.typeSubstitution,
+            stringLiterals,
+            entry.value,
+          ).lower(),
+        );
+      }
+
+      // (ADR-0054) One set of method bodies and (if the layout has a
+      // heap-typed field) one destructor per class INSTANTIATION.
+      // `.toList()` because emitting a member can register further
+      // instantiations into the very map being iterated.
+      for (final key in heapLayouts.instantiations.keys.toList(growable: false)) {
+        if (emittedInstantiations.contains(key)) continue;
+        final inst = heapLayouts.instantiations[key];
+        if (inst == null) continue;
+        emittedInstantiations.add(key);
+        progressed = true;
+
+        for (final proc in inst.cls.procedures) {
+          if (proc.isStatic || proc.isAbstract || proc.isExternal) continue;
+          if (proc.kind != ProcedureKind.Method) {
+            // Getters/setters/operators on a HeapObject are not lowered yet;
+            // saying so beats emitting nothing and letting the call site fail
+            // with a confusing "has no field" error later.
+            throw DccLowerError(
+              '"${inst.cls.name}.${proc.name.text}" is a ${proc.kind.name}; '
+              'only plain instance methods are lowered on a HeapObject '
+              'subclass (docs/decisions/0043-instance-methods.md)',
+            );
+          }
+          // (ADR-0054, GAP-0055) A method carrying its OWN type parameters is
+          // a template even after the CLASS is instantiated -- it would need
+          // one body per (class instantiation x method type arguments) pair,
+          // which this drain does not produce. Skipped here rather than
+          // lowered into a body with `R` unbound; the call site refuses it by
+          // name.
+          if (proc.function.typeParameters.isNotEmpty) continue;
+          functions.add(
+            _BareFunctionLowerer(
+              proc,
+              preludeUri,
+              structLayouts,
+              heapLayouts,
+              externNames,
+              globalNames,
+              hoister,
+              inst,
+              pendingSpecializations,
+              inst.substitution,
+              stringLiterals,
+            ).lower(linkNameOverride: methodLinkName(key, proc.name.text)),
+          );
+        }
+
+        // (ADR-0022, per-instantiation since ADR-0054) These are never
+        // written by the user, only referenced by name (from Alloc's cls
+        // header write) and called indirectly (from Release's codegen).
+        final destructorName = heapLayouts.destructorNameFor(inst);
+        if (destructorName != null) {
+          functions.add(_buildDestructor(destructorName, heapLayouts.layoutFor(inst)));
+        }
+      }
     }
 
     if (functions.isEmpty) {
@@ -300,16 +345,10 @@ Future<DCModule> lowerToDCModule(
       }
     }
 
-    // (ADR-0022) Synthesize one destructor DCFunction per HeapObject
-    // subclass that actually has a heap-typed field -- these are never
-    // written by the user, only referenced by name (from Alloc's cls
-    // header write) and called indirectly (from Release's codegen).
-    for (final cls in targetLibrary.classes) {
-      if (!heapLayouts.extendsHeapObject(cls)) continue;
-      final destructorName = heapLayouts.destructorNameFor(cls);
-      if (destructorName == null) continue; // no heap-typed fields, nothing to release
-      functions.add(_buildDestructor(destructorName, heapLayouts.layoutFor(cls)));
-    }
+    // (ADR-0022's destructor synthesis used to live here, walking
+    // `targetLibrary.classes`. Since ADR-0054 it is part of the
+    // instantiation drain above, because "does this class need a
+    // destructor" is only answerable once `T` is known.)
 
     // (ADR-0025) Redundant-pair removal, applied to every function --
     // user-lowered and synthesized destructors alike. Real M2 exit-
@@ -367,7 +406,7 @@ DCFunction _buildDestructor(String linkName, List<_StructField> fields) {
   final selfValue = DCValue(allocId(), const DCHeapPointer(DCVoid()));
   final instructions = <DCInstruction>[];
   for (final field in fields) {
-    if (field.heapFieldClass == null) continue; // scalar field -- nothing to release
+    if (field.heapFieldInstance == null) continue; // scalar field -- nothing to release
     final fieldPtr = DCValue(allocId(), DCPointer(field.type));
     instructions.add(PtrOffset(dest: fieldPtr, base: selfValue, offsetBytes: field.offset));
     final fieldValue = DCValue(allocId(), field.type);
@@ -577,18 +616,24 @@ bool _extendsPreludeMarker(Class cls, String markerName, Uri preludeUri) {
 /// byte offset from the struct's base address (packed layout — sequential,
 /// no natural-alignment padding).
 ///
-/// `heapFieldClass` (ADR-0020, extended by ADR-0022): non-null iff `type`
-/// is `DCHeapPointer` -- the CONCRETE class this field points to, which
-/// `type` alone can't say (it's always the same `DCHeapPointer(DCVoid())`
-/// placeholder, GAP-0003). Needed for destructor-cascade resolution
-/// (`_HeapLayouts.destructorNameFor`) -- always `null` for `_StructField`s
-/// built by `_StructLayouts` (`@packed` fields are never heap-typed).
+/// `heapFieldInstance` (ADR-0020, extended by ADR-0022, and widened from a
+/// bare `Class` to a `_ClassInstance` by ADR-0054): non-null iff `type` is
+/// `DCHeapPointer` -- the CONCRETE class INSTANTIATION this field points
+/// to, which `type` alone can't say (it's always the same
+/// `DCHeapPointer(DCVoid())` placeholder, GAP-0003). Needed for
+/// destructor-cascade resolution (`_HeapLayouts.destructorNameFor`) --
+/// always `null` for `_StructField`s built by `_StructLayouts` (`@packed`
+/// fields are never heap-typed).
+///
+/// It has to be an INSTANTIATION rather than a class because `Box<u64>` and
+/// `Box<Node>` are the same `Class` and carry different destructor
+/// obligations: one has none at all, the other must release its field.
 class _StructField {
   final String name;
   final DCType type;
   final int offset;
-  final Class? heapFieldClass;
-  const _StructField(this.name, this.type, this.offset, {this.heapFieldClass});
+  final _ClassInstance? heapFieldInstance;
+  const _StructField(this.name, this.type, this.offset, {this.heapFieldInstance});
 }
 
 /// Computes and caches `@packed` field layouts for `extends Struct`
@@ -645,22 +690,73 @@ class _StructLayouts {
 /// they're always reached through their own `Alloc`-returned
 /// `DCHeapPointer`, so there's no reason to use the getter-pair
 /// approximation here too.
+///
+/// (ADR-0054) Everything here is keyed by a [_ClassInstance] -- a class PLUS
+/// its type arguments -- rather than by a bare `Class`, because `Box<u64>`
+/// and `Box<u32>` are one `Class` with two different field layouts, two
+/// different payload sizes and two different ARC shapes. A non-generic class
+/// is simply the instantiation with an empty type-argument list, whose
+/// mangled name is its own name, so nothing that predates generic classes
+/// changes name, layout or symbol.
 class _HeapLayouts {
   final Uri preludeUri;
-  final Map<Class, List<_StructField>> _cache = {};
-  final Map<Class, String?> _destructorCache = {};
+  final Map<String, List<_StructField>> _cache = {};
+  final Map<String, String?> _destructorCache = {};
+
+  /// (ADR-0054) Every class instantiation discovered so far, keyed by
+  /// mangled name. **This map is what bounds code size**: two call sites
+  /// asking for `Box<u64>` produce one key and therefore one layout, one
+  /// destructor and one copy of each method. It is also the drain queue --
+  /// `lowerToDCModule` emits the members of everything in here, and
+  /// lowering those members can add more.
+  final Map<String, _ClassInstance> instantiations = {};
 
   _HeapLayouts(this.preludeUri);
 
   bool extendsHeapObject(Class cls) => _extendsPreludeMarker(cls, 'HeapObject', preludeUri);
 
-  List<_StructField> layoutFor(Class cls) {
-    final cached = _cache[cls];
-    if (cached != null) return cached;
+  /// The single instantiation of a NON-generic class. Refuses a generic one
+  /// by name rather than silently treating `Box` as `Box<dynamic>`: a class
+  /// whose type arguments are not known has no layout, and pretending it
+  /// does is exactly the bug this ADR exists to prevent.
+  _ClassInstance instanceOfNonGeneric(Class cls, {required String context}) {
+    if (cls.typeParameters.isNotEmpty) {
+      throw DccLowerError(
+        '"$context": "${cls.name}" is generic and was reached without type '
+        'arguments. A generic class is a TEMPLATE -- it has no layout, no '
+        'payload size and no destructor until `T` is known '
+        '(docs/decisions/0054-generic-classes.md).',
+      );
+    }
+    return register(_ClassInstance(cls, const []));
+  }
 
+  /// Records [inst] and returns the canonical instance for its mangled name,
+  /// so identical instantiations reached from different call sites are one
+  /// object and one emitted body.
+  _ClassInstance register(_ClassInstance inst) {
+    final existing = instantiations[inst.mangledName];
+    if (existing != null) return existing;
+    _checkInstantiationBudget(inst.cls.name, inst.typeArgs, instantiations.length);
+    instantiations[inst.mangledName] = inst;
+    return inst;
+  }
+
+  List<_StructField> layoutFor(_ClassInstance inst) {
+    final cached = _cache[inst.mangledName];
+    if (cached != null) return cached;
+    register(inst);
+
+    final substitution = inst.substitution;
     final fields = <_StructField>[];
     var offset = 0;
-    for (final field in cls.fields) {
+    for (final field in inst.cls.fields) {
+      // (ADR-0054) Substitute FIRST. `final T value` is a
+      // `TypeParameterType` in the Kernel IR and has no width; once `T` is
+      // resolved this is an ordinary field type and `_lowerFieldType`
+      // needs no knowledge of generics at all -- the same property
+      // ADR-0052 relied on for signatures.
+      final fieldType = _substituteType(field.type, substitution);
       // heapLayouts: this -- ADR-0020. A HeapObject subclass's OWN field
       // can itself be HeapObject-typed (`class BoxHolder extends HeapObject
       // { final Box inner; ... }`); `@packed` struct fields (below,
@@ -668,42 +764,55 @@ class _HeapLayouts {
       // argument) never get this recognition -- a raw-memory `@packed`
       // struct has no ARC involvement at all, so a heap reference inside
       // one would be meaningless (nothing would ever retain/release it).
-      final type = _lowerFieldType(field.type, preludeUri, cls.name, field.name.text, heapLayouts: this);
-      Class? heapFieldClass;
-      if (type is DCHeapPointer) {
-        final fieldDartType = field.type;
-        if (fieldDartType is InterfaceType) heapFieldClass = fieldDartType.classNode;
+      final type = _lowerFieldType(
+          fieldType, preludeUri, inst.mangledName, field.name.text, heapLayouts: this);
+      _ClassInstance? heapFieldInstance;
+      if (type is DCHeapPointer && fieldType is InterfaceType) {
+        // Registered, not merely recorded: a field of type `Box<Node>`
+        // makes `Box<Node>` reachable even if no constructor for it is
+        // written anywhere in this unit, and its destructor and methods
+        // still have to exist.
+        heapFieldInstance =
+            register(_ClassInstance(fieldType.classNode, fieldType.typeArguments));
       }
-      fields.add(_StructField(field.name.text, type, offset, heapFieldClass: heapFieldClass));
-      offset += _byteWidth(type, cls.name, field.name.text);
+      fields.add(_StructField(field.name.text, type, offset,
+          heapFieldInstance: heapFieldInstance));
+      offset += _byteWidth(type, inst.mangledName, field.name.text);
     }
-    _cache[cls] = fields;
+    _cache[inst.mangledName] = fields;
     return fields;
   }
 
-  /// The link name of [cls]'s destructor (ADR-0022), or `null` if [cls] has
+  /// The link name of [inst]'s destructor (ADR-0022), or `null` if it has
   /// no heap-typed fields -- the overwhelmingly common case, and the only
-  /// one that existed before this ADR (e.g. `Box`, whose only field is a
+  /// one that existed before that ADR (e.g. `Box`, whose only field is a
   /// `u64`). A destructor's own body releases each heap-typed field in
   /// turn (`_buildDestructor`); if one of THOSE fields' classes also has a
   /// destructor, that cascades automatically at runtime through `cls`
   /// (docs/decisions/0022) with no recursion needed here -- this method
-  /// only decides whether THIS class needs a destructor at all, not what
-  /// its transitive closure looks like.
-  String? destructorNameFor(Class cls) {
-    if (_destructorCache.containsKey(cls)) return _destructorCache[cls];
-    final fields = layoutFor(cls);
-    final hasHeapField = fields.any((f) => f.heapFieldClass != null);
-    final name = hasHeapField ? '${cls.name}_dtor' : null;
-    _destructorCache[cls] = name;
+  /// only decides whether THIS instantiation needs a destructor at all, not
+  /// what its transitive closure looks like.
+  ///
+  /// (ADR-0054) Note that this is answered PER INSTANTIATION. `Box<u64>`
+  /// returns null and `Box<Node>` returns `Box$Node_dtor` -- from the same
+  /// class. Answering it per CLASS would either release an integer as if it
+  /// were a pointer, or leak the reference, depending on which way it
+  /// guessed.
+  String? destructorNameFor(_ClassInstance inst) {
+    final key = inst.mangledName;
+    if (_destructorCache.containsKey(key)) return _destructorCache[key];
+    final fields = layoutFor(inst);
+    final hasHeapField = fields.any((f) => f.heapFieldInstance != null);
+    final name = hasHeapField ? '${key}_dtor' : null;
+    _destructorCache[key] = name;
     return name;
   }
 
-  int payloadSizeBytes(Class cls) {
-    final fields = layoutFor(cls);
+  int payloadSizeBytes(_ClassInstance inst) {
+    final fields = layoutFor(inst);
     if (fields.isEmpty) return 0;
     final last = fields.last;
-    return last.offset + _byteWidth(last.type, cls.name, last.name);
+    return last.offset + _byteWidth(last.type, inst.mangledName, last.name);
   }
 }
 
@@ -855,15 +964,20 @@ class _BareFunctionLowerer {
   /// else is still rejected.
   final Set<String> globalNames;
 
-  /// The enclosing class when lowering an INSTANCE METHOD (ADR-0043), null
-  /// for a top-level `@bare` function.
+  /// The enclosing class INSTANTIATION when lowering an INSTANCE METHOD
+  /// (ADR-0043; widened from `Class?` to `_ClassInstance?` by ADR-0054),
+  /// null for a top-level `@bare` function.
   ///
   /// A method is lowered as an ordinary function whose FIRST parameter is
   /// the receiver — the same shape `_buildDestructor` already synthesizes
   /// for the destructor cascade (ADR-0022), and the same shape C uses. No
   /// dynamic dispatch is involved: every call site knows the concrete class
   /// statically, exactly as ADR-0022 observed for destructors.
-  final Class? receiverClass;
+  ///
+  /// It is the instantiation rather than the class because `this.value`
+  /// inside `Box<T>.unwrap` needs `Box<u64>`'s layout, not `Box`'s — which
+  /// does not exist.
+  final _ClassInstance? receiverInstance;
 
   /// (ADR-0052) Where newly-discovered specializations are queued, keyed by
   /// mangled name so each distinct (function, type arguments) pair is emitted
@@ -910,7 +1024,7 @@ class _BareFunctionLowerer {
     this.externNames,
     this.globalNames,
     this.hoister, [
-    this.receiverClass,
+    this.receiverInstance,
     this.pendingSpecializations = const {},
     this.typeSubstitution = const {},
     this.stringLiterals = const {},
@@ -973,8 +1087,8 @@ class _BareFunctionLowerer {
     // put `this` in `positionalParameters` -- it is implicit, reached via
     // `ThisExpression` -- so it is prepended here and bound to `_thisValue`
     // rather than to a VariableDeclaration.
-    final cls = receiverClass;
-    if (cls != null) {
+    final self = receiverInstance;
+    if (self != null) {
       final selfType = DCHeapPointer(DCVoid());
       final selfValue = DCValue(_allocId(), selfType);
       _thisValue = selfValue;
@@ -1163,7 +1277,10 @@ class _BareFunctionLowerer {
         }
 
         if (enclosingClass != null && heapLayouts.extendsHeapObject(enclosingClass)) {
-          _lowerHeapFieldStore(expr, enclosingClass);
+          _lowerHeapFieldStore(
+              expr,
+              _instanceOfReceiver(expr.receiver, enclosingClass,
+                  'the field store "${expr.interfaceTarget.name.text}"'));
           return;
         }
       }
@@ -2420,7 +2537,19 @@ class _BareFunctionLowerer {
       }
 
       if (enclosingClass != null && heapLayouts.extendsHeapObject(enclosingClass)) {
-        return _lowerHeapConstruction(expr, enclosingClass);
+        // (ADR-0054) A constructor invocation names its own type arguments
+        // directly -- `Box<u64>(v)` -- so this is the one discovery site that
+        // needs no receiver at all.
+        final inst = _instanceFromArgs(enclosingClass, expr.arguments.types);
+        if (inst == null) {
+          throw DccLowerError(
+            '"$context": cannot instantiate "${enclosingClass.name}" with '
+            '${expr.arguments.types.length} type arguments; it declares '
+            '${enclosingClass.typeParameters.length} '
+            '(docs/decisions/0054-generic-classes.md)',
+          );
+        }
+        return _lowerHeapConstruction(expr, inst);
       }
 
       // (M2, ADR-0023) `Weak<T>.fromStrong(target)` -> MakeWeak. The
@@ -2489,7 +2618,10 @@ class _BareFunctionLowerer {
       }
 
       if (enclosingClass != null && heapLayouts.extendsHeapObject(enclosingClass)) {
-        return _lowerHeapFieldLoad(expr, enclosingClass);
+        return _lowerHeapFieldLoad(
+            expr,
+            _instanceOfReceiver(expr.receiver, enclosingClass,
+                'the field read "${expr.interfaceTarget.name.text}"'));
       }
     }
 
@@ -2505,19 +2637,46 @@ class _BareFunctionLowerer {
           target.kind == ProcedureKind.Method &&
           enclosing != null &&
           heapLayouts.extendsHeapObject(enclosing)) {
+        // (ADR-0054, GAP-0055) A method with its own type parameters would
+        // need one body per (class instantiation x method type arguments)
+        // pair. Refused here, by name: without this the failure surfaces as
+        // ADR-0052's "type parameter has no binding ... which is a dcc-lower
+        // bug", which is both confusing and wrong -- this is an unimplemented
+        // shape, not a broken invariant.
+        if (target.function.typeParameters.isNotEmpty) {
+          throw DccLowerError(
+            '"$context": "${enclosing.name}.${target.name.text}" is a GENERIC '
+            'METHOD. Generic classes are monomorphized (ADR-0054) and generic '
+            'top-level functions are (ADR-0052), but a generic method on a '
+            'class is neither and is not implemented — see '
+            'docs/known-gaps.md GAP-0055. Make it a generic top-level '
+            'function taking the receiver as its first parameter.',
+          );
+        }
+
+        // (ADR-0054) Which INSTANTIATION's method body this call goes to.
+        // Resolved BEFORE the receiver is lowered, so a failure names the
+        // call rather than surfacing later as a missing symbol.
+        final inst = _instanceOfReceiver(
+            expr.receiver, enclosing, 'the call to "${target.name.text}"');
         final receiver = _lowerExpression(expr.receiver);
         final args = <DCValue>[receiver];
         for (final arg in expr.arguments.positional) {
           args.add(_lowerExpression(arg));
         }
+        // The callee's return type is written in terms of the RECEIVER's
+        // type parameters, not this function's -- `T unwrap()` on
+        // `Box<u64>` returns u64 regardless of what `T` means here. Same
+        // shape as ADR-0052's `_lowerCalleeType`, one level up: resolve
+        // against the callee's own bindings, not the caller's.
         final returnType = _lowerType(
-          target.function.returnType,
+          _substituteType(target.function.returnType, inst.substitution),
           context: '$context call to ${target.name.text}',
         );
         final dest = DCValue(_allocId(), returnType);
         _addInstr(Call(
           dest: dest,
-          targetName: methodLinkName(enclosing.name, target.name.text),
+          targetName: methodLinkName(inst.mangledName, target.name.text),
           args: args,
           // The receiver is BORROWED (ADR-0019's default): the caller keeps
           // its reference for the duration of the call, so the callee must
@@ -2868,20 +3027,40 @@ class _BareFunctionLowerer {
     final typeParams = target.function.typeParameters;
     if (typeParams.isEmpty) return _lowerType(type, context: context);
 
-    DartType resolved = type;
-    if (type is TypeParameterType) {
-      final paramName = type.parameter.name;
-      final index = typeParams.indexWhere((p) => p.name == paramName);
-      if (index < 0 || index >= expr.arguments.types.length) {
-        throw DccLowerError(
-          '"$context": could not bind type parameter "$paramName" from the '
-          'call site\'s type arguments',
-        );
-      }
-      // The call site's argument may ITSELF be a type parameter, when a
-      // generic calls another generic -- resolve that through OUR
-      // substitution before handing it on.
-      resolved = _resolveTypeParameter(expr.arguments.types[index]);
+    if (typeParams.length != expr.arguments.types.length) {
+      throw DccLowerError(
+        '"$context": call to generic "${target.name.text}" with '
+        '${expr.arguments.types.length} type arguments, expected '
+        '${typeParams.length}',
+      );
+    }
+
+    // (ADR-0052) Build the CALLEE's binding and substitute the whole type
+    // through it. The call site's argument may itself be a type parameter,
+    // when a generic calls a generic, so each one is resolved through OUR
+    // substitution before being handed on.
+    //
+    // (ADR-0054) This is a full structural substitution rather than the
+    // single top-level `TypeParameterType` check it used to be. With generic
+    // classes a callee's signature can say `Box<T>` -- not a
+    // `TypeParameterType`, so the old check skipped it entirely and passed
+    // `Box<T>` down with the callee's `T` unbound. That reached
+    // `_lowerSignatureType`, which registered an instantiation of `Box` at a
+    // type parameter, and the failure surfaced much later as an
+    // "unsupported struct field type TypeParameterType" naming a class the
+    // programmer never wrote.
+    final calleeSubstitution = <String, DartType>{};
+    for (var i = 0; i < typeParams.length; i++) {
+      final name = typeParams[i].name;
+      if (name == null) continue;
+      calleeSubstitution[name] = _resolveTypeParameter(expr.arguments.types[i]);
+    }
+    final resolved = _substituteType(type, calleeSubstitution);
+    if (resolved is TypeParameterType) {
+      throw DccLowerError(
+        '"$context": could not bind type parameter '
+        '"${resolved.parameter.name}" from the call site\'s type arguments',
+      );
     }
     return _lowerSignatureType(resolved,
         preludeUri: preludeUri, heapLayouts: heapLayouts, context: context);
@@ -3435,9 +3614,15 @@ class _BareFunctionLowerer {
   /// `VariableGet` of one of the constructor's own positional parameters
   /// (mapped to the call site's already-lowered arguments by position) —
   /// anything else (real computation in an initializer) throws.
-  DCValue _lowerHeapConstruction(ConstructorInvocation expr, Class heapClass) {
-    final fields = heapLayouts.layoutFor(heapClass);
-    final payloadSize = heapLayouts.payloadSizeBytes(heapClass);
+  DCValue _lowerHeapConstruction(ConstructorInvocation expr, _ClassInstance inst) {
+    final heapClass = inst.cls;
+    // (ADR-0054) Layout, payload size and destructor are all read off the
+    // INSTANTIATION. `Box<u64>` and `Box<Node>` happen to agree on payload
+    // size here and disagree on all three of field type, destructor and ARC
+    // shape -- which is why keying any of this on the class, or on the size,
+    // silently produces a leak or a released integer.
+    final fields = heapLayouts.layoutFor(inst);
+    final payloadSize = heapLayouts.payloadSizeBytes(inst);
 
     // DCVoid as the DCHeapPointer's pointee is a placeholder -- DC-IR
     // doesn't yet track a heap object's full field layout as part of its
@@ -3453,7 +3638,7 @@ class _BareFunctionLowerer {
       Alloc(
         dest: dest,
         payloadSizeBytes: payloadSize,
-        destructorName: heapLayouts.destructorNameFor(heapClass),
+        destructorName: heapLayouts.destructorNameFor(inst),
       ),
     );
 
@@ -3524,8 +3709,8 @@ class _BareFunctionLowerer {
   /// `heapInstance.field` -> `PtrOffset` + `Load`, reading directly off the
   /// `DCHeapPointer` (no address-materialization step needed, unlike
   /// `@packed` struct fields which start from a raw `u64` -- ADR-0016).
-  DCValue _lowerHeapFieldLoad(InstanceGet expr, Class heapClass) {
-    final field = _findHeapField(heapClass, expr.interfaceTarget.name.text);
+  DCValue _lowerHeapFieldLoad(InstanceGet expr, _ClassInstance inst) {
+    final field = _findHeapField(inst, expr.interfaceTarget.name.text);
     final objectPtr = _lowerExpression(expr.receiver);
     final fieldPtr = DCValue(_allocId(), DCPointer(field.type));
     _addInstr(PtrOffset(dest: fieldPtr, base: objectPtr, offsetBytes: field.offset));
@@ -3544,12 +3729,12 @@ class _BareFunctionLowerer {
   /// flagged for local reassignment (does overwriting release the old
   /// value? retain the new one?) -- undecided, so it throws a clear error
   /// rather than guessing at a policy nobody has designed yet.
-  void _lowerHeapFieldStore(InstanceSet expr, Class heapClass) {
-    final field = _findHeapField(heapClass, expr.interfaceTarget.name.text);
+  void _lowerHeapFieldStore(InstanceSet expr, _ClassInstance inst) {
+    final field = _findHeapField(inst, expr.interfaceTarget.name.text);
     if (field.type is DCWeakPointer) {
       throw DccLowerError(
         '"$context": storing to the weak field '
-        '"${heapClass.name}.${field.name}" is not supported. The strong-field '
+        '"${inst.mangledName}.${field.name}" is not supported. The strong-field '
         'policy (ADR-0048) does not transfer: a weak store must adjust the '
         'WEAK count and interacts with the zombie-slot semantics of ADR-0023, '
         'which is a separate decision nobody has made.',
@@ -3562,7 +3747,7 @@ class _BareFunctionLowerer {
     if (value.type != field.type) {
       throw DccLowerError(
         '"$context": assigning a value of type ${value.type} to '
-        '"${heapClass.name}.${field.name}", declared ${field.type} -- no '
+        '"${inst.mangledName}.${field.name}", declared ${field.type} -- no '
         'implicit widening (same rule as arithmetic)',
       );
     }
@@ -3595,13 +3780,13 @@ class _BareFunctionLowerer {
     _addInstr(Store(pointer: fieldPtr, value: value));
   }
 
-  _StructField _findHeapField(Class heapClass, String name) {
-    final fields = heapLayouts.layoutFor(heapClass);
+  _StructField _findHeapField(_ClassInstance inst, String name) {
+    final fields = heapLayouts.layoutFor(inst);
     for (final field in fields) {
       if (field.name == name) return field;
     }
     throw DccLowerError(
-      '"$context": "${heapClass.name}" has no field "$name" — this should '
+      '"$context": "${inst.mangledName}" has no field "$name" — this should '
       'be unreachable (front_end already resolved the field access), so '
       'this indicates a bug in _HeapLayouts.layoutFor',
     );
@@ -3674,7 +3859,116 @@ class _BareFunctionLowerer {
       }
       return concrete;
     }
-    return type;
+    // (ADR-0054) `Box<T>` -- a type parameter NESTED inside a type argument
+    // rather than standing alone. ADR-0052 never had to handle this, because
+    // with no generic classes there was no generic type to nest a parameter
+    // inside; substitution is structural from here on.
+    return _substituteType(type, typeSubstitution);
+  }
+
+  /// (ADR-0054) Which INSTANTIATION of [declared] a receiver expression
+  /// denotes — `Box<u64>` rather than `Box`.
+  ///
+  /// A NON-generic class takes the first branch and never reaches the
+  /// resolution below, so every shape that predates generic classes behaves
+  /// exactly as it did.
+  ///
+  /// For a generic class the type arguments have to come from the receiver's
+  /// STATIC TYPE, which Kernel does not record on the access node:
+  /// `InstanceGet`/`InstanceInvocation` carry an interface target whose
+  /// enclosing class is the template. It is recovered structurally from the
+  /// receiver expression rather than through a `StaticTypeContext`, and that
+  /// is deliberate: building one needs `CoreTypes`/`ClassHierarchy` over a
+  /// component compiled `--no-link-platform`, where `dart:core` is not
+  /// linked at all (kernel_frontend.dart). It is the same reason
+  /// `_lowerSignatureType` inspects `.classNode` directly instead of asking
+  /// a type environment anything.
+  ///
+  /// Anything it cannot resolve throws by name. Guessing here would pick a
+  /// wrong field layout AND a wrong destructor, and the leak that follows is
+  /// silent.
+  _ClassInstance _instanceOfReceiver(Expression receiver, Class declared, String what) {
+    if (declared.typeParameters.isEmpty) {
+      return heapLayouts.instanceOfNonGeneric(declared, context: context);
+    }
+    final resolved = _receiverInstanceOrNull(receiver);
+    if (resolved == null) {
+      throw DccLowerError(
+        '"$context": could not determine which instantiation of the generic '
+        'class "${declared.name}" $what applies to. The receiver is a '
+        '${receiver.runtimeType}, and dcc-lower recovers type arguments from '
+        'the receiver expression itself (a local, `this`, a constructor call, '
+        'a field read or a method result). Bind it to a local with an '
+        'explicit type first (docs/decisions/0054-generic-classes.md).',
+      );
+    }
+    return resolved;
+  }
+
+  _ClassInstance? _receiverInstanceOrNull(Expression receiver) {
+    if (receiver is ThisExpression) return receiverInstance;
+    if (receiver is VariableGet) return _instanceFromType(receiver.variable.type);
+    if (receiver is ConstructorInvocation) {
+      return _instanceFromArgs(
+          receiver.target.enclosingClass, receiver.arguments.types);
+    }
+    if (receiver is InstanceGet) {
+      final owner = _ownerInstanceOf(receiver.interfaceTarget, receiver.receiver);
+      if (owner == null) return null;
+      for (final field in heapLayouts.layoutFor(owner)) {
+        if (field.name == receiver.interfaceTarget.name.text) return field.heapFieldInstance;
+      }
+      return null;
+    }
+    if (receiver is InstanceInvocation) {
+      final target = receiver.interfaceTarget;
+      final owner = _ownerInstanceOf(target, receiver.receiver);
+      if (owner == null) return null;
+      // The method's return type is written in terms of the OWNER's type
+      // parameters, so it resolves against the owner's substitution -- the
+      // class-level twin of ADR-0052's `_lowerCalleeType` problem.
+      return _instanceFromType(_substituteType(target.function.returnType, owner.substitution));
+    }
+    return null;
+  }
+
+  _ClassInstance? _ownerInstanceOf(Member target, Expression receiver) {
+    final owner = target.enclosingClass;
+    if (owner == null) return null;
+    if (owner.typeParameters.isEmpty) return _ClassInstance(owner, const []);
+    return _receiverInstanceOrNull(receiver);
+  }
+
+  _ClassInstance? _instanceFromType(DartType type) {
+    final resolved = _substituteType(type, typeSubstitution);
+    if (resolved is! InterfaceType) return null;
+    if (!heapLayouts.extendsHeapObject(resolved.classNode)) return null;
+    return _instanceFromArgs(resolved.classNode, resolved.typeArguments);
+  }
+
+  _ClassInstance? _instanceFromArgs(Class cls, List<DartType> typeArgs) {
+    if (!heapLayouts.extendsHeapObject(cls)) return null;
+    if (cls.typeParameters.isEmpty) return heapLayouts.register(_ClassInstance(cls, const []));
+    if (typeArgs.length != cls.typeParameters.length) return null;
+    final resolved = [
+      for (final arg in typeArgs) _substituteType(arg, typeSubstitution),
+    ];
+    for (final arg in resolved) {
+      // An unresolved `T` means this was reached from the TEMPLATE rather
+      // than from a specialization, which is a dcc-lower bug rather than a
+      // source error -- say so instead of registering an instantiation whose
+      // layout depends on a type nobody has bound.
+      if (arg is TypeParameterType) {
+        throw DccLowerError(
+          '"$context": instantiating "${cls.name}" at unbound type parameter '
+          '"${arg.parameter.name}". A generic class is only lowered as an '
+          'instantiation reached from a use site '
+          '(docs/decisions/0054-generic-classes.md); this one was reached '
+          'some other way, which is a dcc-lower bug.',
+        );
+      }
+    }
+    return heapLayouts.register(_ClassInstance(cls, resolved));
   }
 }
 
@@ -3722,6 +4016,22 @@ DCType _lowerSignatureType(
       // DCValue's own DCType, so the placeholder pointee loses no
       // information anything here actually needs.
       if (heapLayouts.extendsHeapObject(cls)) {
+        // (ADR-0054) A `Box<u64>` parameter or return type makes that
+        // instantiation reachable even where no constructor for it appears
+        // in this unit -- a function that only ever RECEIVES one still needs
+        // its methods and destructor to exist. Registering here is what
+        // makes "reached by a signature" a discovery site, alongside
+        // ADR-0052's call sites.
+        //
+        // The lowered type itself is unchanged and deliberately so: the
+        // pointee is still the `DCVoid()` placeholder (GAP-0003), because
+        // layout is resolved from the ACCESS site's class instantiation, not
+        // from the DCValue's type. Generic classes therefore add no new
+        // information to DC-IR and no new work for the backend, `dc-elide`
+        // or `dc-objdump` — the same property ADR-0052 traded on.
+        if (cls.typeParameters.isNotEmpty) {
+          heapLayouts.register(_ClassInstance(cls, type.typeArguments));
+        }
         return const DCHeapPointer(DCVoid());
       }
       // (M2, ADR-0023) `Weak<T>` in parameter/return position -- same
@@ -4252,6 +4562,141 @@ final class _Specialization {
   const _Specialization(this.proc, this.substitution);
 }
 
+/// (ADR-0054) A class plus the concrete types it is instantiated at --
+/// `Box<u64>`. This is the unit that has a layout, a payload size, a
+/// destructor and a set of method bodies; the `Class` alone has none of
+/// those, exactly as ADR-0052's generic FUNCTION has no body.
+///
+/// A NON-generic class is the degenerate case: an empty [typeArgs], whose
+/// [mangledName] is the class's own name. Every pre-existing symbol
+/// (`Account_net`, `BoxHolder_dtor`) therefore keeps the name it had, and
+/// the whole of M2 is unaffected by this being one mechanism rather than a
+/// separate path for generics.
+final class _ClassInstance {
+  final Class cls;
+  final List<DartType> typeArgs;
+  const _ClassInstance(this.cls, this.typeArgs);
+
+  /// `Box$u64`, or plain `Account` when non-generic. Reuses ADR-0052's
+  /// function mangling verbatim rather than inventing a second scheme --
+  /// same `$` separator, same reason (`$` cannot appear in a Dart
+  /// identifier, and `linkName` goes out verbatim per spec §9).
+  String get mangledName =>
+      typeArgs.isEmpty ? cls.name : specializationLinkName(cls.name, typeArgs);
+
+  /// `T` -> the concrete type, for lowering this instantiation's fields and
+  /// method bodies.
+  Map<String, DartType> get substitution {
+    if (typeArgs.isEmpty) return const {};
+    final params = cls.typeParameters;
+    if (params.length != typeArgs.length) {
+      throw DccLowerError(
+        '"${cls.name}" declares ${params.length} type parameters but was '
+        'instantiated with ${typeArgs.length} type arguments',
+      );
+    }
+    final result = <String, DartType>{};
+    for (var i = 0; i < params.length; i++) {
+      final name = params[i].name;
+      if (name == null) {
+        throw DccLowerError(
+          '"${cls.name}": type parameter $i has no name in the Kernel IR, so '
+          'nothing in its body could refer to it — this is a frontend '
+          'invariant break, not a source error',
+        );
+      }
+      result[name] = typeArgs[i];
+    }
+    return result;
+  }
+}
+
+/// (ADR-0054) Monomorphization's classic failure mode is unbounded code
+/// growth, and its unbounded case is real rather than theoretical: `f<T>`
+/// calling `f<Box<T>>` builds `Box<Box<Box<...>>>` and queues
+/// specializations forever. GAP-0040 recorded that as unguarded because
+/// generic classes did not exist to build the infinite type WITH; they do
+/// now, so it is guarded here.
+///
+/// Two bounds, because they catch different shapes:
+///
+///  * [_maxTypeArgNesting] catches the recursive case directly and early,
+///    naming the type that ran away.
+///  * [_maxInstantiations] is the backstop for merely-excessive breadth,
+///    where no single type is deep but the cross product is large.
+///
+/// Both are diagnostics, not silent truncation: exceeding either is a
+/// compile error naming what was being instantiated. A program that
+/// legitimately needs more should raise the bound deliberately, in a commit
+/// that says why.
+const int _maxTypeArgNesting = 8;
+const int _maxInstantiations = 512;
+
+void _checkInstantiationBudget(String baseName, List<DartType> typeArgs, int alreadyEmitted) {
+  for (final arg in typeArgs) {
+    final depth = _typeArgNesting(arg);
+    if (depth > _maxTypeArgNesting) {
+      throw DccLowerError(
+        'monomorphizing "$baseName" reached a type argument nested $depth '
+        'levels deep (limit $_maxTypeArgNesting). This is almost always '
+        'recursion through a type parameter — a generic that calls or '
+        'constructs itself at `Something<T>` — which has no finite set of '
+        'specializations. Monomorphization cannot express it '
+        '(docs/decisions/0054-generic-classes.md).',
+      );
+    }
+  }
+  if (alreadyEmitted >= _maxInstantiations) {
+    throw DccLowerError(
+      'monomorphizing "$baseName" would exceed $_maxInstantiations distinct '
+      'instantiations in one compilation unit. Identical instantiations are '
+      'deduplicated by mangled name, so this is $_maxInstantiations genuinely '
+      'DIFFERENT ones — see docs/decisions/0054-generic-classes.md on code '
+      'size.',
+    );
+  }
+}
+
+int _typeArgNesting(DartType type) {
+  if (type is InterfaceType && type.typeArguments.isNotEmpty) {
+    var deepest = 0;
+    for (final arg in type.typeArguments) {
+      final d = _typeArgNesting(arg);
+      if (d > deepest) deepest = d;
+    }
+    return 1 + deepest;
+  }
+  return 0;
+}
+
+/// (ADR-0054) Applies a type substitution, recursing into type ARGUMENTS.
+///
+/// ADR-0052's `_resolveTypeParameter` only had to handle a bare `T`, because
+/// a generic function's signature could only mention `T` directly -- there
+/// was no generic type to nest it inside. `Box<T>` inside a generic function
+/// or a generic class's field is exactly that nesting, so substitution has
+/// to be structural now rather than a single map lookup.
+DartType _substituteType(DartType type, Map<String, DartType> substitution) {
+  if (substitution.isEmpty) return type;
+  if (type is TypeParameterType) {
+    final name = type.parameter.name;
+    if (name == null) return type;
+    return substitution[name] ?? type;
+  }
+  if (type is InterfaceType && type.typeArguments.isNotEmpty) {
+    final args = [
+      for (final arg in type.typeArguments) _substituteType(arg, substitution),
+    ];
+    var changed = false;
+    for (var i = 0; i < args.length; i++) {
+      if (!identical(args[i], type.typeArguments[i])) changed = true;
+    }
+    if (!changed) return type;
+    return InterfaceType(type.classNode, type.declaredNullability, args);
+  }
+  return type;
+}
+
 /// The emitted symbol name for a monomorphized generic (ADR-0052).
 ///
 /// `pick$u64`. The `$` cannot appear in a Dart identifier, so a specialization
@@ -4266,7 +4711,19 @@ String specializationLinkName(String base, List<DartType> typeArgs) {
 String _typeArgMangle(DartType type) {
   if (type is ExtensionType) return type.extensionTypeDeclaration.name;
   if (type is InterfaceType) {
-    return type.classReference.canonicalName?.name ?? 'T';
+    final base = type.classReference.canonicalName?.name ?? 'T';
+    // (ADR-0054) Recurse into the type argument's OWN type arguments.
+    // Before generic classes existed, an `InterfaceType` type argument
+    // could never itself be generic, so dropping them was invisible. It is
+    // not invisible now: `pick<Box<u64>>` and `pick<Box<Node>>` would
+    // otherwise both mangle to `pick$Box`, and the queue -- which
+    // deduplicates by mangled name -- would emit ONE body for two
+    // different layouts. Same spelling as `_ClassInstance.mangledName`,
+    // and deliberately the same function, so a class instantiation and a
+    // function specialization can never disagree about what a type is
+    // called.
+    if (type.typeArguments.isEmpty) return base;
+    return '$base\$${type.typeArguments.map(_typeArgMangle).join('\$')}';
   }
   return type.toString().replaceAll(RegExp(r'[^A-Za-z0-9_]'), '');
 }
