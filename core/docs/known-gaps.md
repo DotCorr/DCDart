@@ -2296,5 +2296,19 @@ the wrong number.
 
 **Next step:** extend pass 3 across the null test — a retain and its release separated only by a
 branch on the retained value's nullness is the canonical shape and is worth handling before any
-general cross-block analysis. Note `dc-sys-21` reports pass 3's *surrender* count measures zero on
-`hashmap`, so the pass is not declining to act on these pairs; it never sees them as pairs at all.
+general cross-block analysis.
+
+**CORRECTION (2026-08-26).** An earlier revision of this entry said pass 3's *surrender* count
+"measures zero", and drew the conclusion that the GAP-0054 correctness fix was therefore free. **Both
+halves were wrong.** The zero was measured on `hashmap`, which is on an unmerged branch and is not
+this tree — so the number never applied to the code the fix landed in. Measured properly on `json`
+by two interleaved A/B runs, 600 samples per side: the correctness fix costs **+4.2% to +4.5%**
+against a ±2% noise floor. It is a **trade**, not a free win. `dc-sys-21` caught and reported their
+own error here; recorded because the shape recurs — **a real measurement, quoted about a thing it
+did not measure**, which is the same failure as the container conformance number and the `mapfile`
+PATH masking, arrived at by two different people on the same day while both were actively looking
+for it.
+
+The conclusion still holds — a wrong answer is not a performance characteristic — but it must be
+argued as a trade rather than as costless. Recovering the 4% needs a way to express a return value's
+**uniqueness**, which DCDart's ARC conventions cannot say: escalation 0011.
