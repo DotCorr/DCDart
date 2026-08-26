@@ -7,8 +7,30 @@ Work queue, not a confession log (`CLAUDE.md`). Every entry: what was worked aro
 ## GAP-0054 — ADR-0025 can elide a retain/release pair across a `Release` of an ALIASING value
 
 **Domain:** dc-elide (M2). **Pre-existing — not introduced by ADR-0054, but found by it.**
-**Status:** OPEN — not reachable today, and the reason it is not reachable is a property of the
-lowering rather than of the pass
+**Status:** **RESOLVED (2026-08-26) — ADR-0063.** A surviving `Release` now invalidates every pending
+retain, not only a matching one. A `Release` the pass *deletes* invalidates nothing, because it never
+executes. Pass 3's safety argument is now local to the pass.
+
+**It was reachable, and it was live.** The entry below correctly declined to call it a bug and
+correctly named the shape that would reach it. That shape got written:
+`examples/m3-elide-alias/elide_alias.dart`, using only ADR-0048's mid-function heap-field release,
+returned **198 where 110 is correct** through `dcc build` at `-O2` — a read of freed memory whose
+slot had already been recycled.
+
+**It was invisible to every check this project ran.** Cancelling a pair is refcount-NEUTRAL, so
+`dc_heap_live` read zero on every call and every count balanced. No leak test could see it, and
+there was no double free to trap on. Only asserting the VALUE caught it, which is why
+`tests/conformance/elide-alias/` exists.
+
+**What it cost to fix:** exactly three pre-existing pairs stop being elided — `json`'s `parseArray`,
+`m2-loopheap`'s `lastKept`, `m3-generic-class`'s `boxNode` — for a measured **~4% on the `json`
+benchmark**. That is not zero, it is attributed per target in ADR-0063, and the recovery is
+GAP-0066 / escalation 0011.
+
+The original entry follows unchanged, because its reasoning was right.
+
+---
+
 
 Spec §3.2 pass 3, as implemented, deletes `retain(x) … release(x)` when **no release of x** appears
 between them. It reasons over DCValues. Two DCValues can refer to the same runtime object — that is
@@ -35,6 +57,73 @@ shape much easier to reach: `map.get(k)` returning a borrowed reference, followe
 map, is the canonical form and it is exactly what M3's hashmap benchmark will write. Worth settling
 before that benchmark, not after — and the honest fix is probably for pass 3 to invalidate pending
 retains on ANY `Release`, not only a matching one, which costs some elision and is measurable.
+
+---
+
+## GAP-0065 — a freshly-allocated temporary passed to a BORROWED parameter is never released
+
+**Domain:** dcc-lower (ARC insertion, ADR-0021). **Pre-existing — found while writing ADR-0063's
+example, not caused by it.**
+**Status:** OPEN — reproduces on `main`, and reproduces identically with elision DISABLED, so it is
+nothing to do with pass 3
+
+```dart
+final c = Cell(Node(v));            // leaks one Node per call
+final n = Node(v); final c = Cell(n);  // correct — balanced
+```
+
+`Cell(this.next)`'s parameter is borrowed by default (ADR-0019), so the constructor emits a `Retain`
+to store it into the field. The temporary `Node(v)` therefore carries a `+1` from its own `Alloc`
+that **nothing ever releases**: there is no local to hang a release on, and the argument was not
+`@owned`, so no transfer happened either. `dc_heap_live` climbs by exactly one per call.
+
+Same family as GAP-0060 (a `void` body falling off the end never releasing its `@owned` heap
+parameters): in both, a release has no syntactic site to be emitted at. Both should be looked at with
+GAP-0050's per-iteration release policy — the real fix is emitting releases at every function EXIT
+and for every temporary, rather than at every `Return` and for every named local.
+
+**Cost of the workaround:** bind the temporary to a local. `examples/m3-elide-alias`'s
+`releaseThroughDestructor` does, with a comment saying why, so that target's leak assertion measures
+elision rather than this. Any expression that nests a constructor call inside another constructor
+call leaks today, silently, one object per call — and unlike GAP-0054 this one IS visible to a leak
+test, which is the only reason it is a gap rather than a second miscompilation.
+
+---
+
+## GAP-0066 — pass 3 cannot tell two heap values apart, so it surrenders every pair spanning a release
+
+**Domain:** dc-elide, spec §3 (M3 gate)
+**Status:** OPEN — the price of ADR-0063, measured and attributed
+
+ADR-0063 stopped a use-after-free by making any surviving `Release` invalidate every pending retain.
+That is correct and it is blunt: the pass has no way to prove two `DCHeapPointer` values denote
+different objects, so it assumes they may.
+
+Per target, `bench/elision-delta.sh`, before → after (retains lowered → surviving):
+
+| target | before | after | pairs lost |
+|---|---|---|---|
+| `json` | 19 → 18 | 19 → 19 | **1** |
+| `m2-loopheap` | 2 → 1 | 2 → 2 | **1** |
+| `m3-generic-class` | 2 → 1 | 2 → 2 | **1** |
+| `tree-traversal`, `m2-list`, `m2-closure`, `m2-owned`, `m2-heap-field`, `m2-alias`, `m3-funcptr` | — | unchanged | 0 |
+
+Runtime: **~4% on `json`** (two interleaved A/B runs, 600 samples a side: +4.5%, +4.2%). Every other
+benchmark's object file is byte-identical.
+
+**The narrowing that does not work.** A pending retain on a value defined by `Alloc` in this block
+that has not escaped cannot be the object another value releases. That recovers `lastKept` and
+**neither of the other two**, because both retain a `Load` or `Call` result. It buys back none of the
+4%, for a second aliasing argument in a pass where a wrong one is a double free. Deliberately not
+taken; reach for it only if a workload appears that it *would* recover.
+
+**The one that would work** is knowing a returned reference is a fresh `+1` nothing else aliases —
+which DCDart's ARC conventions do not express. That is spec §3 under rule 4: **escalation 0011**.
+
+**Cost of the workaround:** ~4% on one M3 benchmark, and it grows with any workload built on
+"container method returns a node", which is most of a stdlib. Independent of GAP-0062's intra-block
+limit — the two have different causes and different fixes, and attempting them together makes a
+regression in either direction unattributable when one of them is a use-after-free.
 
 ---
 

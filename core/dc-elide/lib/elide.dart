@@ -56,8 +56,15 @@
 //      (WeakLoad's own codegen increments `strong` when the target is
 //      alive). Treating these as opaque, exactly like Call, is the safe
 //      choice.
-//   4. Everything else (arithmetic, Load/Store/PtrOffset/IntToPtr,
-//      ConstInt, Alloc/Retain/Release on OTHER values, terminators) is
+//   4. A SURVIVING `Release` -- of ANY value, not just a matching one --
+//      invalidates every pending retain (ADR-0063, closing GAP-0054).
+//      A `Release` that this pass DELETES as half of a cancelled pair
+//      does not, because it never executes. This is the rule that makes
+//      pass 3 safe on its own terms rather than by accident; the long
+//      note at the `Release` case below states the invariant and proves
+//      it, and says what used to stand in for it.
+//   5. Everything else (arithmetic, Load/Store/PtrOffset/IntToPtr,
+//      ConstInt, Alloc and Retain on OTHER values, terminators) is
 //      safe to skip over without invalidating an ORDINARY pending
 //      retain: Alloc always allocates a fresh, previously-unused header
 //      (can't alias a pending retain's object); PtrOffset/Load/Store
@@ -66,6 +73,12 @@
 //      memory op can corrupt a refcount. This does NOT extend to a
 //      call-consumed candidate from rule 2 -- see its own note below for
 //      why that one needs a strictly stronger rule.
+//
+//      NOTE what rules 2-4 have in common, because it is the whole
+//      safety story: the ONLY three ways a refcount can go DOWN are an
+//      executed `Release`, an opaque callee, and a weak op. Each is
+//      handled by clearing. Nothing else in DC-IR can decrement a
+//      refcount, so nothing else can end an object's life early.
 
 import 'package:dc_ir/dc_ir.dart';
 
@@ -138,7 +151,75 @@ DCBasicBlock _elideBlock(DCBasicBlock block) {
         if (pendingIndex != null) {
           kept[pendingIndex] = null; // drop the matched Retain
           kept.add(null); // drop this Release too
+          // Deliberately NO invalidation of the OTHER pending retains here:
+          // this Release does not survive, so it never executes and cannot
+          // decrement anything. Only a SURVIVING Release is a real
+          // decrement, which is what the branch below is about.
         } else {
+          // ------------------------------------------------------------
+          // (ADR-0063, closing GAP-0054) THIS RELEASE SURVIVES, so it runs,
+          // so it decrements SOME object's refcount by one.
+          //
+          // It names a DCValue. A DCValue is not an object. Two distinct
+          // DCValues routinely denote the SAME runtime object -- that is
+          // the entire premise of ADR-0017's alias retain, where
+          // `%b = Load %a.field` produces a second value for the object
+          // `%a.field` already holds. So "this is not a Release of `%x`"
+          // is NOT the statement "this cannot free `%x`'s object", and
+          // pass 3's safety argument needs the second one.
+          //
+          // Every pending retain therefore has to go, exactly as for an
+          // opaque `Call` (rule 2) or a weak op (rule 3).
+          //
+          // WHY THIS IS THE WHOLE FIX, stated as the invariant it
+          // restores. Cancelling a pair is sound iff the object stays
+          // alive across the interval the retain used to cover. Cut the
+          // block at every surviving Release, and inside one such gap the
+          // transformed program has NO decrement of anything at all --
+          // deleted releases do not execute, and every remaining
+          // decrement is a gap boundary by construction. Both members of
+          // an elided pair now lie inside a single gap (a pair spanning a
+          // boundary is invalidated here), so the refcounts of the
+          // original and transformed programs agree AT every boundary,
+          // and within a gap the transformed count only ever rises from a
+          // boundary value that the original program already guaranteed
+          // to be >= 1. So it can never reach zero inside the interval.
+          //
+          // Note what that argument does NOT mention: where dcc-lower
+          // chooses to put `_releaseHeapLocals`, or whether the last use
+          // of a value happens to precede the releases. GAP-0054 recorded
+          // that the ONLY thing standing between pass 3 and a
+          // use-after-free was that ordering -- a property of a different
+          // file, asserted nowhere. This invariant is local to the pass
+          // and holds whatever order lowering emits.
+          // NOT NARROWED BY AN ALIAS ANALYSIS. This is blunt, it is not
+          // free, and the measurement is in ADR-0063 rather than hidden:
+          // across every example, the conformance suite and all four
+          // benchmarks that exist on main, exactly THREE pairs stop being
+          // elided -- `json`'s `parseArray`, `m2-loopheap`'s `lastKept`
+          // and `m3-generic-class`'s `boxNode` -- and the first of those
+          // costs a measured +4% on the json benchmark (two interleaved
+          // A/B runs, 600 samples a side: +4.5% and +4.2%).
+          //
+          // The obvious narrowing was tried and REJECTED ON ITS NUMBERS,
+          // not skipped. A pending retain on a value defined by `Alloc`
+          // in this block that has not since escaped cannot be the object
+          // some other value releases, so it could be spared. That
+          // recovers `lastKept` -- and neither of the other two, because
+          // both retain a value that came from a `Load` or a `Call`,
+          // where nothing local establishes identity. So it buys back
+          // none of that 4%, in exchange for a SECOND aliasing argument
+          // living in the pass where a wrong aliasing argument is a
+          // double free. That is the trade GAP-0054 was created by.
+          //
+          // What would actually recover `parseArray` is knowing that
+          // `parseValue`'s RESULT is a freshly-allocated +1 distinct from
+          // everything live -- a uniqueness fact about a return value,
+          // which DCDart's ARC conventions do not currently carry.
+          // ADR-0063 records it, escalation 0011 asks for it, and it is a
+          // spec §3 question rather than something to invent here.
+          pendingRetain.clear();
+          callConsumed.clear();
           kept.add(instruction);
         }
       case Call():
