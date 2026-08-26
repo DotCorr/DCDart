@@ -25,7 +25,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 EXAMPLE_DIR="$CORE_DIR/examples/m2-str"
 VERIFY_SCRIPT="$CORE_DIR/scripts/verify-freestanding.sh"
-ALLOWFOR="$CORE_DIR/tools/bare-symbol-allowlist.txt"
+ALLOWLIST="$CORE_DIR/tools/bare-symbol-allowlist.txt"
 
 fail() { echo "STR: FAIL — $1" >&2; exit 1; }
 setup_error() { echo "STR: FAIL — $1" >&2; exit 2; }
@@ -60,7 +60,7 @@ trap 'rm -rf "$WORKDIR"' EXIT
   || { cat "$WORKDIR/build.log" >&2; fail "dcc build --target bare-x86_64 failed"; }
 
 if command -v llvm-nm >/dev/null 2>&1; then
-  VERIFY_OUT="$(DCDART_ALLOWFOR="$ALLOWFOR" bash "$VERIFY_SCRIPT" "$WORKDIR/str.o" 2>&1)"
+  VERIFY_OUT="$(DCDART_ALLOWLIST="$ALLOWLIST" bash "$VERIFY_SCRIPT" "$WORKDIR/str.o" 2>&1)"
   echo "$VERIFY_OUT"
   grep -q "FREESTANDING: pass" <<<"$VERIFY_OUT" \
     || fail "static data introduced an undefined symbol — a DEFINED global must never do that"
