@@ -7,6 +7,10 @@ cycle collector. C ABI at every boundary.
 Everything buildable — compiler pipeline, runtime, examples, tests, and the full design-decision
 record — lives under [`core/`](core/README.md). Start there.
 
+**Setting it up, or testing it in VS Code:** [`core/docs/testing-setup.md`](core/docs/testing-setup.md)
+— prerequisites, the fresh-clone step that a clone cannot build without, a first program end to end,
+and the two behaviours (byte-counted `.length`, trapping arithmetic) that surprise people.
+
 ## The two numbers that define the project
 
 1. **ARC overhead vs. C.** Target ≤10% geometric mean. Gated at M3.

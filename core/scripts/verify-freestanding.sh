@@ -61,8 +61,44 @@ if [[ ! -f "$ALLOWLIST" ]]; then
   exit 2
 fi
 
+
+# ---------------------------------------------------------------------------
+# PORTABILITY: this script must run on a STOCK macOS shell.
+#
+# `mapfile`/`readarray` are bash 4+. macOS ships bash 3.2.57, so on a stock Mac
+# every `mapfile` here failed with "command not found". Because `set -e` is on,
+# the script aborted and the caller saw a FAIL -- the safe direction, but only
+# by accident. Without `set -e`, `undef` would have been empty, the loop over it
+# would have examined nothing, and the script would have printed
+# `FREESTANDING: pass` having checked zero symbols. That is a vacuous pass on
+# the one check CLAUDE.md calls the project's spine.
+#
+# A second bash 3.2 trap, which the fix must also survive: under `set -u`,
+# bash before 4.4 treats `"${arr[@]}"` on an EMPTY array as an unbound variable
+# and aborts. So every expansion of a possibly-empty array below uses the
+# `${arr[@]+"${arr[@]}"}` idiom rather than a bare one.
+_read_lines() {           # usage: _read_lines <arrayname>   (input on stdin)
+  local __name="$1" __line
+  eval "$__name=()"
+  while IFS= read -r __line || [[ -n "$__line" ]]; do
+    [[ -z "$__line" ]] && continue
+    eval "$__name+=(\"\$__line\")"
+  done
+}
+
 # Strip comments and blanks from the allowlist.
-mapfile -t ALLOWED < <(grep -vE '^\s*(#|$)' "$ALLOWLIST" | sed 's/\s*$//')
+_read_lines ALLOWED < <(grep -vE '^[[:space:]]*(#|$)' "$ALLOWLIST" | sed 's/[[:space:]]*$//')
+
+# NO non-vacuity guard on this array, deliberately. An empty ALLOWED is the
+# INTENDED state, not a parse failure: every entry in the shipped allowlist is
+# commented out, because the freestanding baseline is genuinely zero undefined
+# symbols and the file's own header says not to grow it to make a check pass.
+# A guard here treating "zero entries" as a broken parse was written and
+# removed within the hour -- it turned the correct configuration into a hard
+# FATAL. Worth leaving this note: a vacuity guard is only correct where the
+# empty case is genuinely impossible, and asserting non-emptiness of something
+# designed to be empty is the same defect as a vacuous pass, pointed the other
+# way.
 
 # ---------------------------------------------------------------------------
 # RESERVED RUNTIME FAMILIES — never honorable, by allowlist OR by manifest.
@@ -112,15 +148,31 @@ for obj in "$@"; do
   DECLARED=()
   MANIFEST="$obj.externs"
   if [[ -f "$MANIFEST" ]]; then
-    mapfile -t DECLARED < <(grep -vE '^\s*(#|$)' "$MANIFEST" | sed 's/\s*$//')
+    _read_lines DECLARED < <(grep -vE '^[[:space:]]*(#|$)' "$MANIFEST" | sed 's/[[:space:]]*$//')
   fi
 
   # Undefined symbols only.
-  mapfile -t undef < <("$NM" -u --format=posix "$obj" 2>/dev/null | awk '{print $1}' | sed 's/^_//')
+  #
+  # NON-VACUITY GUARD, and this is the one that matters most in this file.
+  # Everything below concludes from the ABSENCE of a symbol in `undef`, so an
+  # `nm` that failed to run -- wrong binary, unreadable format, a shell without
+  # `mapfile` -- yields an empty list and a confident `FREESTANDING: pass` that
+  # examined nothing. `nm`'s exit status is therefore checked BEFORE its output
+  # is trusted, and a failure is a hard error rather than a quiet pass.
+  set +e
+  NM_OUT="$("$NM" -u --format=posix "$obj" 2>&1)"
+  NM_STATUS=$?
+  set -e
+  if (( NM_STATUS != 0 )); then
+    echo "FATAL: \"$NM -u\" exited $NM_STATUS on $obj. Not reporting a pass: this check concludes from the ABSENCE of undefined symbols, so a broken nm would look identical to a clean object." >&2
+    echo "$NM_OUT" | head -5 >&2
+    exit 2
+  fi
+  _read_lines undef < <(printf '%s\n' "$NM_OUT" | awk '{print $1}' | sed 's/^_//')
 
   leaked=()
   honored=()
-  for sym in "${undef[@]}"; do
+  for sym in ${undef[@]+"${undef[@]}"}; do
     [[ -z "$sym" ]] && continue
     ok=0
     # Checked FIRST, so neither the allowlist nor the manifest can honor it.
@@ -128,13 +180,13 @@ for obj in "$@"; do
       leaked+=("$sym")
       continue
     fi
-    for a in "${ALLOWED[@]}"; do
+    for a in ${ALLOWED[@]+"${ALLOWED[@]}"}; do
       # Allowlist entries may be exact names or shell globs (e.g. __aeabi_*).
       # shellcheck disable=SC2053
       if [[ "$sym" == $a ]]; then ok=1; break; fi
     done
     if (( ! ok )); then
-      for d in "${DECLARED[@]}"; do
+      for d in ${DECLARED[@]+"${DECLARED[@]}"}; do
         if [[ "$sym" == "$d" ]]; then ok=1; honored+=("$sym"); break; fi
       done
     fi
@@ -145,10 +197,10 @@ for obj in "$@"; do
   # the object disagree -- a stale manifest, a renamed symbol, or a call the
   # optimizer removed. Report it, but do not fail: it PERMITS nothing, so it
   # cannot hide a leak. Silence would be worse than noise here.
-  for d in "${DECLARED[@]}"; do
+  for d in ${DECLARED[@]+"${DECLARED[@]}"}; do
     [[ -z "$d" ]] && continue
     found=0
-    for sym in "${undef[@]}"; do
+    for sym in ${undef[@]+"${undef[@]}"}; do
       if [[ "$sym" == "$d" ]]; then found=1; break; fi
     done
     (( found )) || echo "  note: declared extern \"$d\" is not undefined in $obj (stale manifest entry?)"
@@ -157,7 +209,7 @@ for obj in "$@"; do
   if (( ${#leaked[@]} )); then
     fail=1
     echo "FREESTANDING: FAIL  $obj"
-    for sym in "${leaked[@]}"; do
+    for sym in ${leaked[@]+"${leaked[@]}"}; do
       case "$sym" in
         dc_alloc|dc_free|dc_realloc)
           echo "  $sym  -> implicit allocation. A closure escaped, a String was built, or a collection grew." ;;
@@ -174,7 +226,7 @@ for obj in "$@"; do
     echo "  Do NOT add to the allowlist to make this pass. The allowlist is owned by E4."
     echo "  If this symbol is a deliberate C dependency, declare it in the DCDart"
     echo "  source as \`@extern external ...\` so dcc records it (ADR-0038)."
-    for sym in "${leaked[@]}"; do
+    for sym in ${leaked[@]+"${leaked[@]}"}; do
       if is_reserved "$sym"; then
         echo "  NOTE: \"$sym\" is a RESERVED runtime name. Declaring it @extern will"
         echo "  NOT make this pass — these families are never honorable, because their"

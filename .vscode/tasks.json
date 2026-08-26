@@ -1,0 +1,49 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "DCDart: run conformance suite",
+      "type": "shell",
+      "command": "source core/scripts/dcdart-env.sh >/dev/null && bash core/tests/run-conformance.sh",
+      "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "/bin/bash", "args": ["-c"] } },
+      "group": { "kind": "test", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "DCDart: build current file",
+      "type": "shell",
+      "command": "source core/scripts/dcdart-env.sh >/dev/null && dart core/dcc/bin/dcc.dart build --mode bare --target host \"${file}\" -o \"${fileDirname}/${fileBasenameNoExtension}.o\" --emit-header \"${fileDirname}/${fileBasenameNoExtension}.h\" && echo \"built ${fileBasenameNoExtension}.o + .h\"",
+      "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "/bin/bash", "args": ["-c"] } },
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "DCDart: build current file (freestanding, bare-x86_64)",
+      "type": "shell",
+      "command": "source core/scripts/dcdart-env.sh >/dev/null && dart core/dcc/bin/dcc.dart build --mode bare --target bare-x86_64 \"${file}\" -o \"${fileDirname}/${fileBasenameNoExtension}.bare.o\" && echo \"built ${fileBasenameNoExtension}.bare.o\"",
+      "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "/bin/bash", "args": ["-c"] } },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "DCDart: verify freestanding (rule 1)",
+      "detail": "Builds the open file for bare-x86_64 and runs nm -u against the allowlist. A green suite with a runtime symbol leak is a FAILED change.",
+      "type": "shell",
+      "command": "source core/scripts/dcdart-env.sh >/dev/null && dart core/dcc/bin/dcc.dart build --mode bare --target bare-x86_64 \"${file}\" -o \"${fileDirname}/${fileBasenameNoExtension}.bare.o\" && cd core && bash scripts/verify-freestanding.sh \"${fileDirname}/${fileBasenameNoExtension}.bare.o\"",
+      "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "/bin/bash", "args": ["-c"] } },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "DCDart: first-time setup (restore vendored frontend)",
+      "detail": "Required after a fresh clone -- core/frontend/vendor/ is gitignored and nothing resolves until this runs.",
+      "type": "shell",
+      "command": "bash core/scripts/vendor-frontend.sh",
+      "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "/bin/bash", "args": ["-c"] } },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    }
+  ]
+}

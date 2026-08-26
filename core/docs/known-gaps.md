@@ -1624,8 +1624,69 @@ during the conversion, which is why it is recorded rather than left in the helpe
 a real reduction in what a green Darwin run proves, and it is the price of the suite running at all
 on the dev host.
 
+### Two further findings from the same investigation, both worse than the original
+
+**1. `verify-freestanding.sh` did not run on a stock Mac at all.** It used `mapfile`, which is bash
+4+; macOS ships bash 3.2.57. On a stock shell every invocation died with `mapfile: command not
+found`. It happened to fail *closed* only because `set -e` is on — without it, `undef` would have
+been empty, the loop over it would have examined nothing, and the script would have printed
+`FREESTANDING: pass` having checked **zero symbols**. A vacuous pass on the check `CLAUDE.md` calls
+the project's spine, avoided by an accident of shell options rather than by design.
+
+Fixed: portable read loop, plus an explicit check of `nm`'s **exit status** before its output is
+trusted — everything downstream concludes from the ABSENCE of a symbol, so a broken `nm` is
+indistinguishable from a clean object unless the status is checked. Verified under `/bin/bash` 3.2
+with three controls: a clean object passes (exit 0), an object with an undefined `dc_alloc` fails
+with the right diagnostic (exit 1), and a deliberately broken `nm` is FATAL rather than a pass
+(exit 2). Bash 3.2 also treats `"${arr[@]}"` on an empty array as unbound under `set -u`, so every
+possibly-empty expansion now uses the `${arr[@]+"${arr[@]}"}` idiom.
+
+**A guard that was written and removed within the hour, recorded because the lesson generalises:**
+a non-vacuity check was added asserting the allowlist parsed to more than zero entries. The shipped
+allowlist is *deliberately* empty — every line is commented out, because the freestanding baseline
+genuinely is zero permitted symbols. The guard turned the correct configuration into a hard FATAL,
+and the negative control caught it immediately. **Asserting non-emptiness of something designed to be
+empty is the same defect as a vacuous pass, pointed the other way.** A vacuity guard is only correct
+where the empty case is genuinely impossible.
+
+**2. The wrong Dart SDK produces a diagnostic that points at the wrong file.** With an older SDK on
+`PATH`, the build emits ~4 KB of `The language version 3.12 specified for the package 'kernel' is too
+high` — once per file in `core/frontend/vendor/`. It reads as a corrupted vendor tree and sends you
+to re-run `vendor-frontend.sh`, which fixes nothing. `scripts/dcdart-env.sh` now checks the version
+and names the cause once, before anything is built.
+
 **Next step:** run the suite on Linux/x86-64 in CI so both link paths are exercised every commit, and
 have the runner print the host and link mode in its summary line so no future reader can mistake one
 host's number for the project's. Longer term, boot the `bare-x86_64` objects under QEMU the way
 `oscortex_core`'s harnesses do — that suite does not have this failure mode precisely because it
 never links a host binary.
+
+
+---
+
+## GAP-0049 — the prelude must be imported by file path; there is no `--prelude` flag
+
+**Domain:** dcc (CLI)
+**Status:** OPEN
+
+Every DCDart source file must import the prelude, and the only way to name it is a plain file path:
+
+```dart
+import '/absolute/path/to/DCDart/core/runtime/dc-core-bare/prelude.dart';
+```
+
+In-repo examples use a relative path (`'../../runtime/dc-core-bare/prelude.dart'`), which works
+because they sit at a known depth. Anything outside the repo needs an absolute path. `dcc build` has
+no `--prelude` flag and there is no package URI for `dc:core.bare`, so a user's own project cannot
+refer to the prelude portably.
+
+**Cost of the workaround:** every file outside the repo carries a machine-specific absolute path,
+which means no DCDart source file written today is portable between two developers' machines. It
+also makes the first ten minutes with the language look worse than the language is — this is the
+first thing anyone types.
+
+**Next step:** either a `--prelude <path>` flag on `dcc build` (small, unblocks portability
+immediately) or a real `dc:core.bare` URI resolved by the driver (correct, more work). The flag does
+not preclude the URI. Found while writing `docs/testing-setup.md` — worth noting that the gap
+surfaced from *documenting the workflow end to end*, not from any test, because every existing
+consumer lives inside the repo where the relative path happens to work.

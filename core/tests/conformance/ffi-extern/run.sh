@@ -172,7 +172,18 @@ if [[ -z "$FS_LINKER" ]] && command -v x86_64-elf-ld >/dev/null 2>&1; then
 fi
 if [[ -z "$FS_LINKER" ]]; then
   cat "$FS_DIR/link.log" >&2 2>/dev/null
-  fail "no ELF linker available for the freestanding leg (need a Linux clang or x86_64-elf-ld); see docs/known-gaps.md GAP-0048"
+  # SETUP ERROR (exit 2), not FAIL (exit 1), and the distinction is the whole
+  # point of GAP-0048: "I have no ELF linker here" and "the compiler emitted a
+  # bad relocation" are different facts, and a harness that reports both as
+  # exit 1 destroys the difference at the point of measurement. The runner
+  # lists exit-2 targets as SKIPPED and never folds them into the pass count,
+  # so this reads as absent coverage rather than either a pass or a defect.
+  #
+  # This is a genuine capability gap, not a portability bug to fix here: Apple
+  # ld cannot link ELF at all. `brew install x86_64-elf-binutils` makes this
+  # leg run for real on macOS, and when it IS available the assertions below
+  # are hard -- available means asserted, never optionally skipped.
+  setup_error "no ELF linker available for the freestanding leg. Install one (brew install x86_64-elf-binutils) or run on Linux; this target is SKIPPED, not passed. See docs/known-gaps.md GAP-0048"
 fi
 [[ -f "$FS_BIN" ]] || fail "$FS_LINKER reported success but $FS_BIN was not produced"
 
