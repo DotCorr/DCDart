@@ -2413,6 +2413,30 @@ What the three counts mean for planning:
   these needs a way to express a return value's **uniqueness**: escalation 0011, spec §3, rule 4.
 - **opaqueLimited (0)** — nothing to do.
 
+### The 16 is NOT a forecast of 16 elided pairs, and must not be quoted as one
+
+`blockLimited` counts retains that died **at a block boundary**. It does not follow that a
+cross-block fix converts them into elided pairs, because **a retain that survives the boundary then
+faces rule 2**, and rule 2 is real: isolated properly — `Retain`, `Call`, `Release` all in one block
+with no `if` to split it — a `Call` invalidates, `opaqueLimited=1`.
+
+So a cross-block extension **moves** some fraction of `blockLimited` into `opaqueLimited` rather than
+into `elided`. Every function in `json` calls something (`peek`, `walk`, `parseValue`), so how much
+of the 16 survives to be elided is **not determined by any measurement taken so far** — it can only
+be known by building the extension and re-running `--why`.
+
+The honest planning statement is therefore narrower than the table suggests:
+
+- **Upper bound on what a cross-block fix can recover on `json`: 16 of 19.**
+- **Lower bound: unknown, possibly small.**
+- `opaqueLimited=0` today means only that no retain currently *reaches* a `Call` — **not** that calls
+  are harmless. It is a measurement of where execution stops first, and removing the first obstacle
+  does not prove the second one is absent.
+
+This is the same reading error the count was built to prevent, one level up: a real measurement, of
+the wrong quantity, pointing the encouraging way. Recorded before either the fix or a forecast was
+built on it.
+
 **A caution on reading `--why`: the counts are attempts, not distinct pairs.** A retain invalidated
 in one block and re-attempted is counted once per attempt, so the totals exceed the retain count and
 should be read as proportions rather than as a census.
