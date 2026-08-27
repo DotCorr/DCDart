@@ -32,7 +32,7 @@ import 'cli_args.dart';
 /// any failure — see bin/dcc.dart for how each exception type maps to an
 /// exit code.
 Future<void> runBuild(BuildOptions options) async {
-  final preludeUri = _resolvePreludeUri();
+  final preludeUri = _resolvePreludeUri(options.preludePath);
 
   final module = await lowerToDCModule(
     options.inputPath,
@@ -162,6 +162,20 @@ String _headerGuardNameFor(String path) {
 /// lives on disk. This means `dcc` currently only works run from inside
 /// this checkout at this exact relative layout — true and worth knowing,
 /// not hidden behind a name that suggests it's more general than it is.
-Uri _resolvePreludeUri() {
-  return Platform.script.resolve('../../runtime/dc-core-bare/prelude.dart');
+/// Which file `dcc` treats as THE prelude.
+///
+/// [override] is `--prelude`'s value, or null for the historical behaviour:
+/// the prelude sitting beside this `dcc` in the same checkout.
+///
+/// The override is made ABSOLUTE and lexically normalised, because that is the
+/// form the comparison in `dcc-lower` uses — an annotation counts as `@bare`
+/// only if its library's `importUri` equals this Uri exactly, with `..`
+/// folded and symlinks resolved on NEITHER side. Passing a relative path and
+/// having it silently not match would reproduce the very failure this flag
+/// exists to remove.
+Uri _resolvePreludeUri(String? override) {
+  if (override == null) {
+    return Platform.script.resolve('../../runtime/dc-core-bare/prelude.dart');
+  }
+  return Uri.file(File(override).absolute.path).normalizePath();
 }

@@ -63,6 +63,22 @@ class BuildOptions {
   /// recursing 65,537 frames deep, testing the C stack as much as the heap.
   final int? heapRegionBytes;
 
+  /// Which file is THE PRELUDE, or null to use the one beside this `dcc`
+  /// (`Platform.script.resolve('../../runtime/dc-core-bare/prelude.dart')`).
+  ///
+  /// `@bare` is recognised by comparing an annotation's library URI against
+  /// this one, as EXACT Uri equality on a lexically normalised path — `..` is
+  /// folded, symlinks are resolved on neither side. So a program importing
+  /// the prelude by any other spelling has no `@bare` functions as far as
+  /// `dcc` is concerned, and fails with `no @bare top-level function found`,
+  /// which reads as a broken compiler rather than a path mismatch.
+  ///
+  /// Before this flag the prelude was hard-wired, so a consumer whose source
+  /// lives outside this repo had to spell its import exactly the way `dcc`
+  /// happened to derive it — which made a downstream kernel's build
+  /// non-portable across checkouts and cost a day of misattributed failures.
+  final String? preludePath;
+
   const BuildOptions({
     required this.mode,
     required this.inputPath,
@@ -70,6 +86,7 @@ class BuildOptions {
     this.target = DCTarget.defaultTarget,
     this.headerPath,
     this.heapRegionBytes,
+    this.preludePath,
   });
 
   @override
@@ -111,6 +128,14 @@ Options for build:
                            Orthogonal to --mode: a @bare object is a plain
                            C-ABI object and links into an ordinary native
                            program on any of these.
+  --prelude <path>         Which file is the prelude. Defaults to the one
+                           beside this dcc. `@bare` is recognised by comparing
+                           library URIs as EXACT equality on a lexically
+                           normalised path (symlinks resolved on neither
+                           side), so a program importing the prelude by a
+                           different spelling has no @bare functions as far as
+                           dcc is concerned. Use this when your source lives
+                           outside the DCDart repo.
   --heap-region-bytes <n>  Bytes per size-class heap region (ADR-0058).
                            Power of two, >= 4096. Total heap is 8x this.
                            Default: 2 MiB per class hosted (16 MiB total),
@@ -170,6 +195,7 @@ BuildOptions _parseBuildArgs(
   DCTarget? target;
   String? headerPath;
   int? heapRegionBytes;
+  String? preludePath;
 
   var i = 0;
   while (i < args.length) {
@@ -216,6 +242,17 @@ BuildOptions _parseBuildArgs(
         // lists every supported target, so it is passed through unchanged.
         throw CliUsageError('dcc build: ${e.message}');
       }
+      i += 2;
+      continue;
+    }
+
+    if (arg == '--prelude') {
+      if (i + 1 >= args.length) {
+        throw CliUsageError(
+          'dcc build: --prelude requires a value (path to prelude.dart)',
+        );
+      }
+      preludePath = args[i + 1];
       i += 2;
       continue;
     }
@@ -304,5 +341,6 @@ BuildOptions _parseBuildArgs(
     target: target ?? DCTarget.defaultTarget,
     headerPath: headerPath,
     heapRegionBytes: heapRegionBytes,
+    preludePath: preludePath,
   );
 }

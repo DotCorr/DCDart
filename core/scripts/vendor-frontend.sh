@@ -170,13 +170,22 @@ if command -v dart >/dev/null 2>&1; then
   # below the code: A CHECK THAT VALIDATES SOMETHING ADJACENT TO WHAT MATTERS.
   #
   # The import below is an ABSOLUTE path to this checkout's own prelude, and
-  # that is load-bearing rather than convenient: `dcc` decides `@bare` by
-  # comparing RESOLVED library paths, so a prelude reached by a different real
-  # path -- a relative import aimed at another tree, or anything through a
-  # symlink -- is a different library and every `@bare` annotation becomes
-  # invisible. The symptom is `no @bare top-level function found`, which reads
-  # as a broken compiler rather than a path problem, and it is the single
-  # most misleading failure in this toolchain.
+  # that is load-bearing rather than convenient.
+  #
+  # `dcc` decides `@bare` by comparing the annotation's library `importUri`
+  # against the prelude Uri from `pipeline.dart`'s `_resolvePreludeUri()`,
+  # which is `Platform.script.resolve(...)`. That is EXACT Uri EQUALITY ON A
+  # LEXICALLY NORMALISED PATH: `..` segments are folded, and symlinks are
+  # resolved on NEITHER side. So two spellings of the same file are two
+  # different libraries, every `@bare` annotation in the "wrong" one becomes
+  # invisible, and the error is `no @bare top-level function found` -- which
+  # reads as a broken compiler rather than a path mismatch.
+  #
+  # Stated precisely because the imprecise version cost real work: this was
+  # described (here and in a downstream repo) as resolution through REAL
+  # paths, which made a symlinked toolchain look impossible in principle and
+  # sent several agents copying 211 MB instead. Under the actual rule a
+  # symlink is fine, provided both sides spell the path the same way.
   echo "vendor-frontend: proving the toolchain can COMPILE, not just resolve"
   SMOKE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dcdart-smoke.XXXXXX")" \
     || die "could not create a temp dir for the build proof"

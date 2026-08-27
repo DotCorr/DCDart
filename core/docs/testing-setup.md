@@ -226,6 +226,12 @@ Being explicit so you do not spend time concluding it yourself:
 ## 8. When something breaks
 
 - **`ld: library 'System' not found`** on macOS → Xcode's `clang` is shadowing `/usr/bin/clang`. §1.
+- **`no @bare top-level function found`**, on a file that plainly has one → the prelude was reached
+  by a **different spelling of the path** than `dcc` uses. `@bare` is recognised by comparing the
+  annotation's library URI against `Platform.script.resolve('../../runtime/dc-core-bare/prelude.dart')`,
+  and that comparison is **exact URI equality on a lexically normalised path** — `..` is folded,
+  symlinks are resolved on neither side. Two spellings of one file are two libraries. Pass
+  `--prelude <path>` to say which prelude you mean, or make the import agree character-for-character.
 - **`mapfile: command not found`** → stock macOS bash 3.2 running a bash 4 script. Fixed in
   `verify-freestanding.sh`; if you hit it elsewhere, that is the cause.
 - **`Couldn't resolve the package 'backend'`** → a `pub get` is mid-flight, or `vendor-frontend.sh`
