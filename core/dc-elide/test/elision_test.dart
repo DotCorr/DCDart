@@ -484,19 +484,28 @@ void main() {
         reason: 'nothing at all may be removed here');
   });
 
-  test('the surviving Release rule does NOT depend on a use appearing after it', () {
-    // GAP-0054 recorded that the pass was safe in practice only because
-    // dcc-lower happens to lower the return EXPRESSION before
-    // `_releaseHeapLocals` emits any release -- so there was no use after
-    // the premature free, because there was no use at all. That is a
-    // property of a different file. This block has no use of `aliased`
-    // after the foreign Release, and the pair must STILL survive, because
-    // the invariant the pass now enforces is about refcounts, not uses.
+  test(
+      'run-atomic matching (ADR-0068): a pair whose release sits in the same '
+      'CONSECUTIVE run as an earlier foreign release still cancels', () {
+    // THIS TEST INVERTED ON PURPOSE, and the history matters. Under
+    // ADR-0063 it asserted refusal, with the rationale that the pass's
+    // invariant is "about refcounts, not uses" -- because whether a use
+    // followed the foreign release was a fact about dcc-lower's emission
+    // order, asserted in no file the pass could see. ADR-0068 makes the
+    // no-instruction-between fact LOCAL: these two releases are literally
+    // adjacent in the block body, the pass itself checks that adjacency,
+    // and adjacent releases commute (pure decrements; every count is at
+    // its order-independent final value when the run ends; destructor
+    // cascades are compiler-synthesized field releases only, ADR-0022, so
+    // nothing user-visible runs at either order). Commute `Release other`
+    // past `Release aliased` and this is the plain ADR-0025 shape. The
+    // GAP-0054 danger -- a USE between the foreign release and the pair's
+    // release -- breaks the run and still refuses: that is the next test.
     final other = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
     final aliased = DCValue(ValueId(1), const DCHeapPointer(DCVoid()));
 
     final function = DCFunction(
-      linkName: 'test_alias_release_no_use',
+      linkName: 'test_alias_release_adjacent_run',
       paramTypes: const [DCHeapPointer(DCVoid()), DCHeapPointer(DCVoid())],
       returnType: const DCVoid(),
       mode: DCMode.bare,
@@ -514,8 +523,54 @@ void main() {
       ],
     );
 
+    final stats = ElisionStats();
+    final body =
+        elideRedundantRetainReleasePairs(function, stats).blocks.single.body;
+    expect(body.whereType<Retain>().length, 0,
+        reason: 'the pair cancels; only the foreign release executes');
+    expect(body.whereType<Release>().length, 1);
+    expect(stats.elided, 1);
+  });
+
+  test(
+      'run-atomic matching does NOT fire across a USE between the foreign '
+      'release and the pair\'s release -- the GAP-0054 shape stays refused',
+      () {
+    // `Load` through the retained value between the two releases: if the
+    // foreign release freed the object (they may alias, ADR-0017), this
+    // read is the use-after-free GAP-0054 was. The Load breaks the
+    // consecutive-release run, so the foreign release is processed alone,
+    // survives, and invalidates the pending retain -- the pair must
+    // survive whole.
+    final other = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final aliased = DCValue(ValueId(1), const DCHeapPointer(DCVoid()));
+    final fieldPtr = DCValue(ValueId(2), const DCPointer(DCInt.u64));
+    final fieldVal = DCValue(ValueId(3), DCInt.u64);
+
+    final function = DCFunction(
+      linkName: 'test_alias_release_use_between',
+      paramTypes: const [DCHeapPointer(DCVoid()), DCHeapPointer(DCVoid())],
+      returnType: DCInt.u64,
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: [other, aliased],
+          body: [
+            Retain(object: aliased),
+            Release(object: other),
+            PtrOffset(dest: fieldPtr, base: aliased, offsetBytes: 0),
+            Load(dest: fieldVal, pointer: fieldPtr),
+            Release(object: aliased),
+            Return(value: fieldVal),
+          ],
+        ),
+      ],
+    );
+
     final body = elideRedundantRetainReleasePairs(function).blocks.single.body;
-    expect(body.whereType<Retain>().length, 1);
+    expect(body.whereType<Retain>().length, 1,
+        reason: 'a use inside the would-be interval must keep the pair');
     expect(body.whereType<Release>().length, 2);
   });
 
@@ -1042,12 +1097,24 @@ void main() {
         reason: 'the release executes on the arm that never retained; it must survive');
   });
 
-  test('rule F: refuses a function with a back edge (loop) outright', () {
+  test(
+      'rule F-loops (ADR-0068): an ARC-free interior loop between the retain '
+      'and its frontier release elides (the loaderNextBatch shape)', () {
+    // THIS TEST INVERTED ON PURPOSE. Under ADR-0066 it asserted that ANY
+    // back edge refused the whole function, and this exact shape -- retain
+    // in the entry block, an ARC-free loop in the middle, release in the
+    // single exit -- was the recorded cost (GAP-0067 item 2, NEON's
+    // loaderNextBatch). ADR-0068 accepts it: the retain's block and the
+    // frontier block are on no cycle (each executes at most once per call),
+    // and the walk fully scanned the loop body, proving that what executes
+    // N times contains no release, no opaque op, and no Retain v -- so the
+    // deleted interval still performs no decrement, per ADR-0063's
+    // invariant.
     final v = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
     final cond = DCValue(ValueId(1), const DCBool());
 
     final function = DCFunction(
-      linkName: 'test_frontier_backedge',
+      linkName: 'test_frontier_interior_loop',
       paramTypes: const [DCHeapPointer(DCVoid()), DCBool()],
       returnType: const DCVoid(),
       mode: DCMode.bare,
@@ -1059,8 +1126,140 @@ void main() {
         DCBasicBlock(id: BlockId(1), params: const [], body: [
           CondBranch(
             cond: cond,
-            trueTarget: BlockId(1), // back edge: the retain could run once
-            trueArgs: const [], //     against N executions of the release
+            trueTarget: BlockId(1), // ARC-free loop: safe to walk through
+            trueArgs: const [],
+            falseTarget: BlockId(2),
+            falseArgs: const [],
+          ),
+        ]),
+        DCBasicBlock(id: BlockId(2), params: const [], body: [
+          Release(object: v),
+          Return(value: null),
+        ]),
+      ],
+    );
+
+    final stats = ElisionStats();
+    final elided = elideRedundantRetainReleasePairs(function, stats);
+    final all = [for (final b in elided.blocks) ...b.body];
+    expect(all.whereType<Retain>().length, 0);
+    expect(all.whereType<Release>().length, 0);
+    expect(stats.crossBlockElided, 1);
+  });
+
+  test(
+      'rule F-loops: refuses a retain INSIDE a loop body pairing with a '
+      'release outside it (cross-iteration escape)', () {
+    // The retain's block is on a cycle: N executions of the retain against
+    // one execution of the release. Cancelling would under-release by N-1.
+    final v = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final cond = DCValue(ValueId(1), const DCBool());
+
+    final function = DCFunction(
+      linkName: 'test_frontier_retain_in_loop',
+      paramTypes: const [DCHeapPointer(DCVoid()), DCBool()],
+      returnType: const DCVoid(),
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(id: BlockId(0), params: [v, cond], body: [
+          Branch(target: BlockId(1), args: const []),
+        ]),
+        DCBasicBlock(id: BlockId(1), params: const [], body: [
+          Retain(object: v), // executes once per iteration
+          CondBranch(
+            cond: cond,
+            trueTarget: BlockId(1),
+            trueArgs: const [],
+            falseTarget: BlockId(2),
+            falseArgs: const [],
+          ),
+        ]),
+        DCBasicBlock(id: BlockId(2), params: const [], body: [
+          Release(object: v), // executes once per call
+          Return(value: null),
+        ]),
+      ],
+    );
+
+    final elided = elideRedundantRetainReleasePairs(function);
+    final all = [for (final b in elided.blocks) ...b.body];
+    expect(all.whereType<Retain>().length, 1,
+        reason: 'a retain on a cycle must never cross-block pair');
+    expect(all.whereType<Release>().length, 1);
+  });
+
+  test(
+      'rule F-loops: refuses a frontier release INSIDE a loop body '
+      '(one retain against N executions of the release)', () {
+    final v = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final cond = DCValue(ValueId(1), const DCBool());
+
+    final function = DCFunction(
+      linkName: 'test_frontier_release_in_loop',
+      paramTypes: const [DCHeapPointer(DCVoid()), DCBool()],
+      returnType: const DCVoid(),
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(id: BlockId(0), params: [v, cond], body: [
+          Retain(object: v), // executes once per call
+          Branch(target: BlockId(1), args: const []),
+        ]),
+        DCBasicBlock(id: BlockId(1), params: const [], body: [
+          Release(object: v), // executes once per ITERATION
+          CondBranch(
+            cond: cond,
+            trueTarget: BlockId(1),
+            trueArgs: const [],
+            falseTarget: BlockId(2),
+            falseArgs: const [],
+          ),
+        ]),
+        DCBasicBlock(id: BlockId(2), params: const [], body: [
+          Return(value: null),
+        ]),
+      ],
+    );
+
+    final elided = elideRedundantRetainReleasePairs(function);
+    final all = [for (final b in elided.blocks) ...b.body];
+    expect(all.whereType<Retain>().length, 1,
+        reason: 'a release on a cycle must never join a frontier');
+    expect(all.whereType<Release>().length, 1);
+  });
+
+  test(
+      'rule F-loops: refuses when the interior loop contains a surviving '
+      'release of ANOTHER value (loop-carried alias)', () {
+    // The loop body releases w each iteration. w could alias v\'s object
+    // (ADR-0063/GAP-0054: two DCValues, same object), so the interval is
+    // not decrement-free and the pair must survive. The walk scans the loop
+    // body and fails on the opaque release -- the refusal needs no separate
+    // loop-specific rule, which is the point of walking rather than
+    // skipping interior loops.
+    final v = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final w = DCValue(ValueId(1), const DCHeapPointer(DCVoid()));
+    final cond = DCValue(ValueId(2), const DCBool());
+
+    final function = DCFunction(
+      linkName: 'test_frontier_loop_alias',
+      paramTypes: const [
+        DCHeapPointer(DCVoid()),
+        DCHeapPointer(DCVoid()),
+        DCBool(),
+      ],
+      returnType: const DCVoid(),
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(id: BlockId(0), params: [v, w, cond], body: [
+          Retain(object: v),
+          Branch(target: BlockId(1), args: const []),
+        ]),
+        DCBasicBlock(id: BlockId(1), params: const [], body: [
+          Release(object: w), // surviving release of a maybe-alias
+          CondBranch(
+            cond: cond,
+            trueTarget: BlockId(1),
+            trueArgs: const [],
             falseTarget: BlockId(2),
             falseArgs: const [],
           ),
@@ -1074,8 +1273,9 @@ void main() {
 
     final elided = elideRedundantRetainReleasePairs(function);
     final all = [for (final b in elided.blocks) ...b.body];
-    expect(all.whereType<Retain>().length, 1);
-    expect(all.whereType<Release>().length, 1);
+    expect(all.whereType<Retain>().length, 1,
+        reason: 'an aliasing release inside the interval must block the pair');
+    expect(all.whereType<Release>().length, 2);
   });
 
   test('rule F: two pairs sharing an exit block both elide -- a claimed release does not '

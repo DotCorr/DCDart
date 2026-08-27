@@ -111,11 +111,30 @@ arc_is() {
 # use-after-free.
 arc_is 'aliasBug' 'alloc=5 retain=1 release=5 makeweak=0 weakload=0 dropweak=0'
 
-# releaseThroughDestructor. The pair straddles `Release c`, and `Cell_dtor`
-# releases `c.next` -- so the release that can free the aliased object is
-# not even syntactically a release of a Node. This is the shape GAP-0054
-# was first noticed in (`boxNode`), and it must not cancel.
-arc_is 'releaseThroughDestructor' 'alloc=2 retain=1 release=2 makeweak=0 weakload=0 dropweak=0'
+# releaseThroughDestructor. COUNT RE-PINNED retain=1 -> retain=0 by
+# ADR-0068's run-atomic release matching, and the justification is owed in
+# full because the previous pin was a deliberate ADR-0063 refusal:
+#
+#   The pair straddles `Release c`, and `Cell_dtor` releases `c.next` --
+#   the release that can free the aliased object is not even syntactically
+#   a release of a Node. ADR-0063 refused it because "no use follows the
+#   aliasing release" was a fact about dcc-lower's emission order, asserted
+#   in no file the pass could read. ADR-0068 cancels it because that fact
+#   is now checked LOCALLY: all three releases are literally ADJACENT in
+#   the block body (`Release n; Release c; Release got`, nothing between),
+#   adjacent releases are pure decrements that commute, and the last use
+#   (`got.n`) sits before the run -- inside the run no instruction can
+#   touch a freed object because the run contains only releases. GAP-0054's
+#   original entry said this exact instance was safe and named this exact
+#   reason; what changed is that the pass now PROVES it instead of assuming
+#   it.
+#
+#   The dangerous version of the shape -- ANY use between the aliasing
+#   release and the pair's release -- still refuses: aliasBug and
+#   aliasBugNullable above (retain=1, the actual 198-vs-110 miscompilation
+#   shapes) are the assertion of that, together with dc-elide's own
+#   "use between the releases" negative unit test.
+arc_is 'releaseThroughDestructor' 'alloc=2 retain=0 release=1 makeweak=0 weakload=0 dropweak=0'
 
 # --- The pair that MUST STILL BE ELIDED. ----------------------------------
 #
@@ -135,7 +154,10 @@ arc_is 'stillElided' 'alloc=1 retain=0 release=1 makeweak=0 weakload=0 dropweak=
 # never candidates. It was never nullability that made this safe.
 arc_is 'aliasBugNullable' 'alloc=5 retain=1 release=9 makeweak=0 weakload=0 dropweak=0'
 
-arc_is 'TOTAL' 'alloc=13 retain=3 release=19 makeweak=0 weakload=0 dropweak=0'
+# retain 3 -> 2, release 19 -> 18: releaseThroughDestructor's pair now
+# cancels (ADR-0068, justified at its own assertion above); aliasBug and
+# aliasBugNullable are byte-for-byte unchanged.
+arc_is 'TOTAL' 'alloc=13 retain=2 release=18 makeweak=0 weakload=0 dropweak=0'
 echo "  ARC counts ok: the aliasing pairs survive, and stillElided is still elided"
 
 # ---------------------------------------------------------------------------

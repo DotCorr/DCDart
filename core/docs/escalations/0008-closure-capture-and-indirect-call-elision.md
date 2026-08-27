@@ -14,6 +14,23 @@ has no `argOwnership` field at all — it reads the callee's type — so `dc-eli
 fact for a direct and an indirect call. The four lines §6 asks to be diffed are **unmoved**, and the
 indirect spelling of the same program matches them exactly (see §6's update).
 
+**Update 2026-08-27 — §2 re-probed against the day's compiler, and the M3 benchmark shipped
+without waiting for it.** Before authoring `bench/benchmarks/closure-heavy/` (the last of M3's
+five), the capture rejection was re-verified rather than assumed: a probe exercising a captured
+scalar, a captured heap object, and a capturing function torn off as a value was built with
+`dcc build --mode bare --target host`, and all three are still rejected with ADR-0057's diagnostic
+(`local function "addK" in "captureScalar" captures "k" from an enclosing scope …`, citing this
+document). That state is now PINNED by a negative conformance target,
+`tests/conformance/closure-capture-reject/`, which fails the moment capture starts compiling — so
+§2 being decided by accident inside some other unit now breaks a test naming what must follow.
+The benchmark itself is written on §3's resolved mechanism (ADR-0060 function values + explicit
+heap environment objects — the thing a capture lowering would allocate anyway), its manifest says
+in its first paragraph that it must be rewritten in capture syntax and re-measured when §2 is
+decided, and §3's non-barrier result held at benchmark scale: DCDart/nonatomic measured ~1.15x
+trap-matched C on a workload that is nothing but indirect calls and environment churn (see the
+benchmark's manifest and GAP-0051b for the run). §2 itself: still open, still needs a human,
+nothing below is changed.
+
 **§2 is untouched and is what still needs a human.** The capture convention (by value / strong /
 `unowned`) and the `[weak self]`-shaped language surface `CLAUDE.md`'s cycle rule needs to be
 enforceable are not decided, not implemented, and were deliberately not decided by ADR-0060 — a

@@ -38,6 +38,17 @@
 # What survives is attributed in GAP-0066 (releaseLimited) and GAP-0067
 # (mutating callees, loops) -- not unmeasured.
 #
+# 2026-08-27, ADR-0068 (loop-tolerant rule F + run-atomic release matching):
+#
+#     json             19 retains ->  3    (parseArray's tail-append pair)
+#     m3-generic-class  2 retains ->  0
+#     m3-elide-alias    7 retains ->  2    (aliasBug/aliasBugNullable unchanged)
+#     whole tree      146 -> 43           (146 pre includes concurrent targets)
+#
+# hashmap unchanged on purpose: all 13 survivors are GAP-0067 item 1
+# (mutating callees, escalation 0011's question). NEON's loaderNextBatch
+# and epochReduce (not in this tree's list) both went retain-free.
+#
 # It is NOT sufficient on its own. Seeing the pairs and removing them is one
 # thing; that removal paying for itself is another. Pair this with
 # `closure-heavy`'s ratio, which is the allocator-honest benchmark closest to

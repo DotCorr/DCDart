@@ -215,16 +215,33 @@ arc_is 'boxBoth'     'alloc=2 retain=0 release=2 makeweak=0 weakload=0 dropweak=
 #     PtrOffset/Load/Return -- no release, no weak op, no call), and contains
 #     NO surviving Release. ADR-0063's invariant holds verbatim across it.
 #   - The pair ADR-0063 refused -- `Retain got` straddling `Release b`, where
-#     Box$Node_dtor releases b.value, THE VERY OBJECT `got` aliases -- is
-#     STILL REFUSED (`--why`: releaseLimited=1). If this line ever reads
-#     retain=0, that refusal has been lost and GAP-0054's use-after-free is
-#     back: treat it as a stop-the-line failure, not a count to re-pin.
+#     Box$Node_dtor releases b.value, THE VERY OBJECT `got` aliases -- was
+#     still refused under ADR-0066 (`--why`: releaseLimited=1).
 #
-# Balance after the change: the Node carries +2 (Alloc, alias retain) against
-# -2 (Box$Node_dtor's release of the field, the alias release); the Box +1/-1.
-# Heap returns to baseline either way -- the behavior checks above, not this
-# count, are what prove liveness; this count proves WHICH pair was elided.
-arc_is 'boxNode'     'alloc=2 retain=1 release=2 makeweak=0 weakload=0 dropweak=0'
+# CHANGED A THIRD TIME, to 0/1, BY ADR-0068 (run-atomic release matching),
+# and the earlier warning here -- "if this line ever reads retain=0, treat it
+# as a stop-the-line failure, not a count to re-pin" -- is answered rather
+# than ignored. That warning guarded against LOSING the surviving-release
+# refusal. The refusal machinery is intact: the elide-alias target's
+# aliasBug/aliasBugNullable (the actual 198-vs-110 miscompilation shapes,
+# where a USE follows the aliasing release) still pin retain=1, and dc-elide
+# has a unit test refusing the use-between-the-releases shape by name. What
+# cancels boxNode's `got` pair now is a NEW, separately argued rule, not a
+# lost check: its three releases are literally ADJACENT
+# (`Release b_value; Release b; Release got` -- nothing between them), the
+# last use (`got.n`) precedes the run, adjacent releases are pure decrements
+# that commute, and every count is at its order-independent final value when
+# the run ends. GAP-0054's own entry said this instance was safe for exactly
+# this reason and complained the reason lived in a different file, asserted
+# nowhere; ADR-0068 makes the pass check the adjacency itself. The behavior
+# checks above (the VALUES) remain the final arbiter that no read-after-free
+# was introduced.
+#
+# Balance after the change: the Node carries +1 (its Alloc; both retains are
+# now elided) against -1 (Box$Node_dtor's release of the field -- the local
+# and alias releases are elided with their retains); the Box +1/-1 (its
+# local release survives and cascades through the dtor).
+arc_is 'boxNode'     'alloc=2 retain=0 release=1 makeweak=0 weakload=0 dropweak=0'
 
 # The synthesized per-instantiation destructor: exactly one Release, for the
 # one heap-typed field the instantiation has.

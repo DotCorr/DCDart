@@ -34,7 +34,9 @@
 //   1. Per-block matching first; then ADR-0066 rule F's cross-block
 //      FRONTIER pass (`_elideCrossBlock`) extends it to a retain whose
 //      matching release sits on every path out of its block -- refusing
-//      on back edges, missing dominance, or anything opaque in between.
+//      on missing dominance, anything opaque in between, or (ADR-0068) a
+//      retain or frontier release whose own block lies on a CFG cycle;
+//      ARC-free interior loops BETWEEN the pair are walked through.
 //      A retain neither pass can match is left alone.
 //   2. A `Call` instruction invalidates every pending retain, EXCEPT (a)
 //      one matching an argument the call fully consumes
@@ -449,11 +451,19 @@ bool _isOpaqueForPendingRetain(
 /// -- when all of the following hold, each refusing rather than
 /// approximating:
 ///
-///   1. NO BACK EDGES anywhere in the function: every branch target has a
-///      strictly greater index than its source, so every block executes at
-///      most once per call. Without this a retain inside a loop pairs with
-///      one release outside it -- N retains, one release -- and cancelling
-///      them would under-release.
+///   1. THE RETAIN'S BLOCK AND EVERY FRONTIER BLOCK EXECUTE AT MOST ONCE
+///      PER CALL: none of them lies on a CFG cycle (is reachable from
+///      itself). Without this a retain inside a loop pairs with one release
+///      outside it -- N retains, one release -- and cancelling them would
+///      under-release (and symmetrically for a release inside a loop).
+///      Blocks BETWEEN the retain and the frontier MAY lie on cycles
+///      (ADR-0068 extends ADR-0066 rule F here): an interior loop is safe
+///      exactly because condition 2's walk scans every block it can visit,
+///      so a loop body containing any `Release`, any opaque op, or a
+///      `Retain v` fails the candidate anyway -- what executes N times is
+///      then provably refcount-irrelevant to this pair. The live case is
+///      NEON's `loaderNextBatch`: retain in the entry block, two ARC-free
+///      copy loops, release in the single exit.
 ///   2. EVERY PATH from the retain reaches exactly one frontier member
 ///      before anything that could decrement a refcount. Established by a
 ///      forward walk from the instruction after the retain: the walk STOPS
@@ -481,13 +491,34 @@ bool _isOpaqueForPendingRetain(
 /// and exactly one release, and inside the deleted interval the transformed
 /// program performs no decrement of anything -- so ADR-0063's gap invariant
 /// (counts agree at boundaries, only rise inside, boundary >= 1) holds
-/// verbatim, per path.
+/// verbatim, per path. Spelled out for the loop-tolerant form (ADR-0068):
+/// the retain's block A is not on a cycle, so the retain executes at most
+/// once per call; every frontier release's block likewise; condition 3 makes
+/// every frontier execution follow the retain; condition 2's walk visited --
+/// and fully scanned -- every block any interval execution can touch,
+/// interior loop bodies included, so however many times such a body runs
+/// inside the interval it decrements nothing. A path that enters an interior
+/// loop and never leaves performs no decrement either and never reaches a
+/// Return, so no balance is ever observed on it. Dominance is computed by
+/// the standard iterative fixpoint, valid on cyclic CFGs; the DAG shortcut
+/// the ADR-0066 form used is gone along with its whole-function back-edge
+/// refusal.
 ///
 /// Compared to the ADR-0025 version this replaces: multiple `Return` blocks
 /// are handled (the frontier), opacity is checked over exactly the blocks
 /// REACHABLE from the retain rather than an index-range superset, and a
 /// direct call to a refcount-transparent callee (rule T) is not opaque.
 /// Everything the old form accepted, this form accepts.
+///
+/// What ADR-0068's loop form still deliberately refuses: a retain or a
+/// frontier release ON a cycle. The retain-and-release-both-inside-one-
+/// iteration shape (both in the same loop body, pair complete before the
+/// back edge) is NOT accepted -- it needs an alternation argument ("each
+/// retain occurrence is followed by exactly one frontier occurrence before
+/// the next retain occurrence") this pass does not currently make, and the
+/// one live instance (json parseArray's `Retain tail`) is independently
+/// blocked by an aliasing store-release inside the interval, so there is no
+/// measured case the missing argument would recover (GAP-0067).
 DCFunction _elideCrossBlock(
   DCFunction function,
   ElisionStats? stats,
@@ -501,7 +532,8 @@ DCFunction _elideCrossBlock(
     indexOfBlock[blocks[i].id.index] = i;
   }
 
-  // Condition 1: no back edges, and every target must exist.
+  // Successors. Back edges no longer refuse the whole function (ADR-0068);
+  // only an unknown target (malformed IR) does.
   final successors = List<List<int>>.generate(blocks.length, (_) => <int>[]);
   for (var i = 0; i < blocks.length; i++) {
     final body = blocks[i].body;
@@ -515,31 +547,56 @@ DCFunction _elideCrossBlock(
     }
     for (final t in targets) {
       final ti = indexOfBlock[t];
-      if (ti == null || ti <= i) return function; // back edge or unknown
+      if (ti == null) return function; // unknown target: refuse
       successors[i].add(ti);
     }
   }
 
-  // Dominators, over a DAG already in topological order, so one forward
-  // sweep suffices -- no fixpoint iteration needed.
+  // Full forward reachability, cycle-safe. Used twice: condition 1's
+  // "executes at most once" test (a block can execute twice per call iff it
+  // is reachable from itself), and condition 4's frontier disjointness.
+  final reachableFrom = List<Set<int>>.generate(blocks.length, (_) => <int>{});
+  for (var i = 0; i < blocks.length; i++) {
+    final stack = [...successors[i]];
+    while (stack.isNotEmpty) {
+      final n = stack.removeLast();
+      if (reachableFrom[i].add(n)) stack.addAll(successors[n]);
+    }
+  }
+  bool onCycle(int i) => reachableFrom[i].contains(i);
+
+  // Dominators, by the standard iterative fixpoint -- valid on cyclic CFGs
+  // (the previous single-forward-sweep relied on the DAG's topological
+  // order, which back edges break). Entry = {0}; everything else starts at
+  // "all blocks" and only ever shrinks, so termination is by finite
+  // monotone descent. An unreachable block keeps an over-large set, which
+  // is harmless: condition 3 only ever queries dom[z] for a frontier block
+  // z, and the walk that produced z started from a block the lowering made
+  // reachable (and had it not, every instruction involved is dead code and
+  // deleting it changes nothing).
   final preds = List<List<int>>.generate(blocks.length, (_) => <int>[]);
   for (var i = 0; i < blocks.length; i++) {
     for (final sIdx in successors[i]) {
       preds[sIdx].add(i);
     }
   }
-  final dom = List<Set<int>>.generate(blocks.length, (_) => <int>{});
-  dom[0] = {0};
-  for (var i = 1; i < blocks.length; i++) {
-    if (preds[i].isEmpty) {
-      dom[i] = {i}; // unreachable; dominates only itself
-      continue;
+  final allBlocks = <int>{for (var i = 0; i < blocks.length; i++) i};
+  final dom = List<Set<int>>.generate(
+      blocks.length, (i) => i == 0 ? {0} : Set<int>.of(allBlocks));
+  var domChanged = true;
+  while (domChanged) {
+    domChanged = false;
+    for (var i = 1; i < blocks.length; i++) {
+      Set<int>? acc;
+      for (final p in preds[i]) {
+        acc = acc == null ? Set<int>.of(dom[p]) : acc.intersection(dom[p]);
+      }
+      final next = (acc ?? <int>{})..add(i);
+      if (next.length != dom[i].length) {
+        dom[i] = next;
+        domChanged = true;
+      }
     }
-    Set<int>? acc;
-    for (final p in preds[i]) {
-      acc = acc == null ? Set<int>.from(dom[p]) : acc.intersection(dom[p]);
-    }
-    dom[i] = (acc ?? <int>{})..add(i);
   }
 
   final removeFrom = <int, Set<int>>{}; // block index -> instruction indices
@@ -572,6 +629,10 @@ DCFunction _elideCrossBlock(
       for (var ai = 0; ai < aBody.length && !changedAny; ai++) {
         final r = aBody[ai];
         if (r is! Retain || isClaimed(a, ai)) continue;
+        // Condition 1, retain half (ADR-0068): the retain must execute at
+        // most once per call, i.e. its block must not lie on a CFG cycle --
+        // otherwise N retains would cancel against one frontier release.
+        if (onCycle(a)) continue;
         final vid = r.object.id.index;
 
         // Condition 2: the forward walk. `frontier` maps block index ->
@@ -608,6 +669,18 @@ DCFunction _elideCrossBlock(
         }
         if (!ok || frontier.isEmpty) continue;
 
+        // Condition 1, release half (ADR-0068): every frontier release must
+        // execute at most once per call -- a release on a cycle could run N
+        // times against this retain's one execution.
+        var frontierOnce = true;
+        for (final z in frontier.keys) {
+          if (onCycle(z)) {
+            frontierOnce = false;
+            break;
+          }
+        }
+        if (!frontierOnce) continue;
+
         // Condition 3: A dominates every frontier block.
         var dominated = true;
         for (final z in frontier.keys) {
@@ -618,17 +691,12 @@ DCFunction _elideCrossBlock(
         }
         if (!dominated) continue;
 
-        // Condition 4: no frontier block reaches another frontier block.
+        // Condition 4: no frontier block reaches another frontier block
+        // (cycle-safe: reachableFrom was built with a visited set).
         var disjoint = true;
         for (final z in frontier.keys) {
-          final reach = <int>{};
-          final stack = [...successors[z]];
-          while (stack.isNotEmpty) {
-            final n = stack.removeLast();
-            if (reach.add(n)) stack.addAll(successors[n]);
-          }
           for (final other in frontier.keys) {
-            if (other != z && reach.contains(other)) {
+            if (other != z && reachableFrom[z].contains(other)) {
               disjoint = false;
               break;
             }
@@ -692,7 +760,9 @@ DCBasicBlock _elideBlock(
 
   final kept = <DCInstruction?>[]; // null marks a removed slot
 
-  for (final instruction in block.body) {
+  final body = block.body;
+  for (var idx = 0; idx < body.length; idx++) {
+    final instruction = body[idx];
     if (callConsumed.isNotEmpty) {
       final isOwnMatchingRelease = instruction is Release && callConsumed.contains(instruction.object.id.index);
       if (!isOwnMatchingRelease) {
@@ -722,18 +792,89 @@ DCBasicBlock _elideBlock(
         callConsumed.remove(instruction.object.id.index); // fresh, not yet call-consumed
         kept.add(instruction);
       case Release():
-        final id = instruction.object.id.index;
-        final pendingIndex = pendingRetain.remove(id);
-        callConsumed.remove(id);
-        if (pendingIndex != null) {
+        // ------------------------------------------------------------
+        // (ADR-0068) RUN-ATOMIC MATCHING. A maximal run of CONSECUTIVE
+        // `Release` instructions -- an epilogue, a scope exit, a store's
+        // old-value release directly abutting them -- is processed as one
+        // unit: FIRST every pending retain whose matching release sits
+        // ANYWHERE in the run cancels, THEN the surviving releases (kept
+        // in their original order) invalidate whatever is still pending.
+        //
+        // WHY: dcc-lower emits an exit's releases in *some* order, and
+        // under one-at-a-time processing that order decided elision -- a
+        // surviving `Release a` one slot before a pending pair's
+        // `Release b` killed the pair, while the opposite order cancelled
+        // it. Same multiset, one executed pair of difference. The
+        // emission-order study this ADR records tried fixing that in
+        // dcc-lower with a static order (most-recently-used first): it
+        // recovered NEON epochReduce's pair and un-elided
+        // m2-heap-field's, because the pending retain is NOT reliably on
+        // the most-recently-used local. No static order dominates; the
+        // fix is to make THIS pass order-independent across a run.
+        //
+        // SAFETY. Equivalent to (1) commuting adjacent `Release`
+        // instructions until the matched one is first, then (2) the
+        // ordinary one-at-a-time rule. Step (2) is the pass as it was.
+        // Step (1) is sound because between two adjacent releases NOTHING
+        // executes: releases are pure decrements, decrements commute, and
+        // every object's count at the END of the run is order-independent
+        // -- so an object is freed by the run iff it was freed under the
+        // original order, and no instruction that could USE it runs in
+        // between. What order CAN move is which release site drops a
+        // shared count to zero, i.e. destructor-cascade order within the
+        // run -- and DCDart destructors are all compiler-synthesized
+        // field-release cascades (ADR-0022, never user code), and a
+        // managed object's address is not exposed to programs (GAP-0061:
+        // no conversion exists in either direction), so no conforming
+        // program can observe the difference. This is the same argument a
+        // dcc-lower emission-order change would have needed; making it
+        // here means it is checked against literal ADJACENCY in the
+        // block body rather than against a lowering convention asserted
+        // in a different file -- exactly the dependence ADR-0063
+        // complained about when GAP-0054's safety hung on
+        // `_releaseHeapLocals` placement.
+        //
+        // ADR-0063's gap invariant, restated for a cancelled pair whose
+        // interval now contains earlier SURVIVING members of its own run:
+        // up to the run, the interval is decrement-free as before (a
+        // surviving release or opaque op there would have cleared the
+        // pending). Inside the run, the transformed program's count for
+        // the pair's object sits exactly one below the original's, and
+        // both end the run at the same value; if the transformed count
+        // reaches zero mid-run, the original also reaches zero by run end,
+        // and between those two points only releases execute -- no use,
+        // no weak load, nothing that could touch the freed object.
+        // ------------------------------------------------------------
+        var end = idx;
+        while (end < body.length && body[end] is Release) {
+          end++;
+        }
+        // Phase 1: cancellations, position-independent within the run.
+        final cancelledAt = <int>{};
+        for (var j = idx; j < end; j++) {
+          final id = (body[j] as Release).object.id.index;
+          final pendingIndex = pendingRetain.remove(id);
+          if (pendingIndex == null) continue;
+          callConsumed.remove(id);
           stats?.elided += 1;
           kept[pendingIndex] = null; // drop the matched Retain
-          kept.add(null); // drop this Release too
-          // Deliberately NO invalidation of the OTHER pending retains here:
-          // this Release does not survive, so it never executes and cannot
-          // decrement anything. Only a SURVIVING Release is a real
-          // decrement, which is what the branch below is about.
-        } else {
+          cancelledAt.add(j); // and drop this Release
+          // Deliberately NO invalidation of the OTHER pending retains for
+          // a cancelled release: it does not survive, so it never executes
+          // and cannot decrement anything.
+        }
+        // Phase 2: survivors, original order. The first one to EXECUTE
+        // invalidates every remaining pending retain; emitting them all
+        // before clearing once is equivalent, since no cancellation
+        // happens after phase 1.
+        var anySurvived = false;
+        for (var j = idx; j < end; j++) {
+          if (cancelledAt.contains(j)) continue;
+          kept.add(body[j]);
+          anySurvived = true;
+        }
+        idx = end - 1; // the loop's ++ moves past the whole run
+        if (anySurvived) {
           // ------------------------------------------------------------
           // (ADR-0063, closing GAP-0054) THIS RELEASE SURVIVES, so it runs,
           // so it decrements SOME object's refcount by one.
@@ -796,10 +937,18 @@ DCBasicBlock _elideBlock(
           // which DCDart's ARC conventions do not currently carry.
           // ADR-0063 records it, escalation 0011 asks for it, and it is a
           // spec §3 question rather than something to invent here.
+          //
+          // (ADR-0068 postscript.) Of the three pairs named above,
+          // `boxNode`'s and one of `parseArray`'s now cancel under the
+          // run-atomic rule at the top of this case -- their releases are
+          // literally adjacent, so no ordering assumption is involved --
+          // while `lastKept` (releases separated by the loop counter's
+          // IAdd) and `parseArray`'s two field-store pairs still land
+          // here. This branch is every bit as blunt as ADR-0063 made it;
+          // only the population reaching it shrank.
           stats?.releaseLimited += pendingRetain.length;
           pendingRetain.clear();
           callConsumed.clear();
-          kept.add(instruction);
         }
       case Call():
         // (ADR-0066 rule T) A direct call to a refcount-transparent callee

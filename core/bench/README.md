@@ -5,16 +5,19 @@ M3's exit criterion is a number:
 > **Exit:** geometric mean overhead vs. C is **≤ 10%**.
 > — `ROADMAP.md`, M3 — THE GATE
 
-This directory is the apparatus that will produce that number. **It does not
-produce it today**, and the largest reason is the first thing below.
+This directory is the apparatus that produces that number. **Since 2026-08-27
+all five required benchmarks exist and the M3 GATE section prints a real gate
+number** — see §1 for the suite and `docs/known-gaps.md` GAP-0051b for the
+first full-suite run's result.
 
 ---
 
-## 1. State of the M3 suite: 0 of 5
+## 1. State of the M3 suite: 5 of 5 — the gate is evaluable
 
-`ROADMAP.md` M3 requires, "at minimum", five benchmarks. **None of the five is
-written.** Three are still blocked by a missing language feature; two are not
-blocked any more and are simply unwritten.
+`ROADMAP.md` M3 requires, "at minimum", five benchmarks. **All five now exist**
+(the last, `closure-heavy`, landed 2026-08-27), so `run-bench.sh` prints a
+real M3 GATE section for the first time. The headline below used to say
+"0 of 5"; the rows record what unblocked each one.
 
 State below tracks `docs/known-gaps.md` GAP-0035, which is the authoritative
 list and which moved twice on the day this harness was built — treat this
@@ -24,9 +27,9 @@ table as a pointer to that one, not as a second source of truth.
 |---|---|---|---|
 | hashmap-heavy workload | `hashmap` | **YES** | **written** (ADR-0061). Two phases: `hashmap` is phase B (churn) and is the gate input; `hashmap-burst` is phase A and is a `diagnostic` that enters no mean. It was NOT as unblocked as this table said: a bucket ARRAY is inexpressible (GAP-0061, escalation 0010), so both sides index 1024 buckets with a depth-10 binary trie and `index-tax/` prices that workaround on the C side |
 | tree/graph traversal | `tree-traversal` | **YES** | **written.** Builds, walks and drops a 16,383-node binary tree per round. **2026-08-27: C baseline rewritten from malloc-per-node to a static arena pool** — the malloc baseline was ~5× slower than natural C for this workload (burst-allocate, wholesale drop) and produced DCDart at **0.45× C** (2.2× *faster* than C), an allocator artifact, not an ARC result. Against the arena baseline the same DCDart binary measures **2.372× ±0.6% vs plain C, 2.34× vs trap-matched C** (gate quantity; atomic mode 3.06×/3.01×; traps cost ≈1.01× here — pointer-chasing hides the checks), so the ratio now prices ARC + the ADR-0058 heap, not macOS malloc's bookkeeping. `BENCH_ARG` raised 400→1200 to keep the 5×-faster C kernel well above the 25 ms floor. Details in the benchmark's `BENCH_NOTE` |
-| JSON parser | `json` | **no** | **blocked**: owning `String`/`StrBuf` (GAP-0045, itself blocked on spec §12 decision 2, the allocator). `Str` is a *borrowed* slice — you can read and slice text, not build it (ADR-0053) |
-| string-processing pass | `string-pass` | **no** | **blocked**: same as `json`. No concatenation, no formatting, no comparison beyond bytes |
-| closure-heavy functional workload | `closure-heavy` | **no** | **blocked**: non-capturing local functions hoist to static symbols (ADR-0057), but *capturing* closures and closures-as-values do not exist (GAP-0052, escalation 0008). A functional workload is made of closures that are passed, not named |
+| JSON parser | `json` | **YES** | **written** (2026-08-27). The row above used to say "blocked: owning `String`/`StrBuf`"; ADR-0058's `Heap.allocate` let the program build its own buffer, as `tests/conformance/rawheap/` shows (GAP-0045's workaround). Strings are borrowed slices into the input on both sides — see its BENCH_NOTE |
+| string-processing pass | `string-pass` | **YES** | **written** (2026-08-27), same unblock as `json`. The control with ZERO retains — its buffer is raw bytes and its fields integers, so it prices codegen rather than ARC (see GAP-0062) |
+| closure-heavy functional workload | `closure-heavy` | **YES** | **written 2026-08-27 — the fifth and last.** ADR-0060 closed GAP-0052 (functions as values, real indirect calls, ownership in the pointer's type). CAPTURING closures are still rejected (escalation 0008 §2, re-probed 2026-08-27; pinned by `tests/conformance/closure-capture-reject/`), so the benchmark is written the way closures COMPILE — code pointer + explicit heap environment object — and its manifest says it must be rewritten in capture syntax when capture lands. C baseline keeps its contexts on the stack (natural C; ADR-0059), so the ratio prices environment allocation + ARC |
 
 `run-bench.sh` knows these five ids. Until a benchmark directory exists with
 one of them and `BENCH_SUITE=m3`, the harness prints
@@ -48,6 +51,8 @@ belief about where it stands.
 | `collatz` | `selftest` | sum of Collatz step counts. Loop-heavy, zero heap, zero ARC |
 | `arc-churn` | `diagnostic` | one heap object allocated and released per iteration |
 | `hashmap-burst` | `diagnostic` | phase A of the `hashmap` pair: the same work, batched instead of interleaved. Excluded from every mean by design -- see ADR-0061 |
+| `matmul-f32` | `diagnostic` | **NEON N2 candidate, NOT in `M3_REQUIRED`** (neon/ROADMAP.md N2): blocked 96³ f32 matmul, LCG inputs, checksum = bit-exact modular fold of the output's f32 bit patterns. Zero ARC in the hot path. First float-kernel measurement: **9.244x ±0.4% vs plain C, 8.308x residual vs trap-matched C (traps 1.113x)** — nowhere near the ~1.0x a float kernel "should" show, and the residual is **GAP-0034**: every `Pointer<T>.value` is a volatile load/store, so the inner loop is scalar-unhoistable while C's vectorizes with fused fmla. Any float number from this harness is a measurement of GAP-0034 until the device/ordinary pointer split lands. FP does not trap, hence the small traps column (NEON's published caveat) |
+| `attention-f32` | `diagnostic` | **NEON N2 candidate, NOT in `M3_REQUIRED`**: single-head scaled-dot-product attention (seq 96, d 64; scale exactly 0.125), softmax `exp` as an identical range-reduced polynomial on BOTH sides (GAP-0063 route — libm would break the bit-exact checksum), C baselines under `#pragma STDC FP_CONTRACT OFF` because dcc never fuses multiply-add and clang's default does (GAP-0068, found here as a 1-2 ulp checksum mismatch). **3.679x ±0.7% vs plain C, 3.482x residual vs trap-matched C (traps 1.056x)** — same GAP-0034 story, diluted by softmax's serial exp/divide work |
 
 The two `selftest` benchmarks exist to prove the **harness** works, not to
 prove anything about DCDart. `arc-churn` is a microbenchmark that exists to
@@ -77,17 +82,21 @@ a gate number, and `arc-churn` is excluded from every geometric mean.
 
 **Does not prove:**
 
-- Anything about M3's gate. Zero of the five benchmarks the gate is defined
-  over exist, and the two that could be written today (`hashmap`,
-  `tree-traversal`) are the two that would carry most of the ARC.
-- Anything about ARC on realistic code. The only ARC in this tree today is one
-  alloc/release pair in a loop that does nothing else. Real code amortises
-  allocation across work; `arc-churn` amortises it across nothing. A hashmap
-  benchmark would not look like this, which is exactly why M3 asks for a
-  hashmap benchmark.
-- Anything about elision. `spec §3.2` calls elision "the whole ballgame" and
-  none of these benchmarks has enough ARC in it for elision to have anything
-  to do.
+- ~~Anything about M3's gate.~~ **Superseded 2026-08-27: all five gate
+  benchmarks exist and the harness prints a real M3 GATE section.** What a
+  single run still does not prove is that the gate's number is the language's
+  final word — GAP-0062 (elision removes almost nothing on idiomatic linked
+  structures) is the measured dominant term, and the gate moves when that
+  moves.
+- Anything about ARC on realistic code *from the diagnostics alone*. Written
+  when the only ARC in this tree was `arc-churn`'s one alloc/release pair in
+  a loop; the m3 suite now carries the realistic ARC, and `arc-churn` remains
+  what it always was — the unamortised worst case, excluded from every mean.
+- How much elision COULD remove. `spec §3.2` calls elision "the whole
+  ballgame"; the m3 suite now gives it real ARC to work on, and the measured
+  answer so far is "very little on linked structures" (GAP-0062, and
+  `elision-delta.sh` reproduces the per-benchmark delta). The harness prices
+  what survives; it cannot say what a stronger pass would have removed.
 - Anything about a machine other than the one in the report header. Every run
   prints its host, CPU, both compiler versions and both flag lists, because a
   timing number without them is not a measurement, it is an anecdote.

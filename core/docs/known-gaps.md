@@ -28,22 +28,27 @@ untyped `HeapRef<void>` IR cannot currently see); (b) a "releases only values lo
 parameters' fields" refinement — measured to be unsound as stated, since the pending object IS
 reachable from the callee's parameter; do not reach for it without a new argument.
 
-**2. Loops (rule F refuses any back edge).** The live case is NEON `tensor.dart`'s
-`loaderNextBatch`: `Retain loader.data` in the entry block, `Release` in the single exit, and two
-ARC-FREE copy loops in between. Every instruction between the pair is provably safe to cross; the
-refusal is purely structural (condition 1: no instruction may execute twice — which for the PAIR'S
-OWN blocks is still required, but the loop bodies here contain neither the retain nor the release).
-A region-based extension — allow back edges among blocks that (i) contain no ARC op and no opaque
-op and (ii) cannot reach the frontier except forward — would take exactly this shape. It was left
-out of ADR-0066 to keep rule F's safety argument one paragraph long; it is the natural next unit,
-and `loaderNextBatch` (`blockLimited=1` under `--why`) is its acceptance test.
+**2. Loops (rule F refuses any back edge). RESOLVED (2026-08-27) — ADR-0068 §1**, in exactly the
+predicted shape: the retain's block and every frontier block must lie on no CFG cycle, interior
+loop bodies are walked and must scan clean (no ARC op, no opaque op — enforced by the walk itself,
+no separate region rule needed), dominators moved to the iterative fixpoint. `loaderNextBatch` —
+this item's named acceptance test — now cancels (`crossBlock=1`, retain 0 in the emitted library),
+and NEON's build stays fully green, epoch heap-clean. What ADR-0068 still refuses, on purpose: the
+retain-and-release-both-inside-one-iteration shape (needs an alternation argument nobody has made;
+no measured case wants it — `parseArray`'s in-loop `Retain tail` is independently blocked by an
+aliasing field-store release in its interval).
 
-Also left, already tracked elsewhere: every releaseLimited pair (GAP-0066, escalation 0011);
-`mapInsert`'s three value-store retains (opaque over `tinsert`, same as item 1).
+Also left, already tracked elsewhere: the releaseLimited pairs GAP-0066 still holds after
+ADR-0068's run-atomic matching (non-adjacent shapes: `lastKept`, `parseArray`'s two field-store
+pairs, `tensorSlice0`); `mapInsert`'s three value-store retains (opaque over `tinsert`, same as
+item 1).
 
 **Cost of the workaround:** hashmap's residual keeps ~20 executed pairs per round (insert+remove
-descents) of the ~30 it had; lookup's ~12 are gone. The gate number moves but does not reach 1.10×
-from elision alone until item 1 or GAP-0066 moves.
+descents) of the ~30 it had; lookup's ~12 are gone. Item 1 is now the whole hashmap story: all 13
+of its surviving retains are held by it or by its `mapInsert` corollary. Measured after ADR-0068
+(nonatomic, medians): hashmap 2.20× vs trap-matched C (byte-identical object, ambient drift only),
+tree-traversal 2.16×, json 0.57× — 3-bench geomean ~1.40× against the ≤1.10× bar. It does not
+reach 1.10× from elision alone until item 1 or GAP-0066's remainder moves.
 
 ---
 
@@ -225,6 +230,21 @@ release of a value nothing proves distinct. Fixes, still in preference order: es
 so), or a `_releaseHeapLocals` emission-order study in dcc-lower (releasing `t` FIRST would let the
 pair cancel with no analysis at all) — the latter is a lowering-policy change, not an elide change,
 and belongs with GAP-0050's release-placement work.
+
+**Update (2026-08-27, ADR-0068):** the emission-order study named above was run, and NARROWED this
+gap rather than closing it. The study's own finding: no static release order dominates
+(most-recently-used-first recovered `epochReduce` and un-elided `m2-heap-field`; the tried lowering
+change was reverted byte-identical), so the order-dependence was removed in the pass instead —
+run-atomic matching over maximal runs of literally ADJACENT releases, safety argued in ADR-0068 §2.
+Recovered by it: `parseArray`'s tail-append pair (this gap's headline case and its measured ~4% —
+json's kernel moved 25.4 → 24.0 ms, −5.5%, the only benchmark whose object changed),
+`epochReduce`'s consumed pair (note (2) above, resolved), `boxNode`'s `got` pair, and
+`releaseThroughDestructor` — each with the last use provably before the adjacent run. STILL HELD by
+this gap, because their surviving release is NOT adjacent to the pair's (a real use or arithmetic
+sits between): `aliasBug`/`aliasBugNullable` (the genuine UAF shapes — these must never cancel
+without escalation 0011's fact), `lastKept`, `parseArray`'s two field-store pairs, `tensorSlice0`'s,
+and every mutating-callee descent (GAP-0067 item 1). The blunt rule itself is untouched; escalation
+0011 remains the only route to the remainder.
 
 ---
 
@@ -775,6 +795,18 @@ natural place to hang ordering requirements later.
 
 **Cost of the workaround:** measurable only under `-O` (which now exists, ADR-0042) and only on hosted
 traversal. If M3 comes in over budget, check this before concluding anything about ARC.
+
+**MEASURED, 2026-08-27 (NEON N2, `bench/benchmarks/matmul-f32` + `attention-f32`).** This entry
+predicted "hosted bulk traversal pays all of it"; the first float kernels put numbers on it. Blocked
+96³ f32 matmul — zero ARC in the hot path, checksum bit-identical to C — measures **9.244x ±0.4%**
+total vs plain C, of which trapping index arithmetic is only 1.113x (kernel_trapck.c): the residual,
+**8.308x**, is this gap. The emitted IR shows the inner loop as volatile-load / fmul / fadd / volatile-store per element,
+so LLVM can neither vectorize (C's j-loop runs 4-wide fmla) nor hoist the accumulator; the C baseline
+does both. Attention (same shape + polynomial softmax) measures 3.679x ±0.7% (residual 3.482x) —
+softer only because serial exp/divide work dilutes the buffer walks. On float kernels this gap is not "measurable"; it is the
+whole result, an order of magnitude above every other cost in the benchmark, and any M3-adjacent
+float number is a measurement of GAP-0034 until the device/ordinary pointer split lands. Exact
+ratios + attribution: the two benchmarks' manifests and `bench/README.md`.
 
 ---
 
@@ -2080,6 +2112,14 @@ consumer lives inside the repo where the relative path happens to work.
 **Status:** **CLOSED 2026-08-26 — ADR-0060**, `tests/conformance/funcptr/`. `DCFuncPtr`, `FuncRef`
 and `IndirectCall` exist; a function can be torn off, passed, returned and called through the value.
 
+**2026-08-27 — the thing this gap blocked now exists on the mechanism that closed it.**
+`bench/benchmarks/closure-heavy/` (the last of M3's five, GAP-0051b) is built entirely on
+ADR-0060's function values: every stage call is a genuine indirect call through a data-selected
+pointer, and the measured result — DCDart/nonatomic ~1.15x trap-matched C — is the benchmark-scale
+confirmation that the indirect call is not an elision barrier. Capture (escalation 0008 §2, NOT
+this gap) was re-probed the same day and is still rejected; `tests/conformance/closure-capture-reject/`
+now pins that.
+
 **The prediction below did not come true, and that is the whole result of the unit.** The last
 paragraph of this entry says every indirect call site becomes an elision barrier because
 `argOwnership` is not derivable through a value. ADR-0060's answer is to put ownership **in the
@@ -2411,6 +2451,49 @@ generic classes" row above was optimistic in exactly the way this entry warns ab
 ARRAY turned out to be inexpressible (GAP-0061, escalation 0010), so the benchmark carries a
 measured trie workaround. `closure-heavy` remains the missing fifth.
 
+**UPDATE 2026-08-27 (later the same day) — FIVE OF FIVE. The M3 gate produced its first real
+number, and the number says M3 does not pass.** `closure-heavy` landed (ADR-0067): the capture
+blocker was RE-PROBED rather than assumed — a capturing closure is still rejected (escalation 0008
+§2 open; now pinned by `tests/conformance/closure-capture-reject/`) — so the benchmark is written
+the way closures compile: heap `Env` objects (two scalars + a shared per-round `Gain` reference)
+invoked through data-selected function pointers via ADR-0060's indirect calls, one-item rolling
+window, serial dependency, `dc_heap_live` back to 0. The C baseline keeps its contexts on the
+stack (natural C, ADR-0059). Its manifest commits to a rewrite in capture syntax when 0008 §2 is
+decided. Measured clean in three consecutive full-suite runs: **1.145–1.154x trap-matched C
+(nonatomic; 1.16–1.17x plain C; traps ≈1.015x; atomic 1.70x; stock Dart AOT 2.70x)**; elision
+removes 3 of its 7 lowered retains — the environment-churn shape recycles one size class, which is
+the ADR-0058 heap's best case, hence one of the suite's best ratios.
+
+The first full-suite gate output (run 3 of the day, `bench/run-bench.sh`, Apple M1 Pro):
+
+```
+M3's required benchmark suite: 5 of 5 present.
+Suite complete. The gate number is the geometric mean of
+DCDart / trap-matched C over this suite (ADR-0059):
+  DCDart/nonatomic  : 1.3073x vs trap-matched C -- OVER the <= 1.10x bar
+  DCDart/atomic     : 1.6534x vs trap-matched C -- OVER the <= 1.10x bar
+```
+
+Per-benchmark residuals (DCDart/Ctrap, nonatomic): json ≈0.61x (faster than C — the ADR-0058
+allocator advantage GAP-0062 warns is masking unelided ARC), closure-heavy 1.145x, string-pass
+1.153x, tree-traversal 2.151x, hashmap 2.214x. **The gate is decided by the two linked-structure
+benchmarks, i.e. by GAP-0062** — pass-3 elision removing almost nothing across null tests — not by
+indirect calls (closure-heavy), codegen (string-pass) or allocation throughput (json). The path
+from 1.31x to ≤1.10x runs through elision across null-test block boundaries, per GAP-0062's own
+analysis.
+
+Caveats belonging to this first number: (1) it was measured while another agent compiled on the
+same machine — of three same-day runs, run 1 lost `json`'s nonatomic side to the 25 ms floor by
+0.061 ms (its `BENCH_ARG=600` puts DCDart's fastest side AT the floor on this host; its owner
+should raise it, ~600→800), run 2 lost `tree-traversal` to a mid-edit `dcc-lower` compile break
+(transient, concurrent work, rebuilt clean afterwards) and run 3 lost only `json`'s PLAIN-C
+baseline to noise, which refuses the informational plain-C means but not the gate quantity; the
+gate benchmarks proper were stable across all three runs (closure-heavy ±0.01x, hashmap
+2.19–2.21x, tree 2.15–2.18x). (2) One harness defect found and fixed on the way: `tool/report.awk`
+line 423 contained literal shell-quote escapes (`'\"'\"'`) from a heredoc edit, so EVERY report
+died at the M3-gate section before printing it — i.e. the gate section had never actually rendered
+until today.
+
 ---
 
 ## GAP-0062 — elision removes 1 of 19 retains on the JSON parser, and nothing could measure that until now
@@ -2700,3 +2783,30 @@ allocating object fails only at link time with raw duplicate-symbol errors that 
 rule. Fix direction when multi-object programs become common: emit heap symbols in a separate
 runtime object linked exactly once, or mark them appropriately for the linker and make the
 region genuinely shared.
+
+## GAP-0068 — dcc never emits fused multiply-add; C compiled with the harness flags does by default
+
+**Filed:** 2026-08-27, from NEON N2's float benchmarks (`bench/benchmarks/attention-f32`), where it
+surfaced as a checksum mismatch, not a slowdown.
+
+dcc lowers every float `a * b + c` to separate `fmul` + `fadd` — two roundings, strict per-op IEEE.
+clang's default for C is `-ffp-contract=on`: the same expression contracts to `llvm.fmuladd` and one
+fused `fmadd`/`fmla` instruction — ONE rounding. Two consequences, one per direction:
+
+1. **Cross-language bit-equality breaks by default.** attention-f32's softmax polynomial differed
+   from its statement-identical C twin by 1–2 ulp until the C side was pinned with
+   `#pragma STDC FP_CONTRACT OFF` (the harness's flag list is fixed and shared, so the C11 pragma is
+   the only per-benchmark route). Any future oracle or baseline that memcmp's DCDart floats against
+   C must either pin contraction off or construct inputs whose arithmetic is exact (matmul-f32's
+   trick — inputs on a 2^-6 grid keep every intermediate exact, so fused and unfused agree).
+2. **DCDart leaves FMA throughput and accuracy on the table.** On FMA hardware the contracted loop
+   is up to 2x the flops at strictly better accuracy. Today this is invisible behind GAP-0034
+   (volatile pointer accesses already block vectorization and most scheduling); it becomes the
+   next visible cost the day GAP-0034 closes, and it should be re-measured then.
+
+Not a bug: ADR-0065 chose strict IEEE per-op semantics and unfused is the letter of that choice —
+reproducible bits across targets is worth real money to NEON's oracle discipline. But it is an
+UNDECIDED choice, decided today by emission accident rather than by ADR. Deciding it (forbid
+contraction forever and say so; or add an opt-in fused form, e.g. a `fma()` prelude intrinsic — NOT
+blanket `-ffp-contract`-style contraction, which would un-reproduce every existing checksum) is
+spec §4.1-adjacent and rule-4-frozen after M3, so it should be decided before M3, not after.
