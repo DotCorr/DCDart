@@ -79,6 +79,19 @@ class BuildOptions {
   /// non-portable across checkouts and cost a day of misattributed failures.
   final String? preludePath;
 
+  /// Permit floating-point/SIMD registers on a FREESTANDING target.
+  ///
+  /// Freestanding builds pass `-mgeneral-regs-only` by default, because LLVM
+  /// otherwise vectorizes ordinary integer loops into `xorps`/`movaps` and
+  /// puts SSE into `@bare` objects containing no floating point at all. A
+  /// kernel that defers saving FPU state -- as `oscortex_core` does, hundreds
+  /// of instructions into `procYield` -- is then silently wrong.
+  ///
+  /// On x86-64 using a float MEANS using xmm, so this flag is what a `@bare`
+  /// program says when it wants FP and accepts the FPU-state obligation that
+  /// comes with it. Hosted targets are unaffected either way.
+  final bool allowFp;
+
   const BuildOptions({
     required this.mode,
     required this.inputPath,
@@ -87,6 +100,7 @@ class BuildOptions {
     this.headerPath,
     this.heapRegionBytes,
     this.preludePath,
+    this.allowFp = false,
   });
 
   @override
@@ -128,6 +142,14 @@ Options for build:
                            Orthogonal to --mode: a @bare object is a plain
                            C-ABI object and links into an ordinary native
                            program on any of these.
+  --allow-fp               Permit FP/SIMD registers on a FREESTANDING target.
+                           Off by default: LLVM vectorizes ordinary integer
+                           loops into xorps/movaps, putting SSE into @bare
+                           objects with no floating point in them, which
+                           silently breaks a kernel that defers saving FPU
+                           state. On x86-64 a float MEANS xmm, so pass this
+                           when you want FP in @bare and accept that
+                           obligation. Hosted targets are unaffected.
   --prelude <path>         Which file is the prelude. Defaults to the one
                            beside this dcc. `@bare` is recognised by comparing
                            library URIs as EXACT equality on a lexically
@@ -196,6 +218,7 @@ BuildOptions _parseBuildArgs(
   String? headerPath;
   int? heapRegionBytes;
   String? preludePath;
+  var allowFp = false;
 
   var i = 0;
   while (i < args.length) {
@@ -243,6 +266,12 @@ BuildOptions _parseBuildArgs(
         throw CliUsageError('dcc build: ${e.message}');
       }
       i += 2;
+      continue;
+    }
+
+    if (arg == '--allow-fp') {
+      allowFp = true;
+      i += 1;
       continue;
     }
 
@@ -342,5 +371,6 @@ BuildOptions _parseBuildArgs(
     headerPath: headerPath,
     heapRegionBytes: heapRegionBytes,
     preludePath: preludePath,
+    allowFp: allowFp,
   );
 }

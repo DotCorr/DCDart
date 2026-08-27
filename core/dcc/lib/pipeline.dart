@@ -82,6 +82,12 @@ Future<void> runBuild(BuildOptions options) async {
       options.outputPath,
       targetTriple: target.triple,
       noRedZone: target.forbidsRedZone,
+      // Derived from the target, not passed by hand -- same as noRedZone,
+      // and for the same reason: it is a property of "there is no OS here",
+      // not a preference. `--allow-fp` is the deliberate opt-out for a
+      // `@bare` program that genuinely wants floating point and accepts the
+      // FPU-state obligation that comes with it. See compile.dart.
+      noFpRegs: target.isFreestanding && !options.allowFp,
     );
   } finally {
     tempDir.deleteSync(recursive: true);
