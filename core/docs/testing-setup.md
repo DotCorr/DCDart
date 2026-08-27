@@ -59,8 +59,17 @@ bash core/scripts/vendor-frontend.sh
 ```
 
 It reproduces the vendored SDK from the pinned sparse clone, re-applies the workspace-detach pubspec
-edits (which live only in the ignored tree and cannot survive a re-clone), and proves the result with
-a real `pub get` across all six packages. It takes a few minutes and prints what it is doing.
+edits (which live only in the ignored tree and cannot survive a re-clone), runs `pub get` across all
+six packages, and then **compiles a real `@bare` function and checks an object came out**. It takes
+a few minutes and prints what it is doing.
+
+> **That last step was added on 2026-08-27 and it is the only one that proves anything you care
+> about.** For its whole life the script's final check was `pub get`, which establishes dependency
+> resolution and not that the compiler works. So "a clean checkout produces a working compiler" was
+> an *assumption* — and when a downstream toolchain failed to build, the reasonable conclusion from
+> the available evidence was that **no commit identified a buildable compiler at all**. One does; it
+> had simply never been checked. If this step fails with `no @bare top-level function found`, read
+> §8 before suspecting the compiler.
 
 Then put the toolchain on `PATH` for your shell:
 

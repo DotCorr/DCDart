@@ -154,8 +154,55 @@ if command -v dart >/dev/null 2>&1; then
       || die "dart pub get failed in core/$p (a Dart SDK satisfying ^3.12.0-0 is required)"
     echo "  pub get OK  core/$p"
   done
+  # -------------------------------------------------------------------------
+  # Step 4 — COMPILE SOMETHING. `pub get` succeeding is not the claim anyone
+  # cares about.
+  #
+  # For its whole life this script's last word was "prove it actually
+  # resolves", and it proved dependency resolution. Nobody had ever
+  # established that a clean checkout could COMPILE A PROGRAM -- so
+  # "DCDart is reproducible from git" was an untested assertion, and when a
+  # downstream toolchain failed to build, the reasonable conclusion available
+  # from the evidence was that no commit identified a buildable compiler at
+  # all. It does; nothing said so.
+  #
+  # That is the same defect this project has been removing all day, one level
+  # below the code: A CHECK THAT VALIDATES SOMETHING ADJACENT TO WHAT MATTERS.
+  #
+  # The import below is an ABSOLUTE path to this checkout's own prelude, and
+  # that is load-bearing rather than convenient: `dcc` decides `@bare` by
+  # comparing RESOLVED library paths, so a prelude reached by a different real
+  # path -- a relative import aimed at another tree, or anything through a
+  # symlink -- is a different library and every `@bare` annotation becomes
+  # invisible. The symptom is `no @bare top-level function found`, which reads
+  # as a broken compiler rather than a path problem, and it is the single
+  # most misleading failure in this toolchain.
+  echo "vendor-frontend: proving the toolchain can COMPILE, not just resolve"
+  SMOKE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dcdart-smoke.XXXXXX")" \
+    || die "could not create a temp dir for the build proof"
+  cat > "$SMOKE_DIR/smoke.dart" <<SMOKE
+import '$CORE_DIR/runtime/dc-core-bare/prelude.dart';
+
+@bare u64 smokeAdd(u64 a, u64 b) => a + b;
+SMOKE
+  if ( cd "$CORE_DIR" && dart dcc/bin/dcc.dart build --mode bare --target host \
+         "$SMOKE_DIR/smoke.dart" -o "$SMOKE_DIR/smoke.o" ) \
+       > "$SMOKE_DIR/build.log" 2>&1; then
+    if [ -s "$SMOKE_DIR/smoke.o" ]; then
+      echo "  build OK    $(wc -c < "$SMOKE_DIR/smoke.o" | tr -d ' ') bytes of object emitted"
+    else
+      cat "$SMOKE_DIR/build.log" >&2
+      rm -rf "$SMOKE_DIR"
+      die "dcc reported success but emitted no object — this checkout does NOT build"
+    fi
+  else
+    cat "$SMOKE_DIR/build.log" >&2
+    rm -rf "$SMOKE_DIR"
+    die "this checkout resolves but does NOT compile. If the error is 'no @bare top-level function found', the prelude was reached by a different real path than dcc expects (see the note above this check) rather than the compiler being broken."
+  fi
+  rm -rf "$SMOKE_DIR"
 else
-  echo "vendor-frontend: WARNING — no 'dart' on PATH, skipping the pub-get proof." >&2
+  echo "vendor-frontend: WARNING — no 'dart' on PATH, skipping the pub-get and build proofs." >&2
   echo "vendor-frontend: install a Dart SDK satisfying ^3.12.0-0 and re-run to verify." >&2
 fi
 
