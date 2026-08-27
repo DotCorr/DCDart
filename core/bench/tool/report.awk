@@ -165,7 +165,7 @@ END {
             dkey = b SUBSEP "dcdart" SUBSEP modelist[1]
             if (!(tkey in have) || !(ckey in have) || !(dkey in have)) continue
             if (cfg_status(ckey) != "ok" || cfg_status(tkey) != "ok" || cfg_status(dkey) != "ok") {
-                printf "%-14s %-22s %-24s %-24s\n", b, "REFUSED (noisy)", "-", "-"
+                printf "%-14s %-22s %-24s %-24s\n", b, "REFUSED", "-", "-"
                 continue
             }
             printf "%-14s %-22s %-24s %-24s\n", b, \
@@ -485,7 +485,17 @@ END {
 
 function ratio_cell(ckey, dkey, b, m,   r, u, st) {
     if (!(dkey in have) || !(ckey in have)) return "not run"
-    if (cfg_status(ckey) != "ok" || cfg_status(dkey) != "ok") return "REFUSED (noisy)"
+    # Say WHICH refusal, not just that there was one. A duration-floor
+    # refusal was reported as "noisy" until 2026-08-27, which sent a reader
+    # looking for machine load when the actual cause was a kernel running
+    # FASTER than the harness can time -- opposite diagnosis, opposite fix.
+    if (cfg_status(ckey) != "ok" || cfg_status(dkey) != "ok") {
+        creason = cfg_status(ckey); dreason = cfg_status(dkey)
+        why = (creason != "ok") ? creason : dreason
+        if (why ~ /< 25ms/ || why ~ /kernel </) return "REFUSED (too fast)"
+        if (why ~ /noise/ || why ~ /drift/)     return "REFUSED (noisy)"
+        return "REFUSED"
+    }
     r = med[dkey] / med[ckey]
     u = ratio_unc(ckey, dkey)
     if (u > unc_max + 0) return sprintf("REFUSED (+-%.1f%%)", u)

@@ -3,7 +3,21 @@
 BENCH_ID=json
 BENCH_DESC="parse a 60 KB nested JSON document into a heap tree, walk it, drop it"
 BENCH_SUITE=m3
-BENCH_ARG=600
+BENCH_ARG=1500
+
+# ROUNDS RAISED 600 -> 1500 on 2026-08-27, and the reason is worth keeping.
+#
+# At 600 the DCDart kernel measured 24.257 ms against a 25 ms floor and was
+# REFUSED -- not for noise, but for being too FAST to measure. C ran 41.3 ms,
+# comfortably over. So the one benchmark in the suite where DCDart beats C was
+# also the one the harness could not time, which meant NO GATE NUMBER COULD BE
+# PRODUCED AT ALL: a geometric mean over the survivors is a different quantity
+# from the one M3 asks for, and run-bench.sh correctly refuses to print it.
+#
+# The failure mode is worth naming because it is counter-intuitive: a timing
+# floor rejects the FASTEST configuration first, so the better an
+# implementation gets on a benchmark, the more likely that benchmark drops out
+# of the mean -- silently improving the reported number of whatever survives.
 
 BENCH_NOTE="One of M3's five. Counts toward the gate.
 
