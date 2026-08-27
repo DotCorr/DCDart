@@ -4,6 +4,114 @@ Work queue, not a confession log (`CLAUDE.md`). Every entry: what was worked aro
 
 ---
 
+## GAP-0070 — float kernels were ~9x C because every element ADDRESS was computed with trapping u64 arithmetic through per-element inttoptr; volatile was blamed and measured innocent
+
+**Domain:** dcc-lower, prelude (`Pointer<T>` addressing idiom), spec §4.1/§6 boundary (M3/M4, NEON N2)
+**Status:** RESOLVED for this repo (2026-08-27, ADR-0070 `elementAt`/`PtrIndex`) — filed by the
+unit that closed GAP-0034 (ADR-0069) when the split measurably did NOT move the ratio, and
+resolved by the same unit after the real culprit was isolated. Kept verbose because the
+misattribution → differential → fix chain is the useful part. **Follow-ups that stay open:**
+`neon/native/*.dart` kernels still use the old idiom and should migrate to `elementAt` for the
+same win (NEON's call, their oracle discipline); bounds policy for `elementAt` is GAP-0051's
+still-open question; FMA is GAP-0068.
+
+**RESOLUTION MEASUREMENT (harness, this host, 2026-08-27), after migrating matmul-f32 and
+attention-f32 to `elementAt` — addressing only, FP order untouched, checksums bit-identical to
+the unmodified C baselines:**
+
+```
+                before split   after split    after elementAt   vs trap-matched C
+matmul-f32      9.280x ±0.3%   9.186x ±0.5%   1.110x ±0.3%      0.997x
+attention-f32   3.586x ±0.5%   3.631x ±0.4%   1.056x ±0.3%      0.999x
+```
+
+Smoking-gun pair: the compiled matmul kernel had ZERO SIMD instructions before, and 32 `fmul.4s`
++ 32 `fadd.4s` + 48 vector-register load/stores after (host aarch64); on x86-64 the conformance
+target `tests/conformance/elementat/` pins packed `mulps`/`addps` in saxpy's body at -O2. The
+float kernels now sit AT PARITY with trap-matched C; the remaining ~6–11% vs plain C is the
+separately-priced trap semantics of the VALUE arithmetic (the harness's traps column), which is
+the M3 gate's own baseline question (ADR-0059), not an addressing cost.
+
+**What the measurement says.** After ADR-0069 removed volatile from every ordinary `Pointer<T>`
+access, the float ratios did not move: matmul-f32 9.280x → 9.186x, attention-f32 3.586x → 3.631x
+vs plain C (harness, this host, same day). GAP-0034's "8.308x residual = volatile" attribution
+was wrong.
+
+**Where the cost actually is.** DCDart has no `elementAt` (GAP-0051), so every indexed access is
+spelled `Pointer<f32>.fromAddress(base + (i * n + j) * u64(4)).value` — and every one of those
+`+`/`*` is USER-LEVEL u64 arithmetic under spec §4.1's trap-by-default rule. The emitted inner
+loop carries 5–6 `@llvm.uadd/umul.with.overflow.i64` + branch-to-`@llvm.trap` chains and a fresh
+`inttoptr` PER ELEMENT. LLVM can neither vectorize a loop with that much side-exit control flow
+nor prove the u64 sums non-overflowing (the base address is arbitrary), so nothing folds into
+SCEV-addressable form. C never pays this: `a[i*n+k]` traps (in the trap-matched baseline) only on
+the small INDEX arithmetic, which the compiler can bound and vectorize; C's base+offset scaling
+is pointer arithmetic, untrapped by both C semantics and the baseline, so trap-matched C is
+1.11x while trap-laden DCDart is 9.2x. The baselines are matched on VALUE arithmetic, not on
+ADDRESS arithmetic, and address arithmetic is where the loop's instruction count lives.
+
+**Decomposition, measured (matmul-f32, arg 400, Darwin/arm64 host, -O2):**
+
+```
+as emitted (traps + inttoptr, non-volatile)   540 ms     9.2x plain C
+overflow traps stripped from the IR           142 ms     2.42x   <- traps are 3.8x of the gap
+plain C                                        58.7 ms   1.0x
+```
+
+(Strip method: rewrite every `*.with.overflow` + extract + branch triple to a plain `add`/`mul`
++ unconditional branch; checksum identical, 288161451.) The post-trap 2.42x is still-scalar
+codegen — inttoptr-per-element addressing the vectorizer does not recognize as a strided walk,
+plus unfused mul/add (GAP-0068).
+
+**The shape of the fix, built in the same unit once the coordinator confirmed the decomposition
+independently** (ADR-0070): `Pointer<T>.elementAt(n)` (GAP-0051's ask, spec §6's own listed
+primitive), lowered to a new DC-IR `PtrIndex` emitting one `getelementptr` — COMPILER-emitted,
+provenance-preserving, non-trapping address scaling, so the trap-by-default rule keeps governing
+what the PROGRAMMER writes while the compiler's own address math has the same standing as C's.
+That one change attacked both halves exactly as the decomposition predicted: the 3.8x (no
+user-level overflow checks in the address path; the loop counter's own trap check folds away
+against the `i < n` guard) and the 2.42x (GEP addressing is what the vectorizer and SCEV
+understand — the kernels now vectorize, see the resolution measurement above). What ADR-0070
+deliberately did NOT decide: bounds policy (trap? inherit an allocation length?), which remains
+GAP-0051's §4.1-adjacent open question, to be ADR'd before rule 4 freezes it.
+
+---
+
+## GAP-0069 — `oscortex_core`'s MMIO is still spelled `Pointer<T>`, which ADR-0069 made ordinary: its next rebuild is unsafe-under-optimization until it migrates to `Volatile<T>`
+
+**Domain:** downstream (`oscortex_core`), prelude (M2 consumer)
+**Status:** OPEN — blocking for the kernel's next rebuild against this tree, zero cost inside
+this repo
+
+ADR-0069 split device memory (`Volatile<T>`, volatile access) from ordinary memory
+(`Pointer<T>`, plain access). Everything in THIS repo was reclassified in the same unit. The
+kernel was not: `oscortex_core` reaches UART/PIC/PIT/IDT/VGA/framebuffer registers through
+`Pointer<T>.value` across ~20 files, and those accesses now compile to plain loads/stores that
+-O2 may elide or reorder — the exact defect class ADR-0041 measured (a deleted MMIO read-back
+with every value check green, GAP-0006). Port I/O (`Port.outb/inb`) is unaffected, which covers
+some but not all of the kernel's device traffic.
+
+This was a KNOWN, accepted cost of the split: GAP-0034 recorded the kernel side saying it would
+happily annotate ("it already knows exactly which of its pointers are device memory"), and
+ADR-0069 spends ADR-0041's "no downstream source changes" property deliberately. But accepted is
+not done:
+
+- **Until migrated, do not ship a rebuilt kernel from this tree.** A kernel built before
+  ADR-0069 is unaffected (its objects already exist); the hazard is the next `dcc build`.
+- The migration is mechanical and greppable: every `Pointer<` whose address is a device register
+  becomes `Volatile<`; every ordinary-RAM use (ELF parsing, FAT buffers, multiboot tables, heap
+  structures) stays `Pointer<` and gets faster. The classification knowledge is the kernel
+  team's, which is why this entry exists instead of a cross-repo edit by the unit that made the
+  split.
+- The proof pattern is ready to copy: `tests/conformance/volatile/` (IR grep + per-site objdump
+  counts + automated negative control) and `tests/conformance/m1-pointer/` step 2b show how to
+  pin each migrated register access.
+
+**Cost of the workaround:** none in this repo; in the kernel, one grep-guided pass plus its
+review. The failure mode if skipped is the worst kind: no crash, no wrong value in tests, a
+device access that silently never happens under -O2.
+
+---
+
 ## GAP-0067 — the pairs ADR-0066 deliberately left: mutating callees, and loops
 
 **Domain:** dc-elide (M3 gate)
@@ -764,7 +872,10 @@ overhead near zero — a meaningless pass.
 ## GAP-0034 — Every `Pointer<T>` access is volatile, including bulk memory walks that do not need it
 
 **Domain:** runtime prelude, dcc-lower (M2/M3)
-**Status:** OPEN — correctness-safe, performance cost
+**Status:** RESOLVED (2026-08-27, ADR-0069) — the device/ordinary split this entry asked for is
+built and verified. **BUT its performance attribution was WRONG, by an order of magnitude** — see
+the resolution block at the end of this entry, and GAP-0070 for where the float cost actually
+lives. Read that before quoting anything from the middle of this entry.
 
 ADR-0041 makes `Pointer<T>.value` volatile because it is DCDart's MMIO mechanism. But it is also the
 only way to read ordinary memory through a pointer, so `examples/demo-stats/` — walking a plain `u32`
@@ -807,6 +918,42 @@ softer only because serial exp/divide work dilutes the buffer walks. On float ke
 whole result, an order of magnitude above every other cost in the benchmark, and any M3-adjacent
 float number is a measurement of GAP-0034 until the device/ordinary pointer split lands. Exact
 ratios + attribution: the two benchmarks' manifests and `bench/README.md`.
+
+**RESOLUTION (2026-08-27, ADR-0069) — and the correction of this entry's central claim.**
+
+The split landed exactly as this entry recommended: `Pointer<T>` is ordinary memory (plain
+loads/stores, optimizer free), MMIO moved to a distinct `Volatile<T>` type, volatile follows the
+type. Verified both ways: `tests/conformance/volatile/` asserts the MMIO accesses survive
+-O0…-Os with exact per-site counts plus an automated negative control, and asserts an ordinary
+`Pointer` walk emits ZERO volatile ops; `tests/conformance/m1-pointer/` pins the same property on
+dcc's own shipped object. GAP-0043's fence differential is written and passes. 46/46 conformance.
+
+**The measured performance claim above was WRONG.** Same harness, same host, same day, before →
+after the split:
+
+```
+matmul-f32     9.280x ±0.3%  →  9.186x ±0.5%   vs plain C   (~1%, near noise)
+attention-f32  3.586x ±0.5%  →  3.631x ±0.4%   vs plain C   (unchanged)
+```
+
+The 8.308x "residual attributed to volatile" was not volatile. The emitted inner loop this entry
+itself described — volatile-load / fmul / fadd / volatile-store — was read as "volatile blocks
+vectorization", but removing the volatile keywords changes nothing, because the SAME loop also
+recomputes every element address with 5–6 trapping u64 add/mul chains (each a
+`@llvm.*.with.overflow` + branch-to-trap) and an `inttoptr` per element, and THOSE block
+vectorization and hoisting all by themselves. Controlled decomposition (matmul-f32 kernel, arg
+400, this host): as-emitted 540ms; with every overflow trap stripped from the IR 142ms (3.8x of
+the gap); plain C 58.7ms (the remaining 2.42x: still-scalar codegen through inttoptr addressing,
+plus no FMA, GAP-0068). Where the cost actually lives is now GAP-0070, with the arithmetic.
+
+The split is still the right language change — it is the safety type this entry asked for, the
+information now has a place to be written down, it made the fences load-bearing (GAP-0043), and
+ordinary code stops paying volatile's (small) tax on scalar walks (string-pass/json improved
+slightly). But it is NOT the float-kernel fix this entry promised, and any plan that scheduled
+"close GAP-0034, get float perf" must reroute to GAP-0070. A cost this entry attributed without a
+differential got quoted for one day and cost one unit of work to un-quote; the differential
+experiment (strip the suspected cost from the IR, re-measure) takes minutes and should have been
+run before the attribution was written.
 
 ---
 
@@ -878,7 +1025,14 @@ misinterpretation.
 ## GAP-0043 — The fences are currently redundant with `volatile`, so their ordering property is untestable
 
 **Domain:** dcc-lower, backend, tests (M2)
-**Status:** OPEN — a testing gap, not a correctness one
+**Status:** RESOLVED (2026-08-27, ADR-0069) — exactly as this entry predicted: the redundancy
+ended when the device/ordinary pointer split made ordinary `Pointer<T>` access non-volatile, the
+fences in `examples/m2-fence/` became load-bearing with no source change, and the differential
+this entry asked for is written: `tests/conformance/fence/run.sh` step 6 shows `handoff`'s
+store→fence(acqRel)→load keeps its read-back at -O2 WITH the fence and has it store-forwarded
+away WITHOUT it (fence stripped from the IR, both halves asserted). The honest limit in the last
+paragraph still stands: a MIS-mapped ordering (release emitted as acquire) is still uncaught —
+that is GAP-0044's memory-model work, not this entry's.
 
 ADR-0056's conformance harness cannot run the test that would actually prove a fence works: a
 differential showing that without it the compiler reorders two accesses and with it it does not.
@@ -1046,7 +1200,17 @@ verifier pass, which DC-IR has never had.
 ## GAP-0051 — `Pointer<T>.elementAt(n)` does not exist, so every indexed read restates the element width by hand
 
 **Domain:** runtime prelude, dcc-lower (M1/M2)
-**Status:** OPEN — specified in `DCDART_SPEC.md` §6's required primitives, never built
+**Status:** LARGELY RESOLVED (2026-08-27, ADR-0070): `Pointer<T>.elementAt(n)` and
+`Volatile<T>.elementAt(n)` exist, derive the stride from `T`, lower to one `getelementptr`
+(DC-IR `PtrIndex`), and are verified by `tests/conformance/elementat/` — built because GAP-0070
+showed the hand-computed-stride idiom was also the ~9x float-kernel performance bug (per-element
+trapping address arithmetic + provenance-destroying inttoptr), not only the correctness hazard
+this entry describes. **Still open here:** the BOUNDS/overflow policy for `elementAt`
+(compiler-emitted address math wraps, deliberately un-poisoned — see ADR-0070; whether a future
+form traps or inherits an allocation length is a §4.1-adjacent ADR to write before M3 freezes
+rule 4), `.cast<U>()`, and migrating the remaining old-idiom call sites (in-repo examples still
+compile unchanged; `oscortex_core`'s and `neon/`'s migrations are their owners' — GAP-0069's
+warning applies to the kernel's device pointers regardless).
 
 Reading an element of a static table or any pointer-addressed array is written:
 
@@ -2803,6 +2967,10 @@ fused `fmadd`/`fmla` instruction — ONE rounding. Two consequences, one per dir
    is up to 2x the flops at strictly better accuracy. Today this is invisible behind GAP-0034
    (volatile pointer accesses already block vectorization and most scheduling); it becomes the
    next visible cost the day GAP-0034 closes, and it should be re-measured then.
+   *(2026-08-27 update: GAP-0034 closed — ADR-0069 — and the float ratio did not move, because
+   GAP-0070's trapping address arithmetic was the actual front of the queue. FMA is part of
+   GAP-0070's measured 2.42x post-trap residual and stays behind it, still OPEN, still
+   deliberately untouched by ADR-0069's unit.)*
 
 Not a bug: ADR-0065 chose strict IEEE per-op semantics and unfused is the letter of that choice —
 reproducible bits across targets is worth real money to NEON's oracle discipline. But it is an
@@ -2810,3 +2978,31 @@ UNDECIDED choice, decided today by emission accident rather than by ADR. Decidin
 contraction forever and say so; or add an opt-in fused form, e.g. a `fma()` prelude intrinsic — NOT
 blanket `-ffp-contract`-style contraction, which would un-reproduce every existing checksum) is
 spec §4.1-adjacent and rule-4-frozen after M3, so it should be decided before M3, not after.
+
+
+---
+
+## GAP-0070 — `@bare` floating point is unavailable by default, and the escape hatch is unsafe by design
+
+**Domain:** backend, dcc (ADR-0071)
+**Status:** OPEN — deliberate, and the honest cost of ADR-0071
+
+Freestanding targets pass `-mgeneral-regs-only`, so `@bare` code cannot use floating point unless it
+passes `--allow-fp`. On x86-64 a float means an xmm register, and there is no way to have one without
+the other.
+
+**Why the restriction exists** is ADR-0071: LLVM vectorises ordinary integer loops into
+`xorps`/`movaps`, putting SSE into `@bare` objects that contain no floating point at all, which
+silently broke a downstream kernel that defers saving FPU state.
+
+**What is still wrong after the fix:** `--allow-fp` makes `@bare` FP *deliberate*, not *safe*. A
+program that passes it and runs inside a kernel deferring FPU save is still incorrect — the flag
+moves the decision from the optimizer to the author, which is the most a compiler flag can do.
+
+**Cost of the workaround:** any `@bare` numeric code wanting real floats must either pass the flag
+and accept an unstated obligation, or accept soft-float — which the spine check rejects outright,
+since the libcalls are undefined symbols and the allowlist is deliberately not grown for them.
+
+**Next step:** spec §6's `@interrupt` and FPU-state discipline. The compiler needs to know which
+functions may run with an unsaved FPU state and refuse FP in those specifically, rather than refusing
+FP for the whole target. That is a language question, not a flag.
