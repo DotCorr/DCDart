@@ -590,4 +590,541 @@ void main() {
     expect(body.whereType<Retain>().length, 0, reason: 'pass 3 must still fire here');
     expect(body.whereType<Release>().length, 0);
   });
+
+  // -------------------------------------------------------------------------
+  // ADR-0066 rule N: ARC ops on a statically-null value are runtime no-ops.
+  // -------------------------------------------------------------------------
+
+  test('rule N: removes Retain/Release of a value defined by NullRef in this function', () {
+    // dcc-lower stores `null` into every reference field a constructor
+    // initializes to null, and each such store emits `Retain <NullRef>`.
+    // ADR-0049 makes dc_retain(null)/dc_release(null) DEFINED no-ops, so the
+    // instructions are removable outright -- no pairing needed (this retain
+    // is unmatched, exactly like a real constructor's null field store).
+    final nullVal = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final obj = DCValue(ValueId(1), const DCHeapPointer(DCVoid()));
+    final fieldPtr = DCValue(ValueId(2), const DCPointer(DCHeapPointer(DCVoid())));
+
+    final function = DCFunction(
+      linkName: 'test_null_arc_ops',
+      paramTypes: const [DCHeapPointer(DCVoid())],
+      returnType: const DCVoid(),
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: [obj],
+          body: [
+            NullRef(dest: nullVal),
+            Retain(object: nullVal), // no-op: retains null on every execution
+            PtrOffset(dest: fieldPtr, base: obj, offsetBytes: 0),
+            Store(pointer: fieldPtr, value: nullVal),
+            Release(object: nullVal), // no-op too
+            Return(value: null),
+          ],
+        ),
+      ],
+    );
+
+    final stats = ElisionStats();
+    final body = elideRedundantRetainReleasePairs(function, stats).blocks.single.body;
+    expect(body.whereType<Retain>().length, 0, reason: 'retain of a static null is a no-op');
+    expect(body.whereType<Release>().length, 0, reason: 'release of a static null is a no-op');
+    expect(body.whereType<Store>().length, 1, reason: 'the store itself must survive');
+    expect(stats.nullElided, 2);
+  });
+
+  test('rule N: does NOT remove a Retain of a block parameter one predecessor binds to null', () {
+    // The negative that keeps rule N honest: a block PARAM is dynamic. One
+    // predecessor passes null, another passes a real object -- the retain in
+    // the join block is a real retain on the second path and must survive.
+    final nullVal = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final obj = DCValue(ValueId(1), const DCHeapPointer(DCVoid()));
+    final cond = DCValue(ValueId(2), const DCBool());
+    final joined = DCValue(ValueId(3), const DCHeapPointer(DCVoid()));
+
+    final function = DCFunction(
+      linkName: 'test_null_param_negative',
+      paramTypes: const [DCHeapPointer(DCVoid()), DCBool()],
+      returnType: const DCVoid(),
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: [obj, cond],
+          body: [
+            NullRef(dest: nullVal),
+            CondBranch(
+              cond: cond,
+              trueTarget: BlockId(1),
+              trueArgs: [nullVal],
+              falseTarget: BlockId(1),
+              falseArgs: [obj],
+            ),
+          ],
+        ),
+        DCBasicBlock(
+          id: BlockId(1),
+          params: [joined],
+          body: [
+            Retain(object: joined), // DYNAMIC: null on one path only
+            Call(dest: null, targetName: 'sink', args: [joined], argOwnership: const [false]),
+            Return(value: null),
+          ],
+        ),
+      ],
+    );
+
+    final elided = elideRedundantRetainReleasePairs(function);
+    final retains = [
+      for (final b in elided.blocks) ...b.body.whereType<Retain>(),
+    ];
+    expect(retains.length, 1, reason: 'a block-param retain is dynamic and must survive');
+  });
+
+  // -------------------------------------------------------------------------
+  // ADR-0066 rule T: refcount-transparent callees.
+  // -------------------------------------------------------------------------
+
+  test('rule T: a pair spanning a Call to a refcount-transparent callee IS elided', () {
+    final heapPtr = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final callResult = DCValue(ValueId(1), DCInt.u64);
+
+    final function = DCFunction(
+      linkName: 'test_transparent_call',
+      paramTypes: const [DCHeapPointer(DCVoid())],
+      returnType: DCInt.u64,
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: [heapPtr],
+          body: [
+            Retain(object: heapPtr),
+            Call(
+              dest: callResult,
+              targetName: 'provenBorrowsOnly',
+              args: [heapPtr],
+              argOwnership: const [false],
+            ),
+            Release(object: heapPtr),
+            Return(value: callResult),
+          ],
+        ),
+      ],
+    );
+
+    final body = elideRedundantRetainReleasePairs(
+      function,
+      null,
+      const {'provenBorrowsOnly'},
+    ).blocks.single.body;
+    expect(body.whereType<Retain>().length, 0,
+        reason: 'a proven non-decrementing callee cannot end the object\'s life');
+    expect(body.whereType<Release>().length, 0);
+  });
+
+  test('rule T: the SAME shape with the callee NOT in the transparent set survives', () {
+    // The negative control for the test above -- identical IR, empty set.
+    final heapPtr = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final callResult = DCValue(ValueId(1), DCInt.u64);
+
+    final function = DCFunction(
+      linkName: 'test_opaque_call_control',
+      paramTypes: const [DCHeapPointer(DCVoid())],
+      returnType: DCInt.u64,
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(
+          id: BlockId(0),
+          params: [heapPtr],
+          body: [
+            Retain(object: heapPtr),
+            Call(
+              dest: callResult,
+              targetName: 'provenBorrowsOnly',
+              args: [heapPtr],
+              argOwnership: const [false],
+            ),
+            Release(object: heapPtr),
+            Return(value: callResult),
+          ],
+        ),
+      ],
+    );
+
+    final body = elideRedundantRetainReleasePairs(function).blocks.single.body;
+    expect(body.whereType<Retain>().length, 1);
+    expect(body.whereType<Release>().length, 1);
+  });
+
+  group('computeRefcountTransparentCallees', () {
+    DCFunction leafWithBody(String name, List<DCInstruction> body,
+        {List<DCValue> params = const []}) {
+      return DCFunction(
+        linkName: name,
+        paramTypes: [for (final p in params) p.type],
+        returnType: const DCVoid(),
+        mode: DCMode.bare,
+        blocks: [DCBasicBlock(id: BlockId(0), params: params, body: body)],
+      );
+    }
+
+    test('a self-recursive function whose releases are all covered qualifies (walk shape)', () {
+      // The M3-gate case: Retain in one block, the covering Release on every
+      // path in later blocks, a recursive borrowed call in between.
+      final n = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+      final childPtr = DCValue(ValueId(1), const DCPointer(DCHeapPointer(DCVoid())));
+      final child = DCValue(ValueId(2), const DCHeapPointer(DCVoid()));
+      final nil = DCValue(ValueId(3), const DCHeapPointer(DCVoid()));
+      final isNil = DCValue(ValueId(4), const DCBool());
+
+      final walk = DCFunction(
+        linkName: 'walkish',
+        paramTypes: const [DCHeapPointer(DCVoid())],
+        returnType: const DCVoid(),
+        mode: DCMode.bare,
+        blocks: [
+          DCBasicBlock(id: BlockId(0), params: [n], body: [
+            PtrOffset(dest: childPtr, base: n, offsetBytes: 0),
+            Load(dest: child, pointer: childPtr),
+            Retain(object: child),
+            NullRef(dest: nil),
+            ICmp(dest: isNil, lhs: child, rhs: nil, predicate: ICmpPredicate.eq),
+            CondBranch(
+              cond: isNil,
+              trueTarget: BlockId(1),
+              trueArgs: const [],
+              falseTarget: BlockId(2),
+              falseArgs: const [],
+            ),
+          ]),
+          DCBasicBlock(id: BlockId(1), params: const [], body: [
+            Release(object: child),
+            Return(value: null),
+          ]),
+          DCBasicBlock(id: BlockId(2), params: const [], body: [
+            Call(dest: null, targetName: 'walkish', args: [child], argOwnership: const [false]),
+            Release(object: child),
+            Return(value: null),
+          ]),
+        ],
+      );
+
+      expect(computeRefcountTransparentCallees([walk]), {'walkish'});
+    });
+
+    test('an UNCOVERED release disqualifies (the field-overwrite / GAP-0054 shape)', () {
+      // `Store p <- new; Release old` -- `old` was never retained HERE, so
+      // the function genuinely decrements an object it did not first bump.
+      // hashmap's tinsert/unlinkFrom are this shape and must stay opaque.
+      final p = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+      final newVal = DCValue(ValueId(1), const DCHeapPointer(DCVoid()));
+      final fieldPtr = DCValue(ValueId(2), const DCPointer(DCHeapPointer(DCVoid())));
+      final oldVal = DCValue(ValueId(3), const DCHeapPointer(DCVoid()));
+
+      final overwrite = leafWithBody('overwrite', [
+        PtrOffset(dest: fieldPtr, base: p, offsetBytes: 0),
+        Load(dest: oldVal, pointer: fieldPtr),
+        Retain(object: newVal),
+        Store(pointer: fieldPtr, value: newVal),
+        Release(object: oldVal), // uncovered: no prior Retain of oldVal
+        Return(value: null),
+      ], params: [p, newVal]);
+
+      expect(computeRefcountTransparentCallees([overwrite]), isEmpty);
+    });
+
+    test('a release covered on only ONE path disqualifies', () {
+      // Retain in a conditional arm, Release in the merge block: on the
+      // other path the release is a net decrement. min-over-paths must
+      // catch it.
+      final v = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+      final cond = DCValue(ValueId(1), const DCBool());
+
+      final oneArm = DCFunction(
+        linkName: 'oneArm',
+        paramTypes: const [DCHeapPointer(DCVoid()), DCBool()],
+        returnType: const DCVoid(),
+        mode: DCMode.bare,
+        blocks: [
+          DCBasicBlock(id: BlockId(0), params: [v, cond], body: [
+            CondBranch(
+              cond: cond,
+              trueTarget: BlockId(1),
+              trueArgs: const [],
+              falseTarget: BlockId(2),
+              falseArgs: const [],
+            ),
+          ]),
+          DCBasicBlock(id: BlockId(1), params: const [], body: [
+            Retain(object: v),
+            Branch(target: BlockId(2), args: const []),
+          ]),
+          DCBasicBlock(id: BlockId(2), params: const [], body: [
+            Release(object: v), // covered on the b1 path ONLY
+            Return(value: null),
+          ]),
+        ],
+      );
+
+      expect(computeRefcountTransparentCallees([oneArm]), isEmpty);
+    });
+
+    test('weak ops, indirect calls, and extern callees disqualify; badness propagates to callers', () {
+      final v = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+      final w = DCValue(ValueId(1), const DCWeakPointer(DCVoid()));
+
+      final weakUser = leafWithBody('weakUser', [
+        MakeWeak(dest: w, object: v),
+        Return(value: null),
+      ], params: [v]);
+      final externCaller = leafWithBody('externCaller', [
+        Call(dest: null, targetName: 'not_in_module', args: const [], argOwnership: const []),
+        Return(value: null),
+      ]);
+      final callsWeakUser = leafWithBody('callsWeakUser', [
+        Call(dest: null, targetName: 'weakUser', args: [v], argOwnership: const [false]),
+        Return(value: null),
+      ], params: [v]);
+      final clean = leafWithBody('clean', [
+        Return(value: null),
+      ]);
+
+      expect(
+        computeRefcountTransparentCallees([weakUser, externCaller, callsWeakUser, clean]),
+        {'clean'},
+      );
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // ADR-0066 rule F: multi-exit cross-block frontier pairs.
+  // -------------------------------------------------------------------------
+
+  test('rule F: a retain paired against a Release on EACH of two return paths is elided '
+      '(the tlookup descent shape)', () {
+    // b0: retain, null test. b1: transparent recursive call, release,
+    // return. b2: release, return. One retain, a frontier of two releases.
+    final n = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final childPtr = DCValue(ValueId(1), const DCPointer(DCHeapPointer(DCVoid())));
+    final child = DCValue(ValueId(2), const DCHeapPointer(DCVoid()));
+    final nil = DCValue(ValueId(3), const DCHeapPointer(DCVoid()));
+    final isNil = DCValue(ValueId(4), const DCBool());
+    final res = DCValue(ValueId(5), DCInt.u64);
+    final zero = DCValue(ValueId(6), DCInt.u64);
+
+    final function = DCFunction(
+      linkName: 'test_frontier',
+      paramTypes: const [DCHeapPointer(DCVoid())],
+      returnType: DCInt.u64,
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(id: BlockId(0), params: [n], body: [
+          PtrOffset(dest: childPtr, base: n, offsetBytes: 0),
+          Load(dest: child, pointer: childPtr),
+          Retain(object: child),
+          NullRef(dest: nil),
+          ICmp(dest: isNil, lhs: child, rhs: nil, predicate: ICmpPredicate.eq),
+          CondBranch(
+            cond: isNil,
+            trueTarget: BlockId(1),
+            trueArgs: const [],
+            falseTarget: BlockId(2),
+            falseArgs: const [],
+          ),
+        ]),
+        DCBasicBlock(id: BlockId(1), params: const [], body: [
+          ConstInt(dest: zero, bits: 0),
+          Release(object: child),
+          Return(value: zero),
+        ]),
+        DCBasicBlock(id: BlockId(2), params: const [], body: [
+          Call(
+            dest: res,
+            targetName: 'test_frontier',
+            args: [child],
+            argOwnership: const [false],
+          ),
+          Release(object: child),
+          Return(value: res),
+        ]),
+      ],
+    );
+
+    final stats = ElisionStats();
+    final elided = elideRedundantRetainReleasePairs(
+      function,
+      stats,
+      const {'test_frontier'},
+    );
+    final all = [for (final b in elided.blocks) ...b.body];
+    expect(all.whereType<Retain>().length, 0,
+        reason: 'the retain has a release on every path: the frontier cancels it');
+    expect(all.whereType<Release>().length, 0,
+        reason: 'both frontier releases go with it -- one per path');
+    expect(stats.crossBlockElided, 1);
+  });
+
+  test('rule F: refuses when one path reaches Return with NO release (would leak)', () {
+    final child = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final cond = DCValue(ValueId(1), const DCBool());
+
+    final function = DCFunction(
+      linkName: 'test_frontier_missing_release',
+      paramTypes: const [DCHeapPointer(DCVoid()), DCBool()],
+      returnType: const DCVoid(),
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(id: BlockId(0), params: [child, cond], body: [
+          Retain(object: child),
+          CondBranch(
+            cond: cond,
+            trueTarget: BlockId(1),
+            trueArgs: const [],
+            falseTarget: BlockId(2),
+            falseArgs: const [],
+          ),
+        ]),
+        DCBasicBlock(id: BlockId(1), params: const [], body: [
+          Release(object: child),
+          Return(value: null),
+        ]),
+        DCBasicBlock(id: BlockId(2), params: const [], body: [
+          Return(value: null), // no release on this path
+        ]),
+      ],
+    );
+
+    final elided = elideRedundantRetainReleasePairs(function);
+    final all = [for (final b in elided.blocks) ...b.body];
+    expect(all.whereType<Retain>().length, 1,
+        reason: 'deleting the retain would strand the release-less path unbalanced');
+    expect(all.whereType<Release>().length, 1);
+  });
+
+  test('rule F: refuses when the retain does NOT dominate the frontier release', () {
+    // Retain in one arm, release in the merge block reachable from BOTH
+    // arms: the other arm would lose a release it needs.
+    final v = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final cond = DCValue(ValueId(1), const DCBool());
+
+    final function = DCFunction(
+      linkName: 'test_frontier_dominance',
+      paramTypes: const [DCHeapPointer(DCVoid()), DCBool()],
+      returnType: const DCVoid(),
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(id: BlockId(0), params: [v, cond], body: [
+          CondBranch(
+            cond: cond,
+            trueTarget: BlockId(1),
+            trueArgs: const [],
+            falseTarget: BlockId(2),
+            falseArgs: const [],
+          ),
+        ]),
+        DCBasicBlock(id: BlockId(1), params: const [], body: [
+          Retain(object: v),
+          Branch(target: BlockId(2), args: const []),
+        ]),
+        DCBasicBlock(id: BlockId(2), params: const [], body: [
+          Release(object: v),
+          Return(value: null),
+        ]),
+      ],
+    );
+
+    final elided = elideRedundantRetainReleasePairs(function);
+    final all = [for (final b in elided.blocks) ...b.body];
+    expect(all.whereType<Retain>().length, 1);
+    expect(all.whereType<Release>().length, 1,
+        reason: 'the release executes on the arm that never retained; it must survive');
+  });
+
+  test('rule F: refuses a function with a back edge (loop) outright', () {
+    final v = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final cond = DCValue(ValueId(1), const DCBool());
+
+    final function = DCFunction(
+      linkName: 'test_frontier_backedge',
+      paramTypes: const [DCHeapPointer(DCVoid()), DCBool()],
+      returnType: const DCVoid(),
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(id: BlockId(0), params: [v, cond], body: [
+          Retain(object: v),
+          Branch(target: BlockId(1), args: const []),
+        ]),
+        DCBasicBlock(id: BlockId(1), params: const [], body: [
+          CondBranch(
+            cond: cond,
+            trueTarget: BlockId(1), // back edge: the retain could run once
+            trueArgs: const [], //     against N executions of the release
+            falseTarget: BlockId(2),
+            falseArgs: const [],
+          ),
+        ]),
+        DCBasicBlock(id: BlockId(2), params: const [], body: [
+          Release(object: v),
+          Return(value: null),
+        ]),
+      ],
+    );
+
+    final elided = elideRedundantRetainReleasePairs(function);
+    final all = [for (final b in elided.blocks) ...b.body];
+    expect(all.whereType<Retain>().length, 1);
+    expect(all.whereType<Release>().length, 1);
+  });
+
+  test('rule F: two pairs sharing an exit block both elide -- a claimed release does not '
+      'block the later walk (the json/tree walk shape)', () {
+    // b0: retain v18; branch either way to b1 or b2, both to b3.
+    // b3: Release v18; Release v27; Return. The v18 pair claims the first
+    // release; the v27 pair (retained in b1... here b0 for simplicity of
+    // dominance) must then walk PAST the claimed release, which never
+    // executes.
+    final a = DCValue(ValueId(0), const DCHeapPointer(DCVoid()));
+    final b = DCValue(ValueId(1), const DCHeapPointer(DCVoid()));
+    final cond = DCValue(ValueId(2), const DCBool());
+
+    final function = DCFunction(
+      linkName: 'test_frontier_shared_exit',
+      paramTypes: const [DCHeapPointer(DCVoid()), DCHeapPointer(DCVoid()), DCBool()],
+      returnType: const DCVoid(),
+      mode: DCMode.bare,
+      blocks: [
+        DCBasicBlock(id: BlockId(0), params: [a, b, cond], body: [
+          Retain(object: a),
+          Retain(object: b),
+          CondBranch(
+            cond: cond,
+            trueTarget: BlockId(1),
+            trueArgs: const [],
+            falseTarget: BlockId(2),
+            falseArgs: const [],
+          ),
+        ]),
+        DCBasicBlock(id: BlockId(1), params: const [], body: [
+          Branch(target: BlockId(3), args: const []),
+        ]),
+        DCBasicBlock(id: BlockId(2), params: const [], body: [
+          Branch(target: BlockId(3), args: const []),
+        ]),
+        DCBasicBlock(id: BlockId(3), params: const [], body: [
+          Release(object: a),
+          Release(object: b), // reachable only past the (claimed) release of a
+          Return(value: null),
+        ]),
+      ],
+    );
+
+    final stats = ElisionStats();
+    final elided = elideRedundantRetainReleasePairs(function, stats);
+    final all = [for (final b2 in elided.blocks) ...b2.body];
+    expect(all.whereType<Retain>().length, 0, reason: 'both pairs must cancel');
+    expect(all.whereType<Release>().length, 0);
+    expect(stats.crossBlockElided, 2);
+  });
 }

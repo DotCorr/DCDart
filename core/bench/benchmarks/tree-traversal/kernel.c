@@ -1,29 +1,51 @@
 /* core/bench/benchmarks/tree-traversal/kernel.c
  *
- * The C baseline for `tree-traversal`, and unlike `arc-churn`'s it required
- * no judgement call: a C programmer solving this problem allocates nodes and
- * frees them, so the baseline does exactly that. `malloc` per node, one
- * recursive `free` at the end.
+ * The C baseline for `tree-traversal`. REWRITTEN 2026-08-27: the first
+ * version did malloc-per-node with one recursive free, and that baseline was
+ * WEAK -- DCDart measured 0.446x of it, i.e. 2.2x FASTER than C, which for a
+ * managed-ARC language on a tree walk is not a result, it is a symptom. The
+ * BENCH_NOTE said so from the first run ("allocator-dominated"); this fixes
+ * the baseline instead of leaving the caveat to do the work.
  *
- * That makes this the FIRST benchmark in this tree whose C side and DCDart
- * side are doing the same job, which is why it is one of M3's five and
- * `arc-churn` is not. The gap it measures is DCDart's retain/release traffic
- * plus the difference between ADR-0058's segregated size-class heap and
- * glibc/macOS malloc -- exactly the quantity the gate is about.
+ * THE NATURAL C IDIOM FOR THIS WORKLOAD IS AN ARENA (POOL), NOT MALLOC.
+ * Every node is the same size, the whole tree is built in one burst, and the
+ * whole tree is dropped at once. That is the textbook arena case, and it is
+ * what real C tree code does -- compilers (obstacks, LLVM's BumpPtrAllocator),
+ * parsers (apr pools), kernels (slab caches) all pool their nodes. A C
+ * programmer who calls malloc 16,383 times to build a tree they will free
+ * wholesale is writing naive C, not idiomatic C, and a baseline is only a
+ * baseline if it is the program a competent C programmer would write.
+ * Measured on the first run's machine: malloc-per-node ~168 ms, this arena
+ * ~33 ms for the same 400 rounds and the same checksum -- the old baseline
+ * was 5x slower than natural C, and ALL of that 5x was being credited to
+ * DCDart.
  *
- * THE ALLOCATOR HALF OF THAT GAP IS NOT NEUTRAL AND CANNOT BE MADE SO. The
- * DCDart heap has no coalescing and no cross-class reuse; malloc has both and
- * pays for them. Every node here is the same size and every tree is freed
- * completely, which is the case DCDart's allocator handles best and malloc
- * gains least from. run-bench.sh prints this caveat next to the number.
+ * WHAT IS UNCHANGED -- the harness enforces the checksum and the shape is by
+ * construction: same node count (2^14-1 = 16,383 per round, depth fixed at
+ * 13), same recursive build with the same label recurrence, same recursive
+ * walk in the same left-then-right order, same modular checksum. Only where
+ * the bytes come from changed.
  *
- * malloc is NOT checked for NULL, deliberately: DCDart traps on OOM, so a
- * baseline that branched on every allocation would carry a check DCDart's
- * side does not have, in the hot path, and flatter DCDart.
+ * DROP IS O(1) AND THAT IS THE POINT, NOT AN OMISSION. An arena frees by
+ * resetting the cursor; per-node free is the thing the idiom exists to avoid.
+ * DCDart's drop is the destructor cascade (ADR-0022) visiting every node --
+ * that per-node release traffic is precisely the ARC cost this benchmark
+ * exists to price, and it is now priced against what C actually does instead,
+ * rather than hidden under malloc's own per-node bookkeeping.
+ *
+ * The pool is NOT bounds-checked, same stance as the old baseline's unchecked
+ * malloc: the tree size is exact by construction (build(13) allocates exactly
+ * NODE_COUNT nodes), and a per-allocation branch C does not need would
+ * flatter DCDart, whose allocator does carry a bump bounds check (ADR-0058).
+ *
+ * The pool is static (.bss), like the DCDart heap's pre-zeroed region. Note
+ * what C still gets for free here that DCDart pays for: a Node is 24 bytes
+ * with no header, so the pool packs nodes at 24-byte pitch, while DCDart's
+ * 16-byte object header pushes its nodes into the 64-byte size class.
  */
 
 #include <stdint.h>
-#include <stdlib.h>
+#include <stddef.h>
 
 struct Node {
     uint64_t value;
@@ -31,8 +53,20 @@ struct Node {
     struct Node *right;
 };
 
+/* A complete binary tree of depth 13: 2^14 - 1 nodes. benchKernel below
+ * builds exactly this depth every round; the pool is sized to it exactly. */
+#define TREE_DEPTH 13
+#define NODE_COUNT ((size_t)((1u << (TREE_DEPTH + 1)) - 1))
+
+static struct Node pool[NODE_COUNT];
+static size_t pool_next;
+
+static struct Node *node_alloc(void) {
+    return &pool[pool_next++];
+}
+
 static struct Node *build(uint64_t depth, uint64_t label) {
-    struct Node *n = malloc(sizeof(struct Node));
+    struct Node *n = node_alloc();
     n->value = label;
     if (depth == 0) {
         n->left = NULL;
@@ -51,19 +85,19 @@ static uint64_t walk(const struct Node *n) {
     return total % 1000000007;
 }
 
-/* DCDart's equivalent is the destructor cascade (ADR-0022) firing when the
- * last reference to the root goes away -- no explicit free exists in the
- * DCDart source at all. This is the C work that ARC is replacing. */
+/* Arena drop: reset the cursor. DCDart's equivalent is the destructor cascade
+ * (ADR-0022) releasing every node when the last reference to the root goes
+ * away -- the per-node work C's idiom does not have is the quantity the
+ * benchmark measures. */
 static void drop(struct Node *n) {
-    if (n->left) drop(n->left);
-    if (n->right) drop(n->right);
-    free(n);
+    (void)n;
+    pool_next = 0;
 }
 
 uint64_t benchKernel(uint64_t rounds) {
     uint64_t acc = 0;
     for (uint64_t i = 0; i < rounds; i++) {
-        struct Node *t = build(13, 1);
+        struct Node *t = build(TREE_DEPTH, 1);
         acc = (acc + walk(t)) % 1000000007;
         drop(t);
     }

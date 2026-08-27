@@ -48,10 +48,19 @@
 // codegen — a plain LLVM `call`, no vtable/dispatch involved (direct calls
 // only).
 //
-// SCOPE CUT, still: DCInt/DCPointer/DCBool/DCStruct/DCHeapPointer only (no
-// float codegen). Call does not yet support DCHeapPointer-typed
+// FLOAT UPDATE (see docs/decisions/0065-floating-point.md): DCFloat now
+// maps to `float`/`double`, with ConstFloat/FAdd/FSub/FMul/FDiv/FNeg/FCmp/
+// FConvert codegen. Every float op emits a hardware instruction (SSE2 on
+// x86-64, NEON on aarch64) — never a soft-float or `__addsf3`-style
+// libcall, which would be an undefined symbol in a `@bare` object
+// (CLAUDE.md rule 1). Float->int conversion goes through the
+// `llvm.fptoui.sat.*` intrinsics, which also lower inline.
+//
+// SCOPE CUT, still: Call does not yet support DCHeapPointer-typed
 // arguments/return (dcc-lower doesn't lower those types for function
 // signatures yet — GAP-0017).
+
+import 'dart:typed_data';
 
 import 'package:dc_ir/dc_ir.dart';
 
@@ -499,6 +508,32 @@ void _emitInstruction(DCInstruction instruction, _FunctionEmitter e, {required S
       e.line(
         '%v${instruction.dest.id.index} = icmp $pred $type %v${instruction.lhs.id.index}, %v${instruction.rhs.id.index}',
       );
+    // Floats (ADR-0065). No trapping expansion for any of these — IEEE
+    // overflow/NaN are defined VALUES, not errors (see instructions.dart's
+    // float section) — so unlike _emitArith each is exactly one line.
+    case ConstFloat():
+      _emitConstFloat(instruction, e, context);
+    case FAdd():
+      _emitFloatArith('fadd', instruction.dest, instruction.lhs, instruction.rhs, e, context);
+    case FSub():
+      _emitFloatArith('fsub', instruction.dest, instruction.lhs, instruction.rhs, e, context);
+    case FMul():
+      _emitFloatArith('fmul', instruction.dest, instruction.lhs, instruction.rhs, e, context);
+    case FDiv():
+      // No zero-divisor guard, unlike _emitDivRem: `fdiv x, 0.0` is a
+      // defined IEEE result (±inf / NaN), not LLVM poison.
+      _emitFloatArith('fdiv', instruction.dest, instruction.lhs, instruction.rhs, e, context);
+    case FNeg():
+      final negType = _llvmType(instruction.dest.type, context: context);
+      e.line('%v${instruction.dest.id.index} = fneg $negType %v${instruction.operand.id.index}');
+    case FCmp():
+      final type = _llvmType(instruction.lhs.type, context: context);
+      final pred = instruction.predicate.name; // enum names match LLVM's fcmp condition codes exactly
+      e.line(
+        '%v${instruction.dest.id.index} = fcmp $pred $type %v${instruction.lhs.id.index}, %v${instruction.rhs.id.index}',
+      );
+    case FConvert():
+      _emitFloatConvert(instruction, e, context);
     case MakeStruct():
       _emitMakeStruct(instruction, e, context);
     case ExtractField():
@@ -845,6 +880,132 @@ int _intBits(DCInt type, {required String context}) => switch (type.width) {
       IntWidth.wSize => 64,
     };
 
+/// `ConstFloat` -> `bitcast iN <bits> to float/double`.
+///
+/// The bit pattern, not a decimal or hex-float literal, and that choice is
+/// the whole correctness story here: LLVM's textual float constants have
+/// their own parsing/rounding rules (a `float` constant must be written as
+/// the double whose value is exactly representable in float, or the module
+/// is rejected), and printing through them is a second rounding step that
+/// can disagree with the first. Computing the IEEE bits on the host —
+/// including the one round-to-nearest-even for an f32 dest — and emitting
+/// them through an integer bitcast makes the emitted constant exact by
+/// construction. The bitcast folds to a plain constant at -O0 and above;
+/// no instruction survives.
+void _emitConstFloat(ConstFloat instruction, _FunctionEmitter e, String context) {
+  final destType = instruction.dest.type;
+  if (destType is! DCFloat) {
+    throw BackendError(
+      '"$context": ConstFloat dest has non-DCFloat type $destType '
+      '(${destType.runtimeType})',
+    );
+  }
+  final type = _llvmType(destType, context: context);
+  if (destType.width == FloatWidth.w32) {
+    // setFloat32 performs the double->binary32 round-to-nearest-even; the
+    // read-back gives the exact 32 stored bits.
+    final data = ByteData(4)..setFloat32(0, instruction.value);
+    final bits = data.getUint32(0);
+    e.line('%v${instruction.dest.id.index} = bitcast i32 $bits to $type');
+  } else {
+    final data = ByteData(8)..setFloat64(0, instruction.value);
+    final bits = data.getUint64(0);
+    // toUnsigned keeps the textual constant non-negative: Dart ints print
+    // signed, and `bitcast i64 -1 to double` is legal but harder to read
+    // in a dumped module than the unsigned pattern.
+    e.line(
+      '%v${instruction.dest.id.index} = bitcast i64 ${BigInt.from(bits).toUnsigned(64)} to $type',
+    );
+  }
+}
+
+/// `fadd`/`fsub`/`fmul`/`fdiv` -- all plain, single-instruction LLVM ops.
+/// No overflow expansion (cf. `_emitArith`) and no zero-divisor guard
+/// (cf. `_emitDivRem`): IEEE-754 defines a result for every input, so
+/// there is nothing to trap. No fast-math flags, deliberately — `fadd`,
+/// not `fadd fast`: reassociation would change results run-to-run as the
+/// optimizer evolves, and a kernel/ML workload that wants fast-math should
+/// ask for it explicitly some day, not inherit it silently (ADR-0065).
+void _emitFloatArith(
+  String op,
+  DCValue dest,
+  DCValue lhs,
+  DCValue rhs,
+  _FunctionEmitter e,
+  String context,
+) {
+  final destType = dest.type;
+  if (destType is! DCFloat) {
+    throw BackendError(
+      '"$context": float arithmetic on non-DCFloat dest $destType (${destType.runtimeType})',
+    );
+  }
+  final type = _llvmType(destType, context: context);
+  e.line('%v${dest.id.index} = $op $type %v${lhs.id.index}, %v${rhs.id.index}');
+}
+
+/// `FConvert` -> `fpext` / `fptrunc` / `uitofp` / `llvm.fptoui.sat.*`,
+/// chosen from the two types, exactly as `_emitConvert` chooses
+/// zext/sext/trunc (ADR-0065).
+///
+/// float->int goes through the SATURATING intrinsic, not plain `fptoui`:
+/// `fptoui` on an out-of-range or NaN input is poison — silent UB — where
+/// `llvm.fptoui.sat` clamps to the destination's range and maps NaN to 0,
+/// and it lowers to inline compare/select code on every registry target,
+/// never a libcall (checked against CLAUDE.md rule 1 the same way the
+/// atomics were).
+void _emitFloatConvert(FConvert instruction, _FunctionEmitter e, String context) {
+  final srcType = instruction.source.type;
+  final dstType = instruction.dest.type;
+  final src = _llvmType(srcType, context: context);
+  final dst = _llvmType(dstType, context: context);
+
+  if (srcType is DCFloat && dstType is DCFloat) {
+    if (srcType.width == dstType.width) {
+      throw BackendError(
+        '"$context": float conversion between identical types ($srcType) — '
+        'dcc-lower should not have emitted this (nothing in the prelude '
+        'surface can express it)',
+      );
+    }
+    final op = dstType.width == FloatWidth.w64 ? 'fpext' : 'fptrunc';
+    e.line('%v${instruction.dest.id.index} = $op $src %v${instruction.source.id.index} to $dst');
+    return;
+  }
+  if (srcType is DCInt && dstType is DCFloat) {
+    // Signed sources would need `sitofp`; rejected rather than emitted
+    // wrong, same forward-looking refusal as _emitDivRem's signed case.
+    if (srcType.signed) {
+      throw BackendError(
+        '"$context": signed int -> float conversion is not implemented '
+        '(needs sitofp; no signed sized-int type has prelude support, '
+        'GAP-0024\'s reasoning)',
+      );
+    }
+    e.line('%v${instruction.dest.id.index} = uitofp $src %v${instruction.source.id.index} to $dst');
+    return;
+  }
+  if (srcType is DCFloat && dstType is DCInt) {
+    if (dstType.signed) {
+      throw BackendError(
+        '"$context": float -> signed int conversion is not implemented '
+        '(needs llvm.fptosi.sat; no signed sized-int type has prelude '
+        'support, GAP-0024\'s reasoning)',
+      );
+    }
+    final intrinsicName = 'llvm.fptoui.sat.$dst.$src';
+    declareFpToUiSatIntrinsic(e.declaredIntrinsics, intrinsicName, dst, src);
+    e.line(
+      '%v${instruction.dest.id.index} = call $dst @$intrinsicName($src %v${instruction.source.id.index})',
+    );
+    return;
+  }
+  throw BackendError(
+    '"$context": float conversion between unsupported types '
+    '($srcType -> $dstType)',
+  );
+}
+
 /// `MakeStruct` -> a chain of `insertvalue`, starting from `undef`, one per
 /// field, matching how LLVM itself expects an aggregate built from scratch
 /// (there is no single "construct a struct" instruction in LLVM IR either).
@@ -987,6 +1148,19 @@ void declareOverflowIntrinsic(Set<String> declared, String name, String type) {
 
 void declareTrapIntrinsic(Set<String> declared) {
   declared.add('declare void @llvm.trap()');
+}
+
+/// `llvm.fptoui.sat.iN.fM` (ADR-0065): saturating float->unsigned-int.
+/// Recognized by name and lowered inline (compare/select on both registry
+/// architectures), never an external symbol — same rule-1 property the
+/// overflow intrinsics rely on.
+void declareFpToUiSatIntrinsic(
+  Set<String> declared,
+  String name,
+  String intType,
+  String floatType,
+) {
+  declared.add('declare $intType @$name($floatType)');
 }
 
 /// Names the backend emits for its own use. A DCDart global taking one of
@@ -1772,6 +1946,9 @@ String _llvmType(DCType type, {required String context}) {
         return 'i64';
     }
   }
+  // IEEE-754 binary32/binary64 (ADR-0065). LLVM's `float`/`double` are
+  // exactly those formats, so there is no width table to keep in sync.
+  if (type is DCFloat) return type.width == FloatWidth.w32 ? 'float' : 'double';
   if (type is DCVoid) return 'void';
   if (type is DCBool) return 'i1';
   // Opaque pointer type -- LLVM's only pointer representation since LLVM 15
@@ -1813,8 +1990,8 @@ String _llvmType(DCType type, {required String context}) {
   }
   throw BackendError(
     '"$context": unsupported DCType $type (${type.runtimeType}) — backend '
-    'emits DCInt/DCPointer/DCBool/DCStruct so far (see core/dc-ir/types.dart '
-    'scope note; float/heap-object codegen is not implemented)',
+    'emits DCInt/DCFloat/DCPointer/DCBool/DCStruct so far (see '
+    'core/dc-ir/types.dart scope note)',
   );
 }
 

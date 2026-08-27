@@ -43,12 +43,16 @@ Lowers <source.dart> through dcc-lower and prints, per function, how many
 of each ARC-relevant DC-IR instruction it contains: Alloc, Retain,
 Release, MakeWeak, WeakLoad, DropWeak.
 
-  --why        Report, per function, WHY pending retains failed to pair:
-               blockLimited (reached the end of a block unmatched -- what the
-               null-test extension would fix), opaqueLimited (a Call,
-               IndirectCall or weak op invalidated them -- what it would NOT
-               fix, needing interprocedural analysis or an ownership
-               convention), releaseLimited (a surviving Release, ADR-0063).
+  --why        Report, per function, WHY pending retains failed to pair --
+               and which pass removed the ones that did not:
+               blockLimited (reached the end of a block unmatched, and the
+               cross-block frontier pass could not place it either),
+               opaqueLimited (a non-transparent Call, an IndirectCall or a
+               weak op invalidated it -- ADR-0066's transparency summary is
+               what shrank this class), releaseLimited (a surviving Release,
+               ADR-0063 -- needs escalation 0011), elided/crossBlock/nullOps
+               (removed per-block, by the frontier pass, or as a null no-op,
+               ADR-0066). Counts are attempts, not distinct pairs.
                "Elision removes 5% here" does not say what to fix; this does.
 
   --no-elide   Skip ADR-0025's redundant-pair elision, so the counts are what
@@ -112,10 +116,17 @@ Future<void> main(List<String> argv) async {
   if (why) {
     stdout.writeln();
     stdout.writeln('  WHY pending retains failed to pair:');
-    var elided = 0, blockLimited = 0, opaqueLimited = 0, releaseLimited = 0;
+    var elided = 0,
+        crossBlock = 0,
+        nullOps = 0,
+        blockLimited = 0,
+        opaqueLimited = 0,
+        releaseLimited = 0;
     for (final entry in elisionStats.entries) {
       final st = entry.value;
       if (st.elided == 0 &&
+          st.crossBlockElided == 0 &&
+          st.nullElided == 0 &&
           st.blockLimited == 0 &&
           st.opaqueLimited == 0 &&
           st.releaseLimited == 0) {
@@ -123,12 +134,15 @@ Future<void> main(List<String> argv) async {
       }
       stdout.writeln('    ${entry.key}: $st');
       elided += st.elided;
+      crossBlock += st.crossBlockElided;
+      nullOps += st.nullElided;
       blockLimited += st.blockLimited;
       opaqueLimited += st.opaqueLimited;
       releaseLimited += st.releaseLimited;
     }
     stdout.writeln(
-      '    WHY-TOTAL: elided=$elided blockLimited=$blockLimited '
+      '    WHY-TOTAL: elided=$elided crossBlock=$crossBlock nullOps=$nullOps '
+      'blockLimited=$blockLimited '
       'opaqueLimited=$opaqueLimited releaseLimited=$releaseLimited',
     );
   }

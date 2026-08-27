@@ -4,6 +4,93 @@ Work queue, not a confession log (`CLAUDE.md`). Every entry: what was worked aro
 
 ---
 
+## GAP-0067 — the pairs ADR-0066 deliberately left: mutating callees, and loops
+
+**Domain:** dc-elide (M3 gate)
+**Status:** OPEN — each surviving pair named with the limiter that holds it and why the refusal is
+the correct call today
+
+ADR-0066 cut the tree's surviving retains 106 → 42. What remains is not one wall but two, and
+neither is a tuning knob:
+
+**1. Descent pairs over a mutating callee (hashmap: 10 of its 13 surviving retains, and the
+dominant surviving *dynamic* cost — ~10 executed pairs per insert and per remove).**
+`tinsert`/`tremove`/`unlinkFrom`/`unlinkHead` fail rule T's covered-release check because they
+GENUINELY decrement objects they never retained: `e.next = n.head` and `p.next = c.next` each emit
+`Store new; Release old`, and the released old value is exactly the aliasing-release shape GAP-0054
+was a use-after-free through. So every recursive descent call into them stays opaque, and the
+per-level `final c = n.c0; if (c != null) return tinsert(c, ...)` pair survives. **This refusal is
+load-bearing, not conservative slack**: a summary that waved these through would be wrong the first
+time a caller held a pending retain on anything reachable from the mutated chain. What would
+recover them, in order of plausibility: (a) escalation 0011's return-value uniqueness plus
+field-type reasoning (the released `old` is an `Entry`, the pending retain a `Trie` — a fact the
+untyped `HeapRef<void>` IR cannot currently see); (b) a "releases only values loaded from its OWN
+parameters' fields" refinement — measured to be unsound as stated, since the pending object IS
+reachable from the callee's parameter; do not reach for it without a new argument.
+
+**2. Loops (rule F refuses any back edge).** The live case is NEON `tensor.dart`'s
+`loaderNextBatch`: `Retain loader.data` in the entry block, `Release` in the single exit, and two
+ARC-FREE copy loops in between. Every instruction between the pair is provably safe to cross; the
+refusal is purely structural (condition 1: no instruction may execute twice — which for the PAIR'S
+OWN blocks is still required, but the loop bodies here contain neither the retain nor the release).
+A region-based extension — allow back edges among blocks that (i) contain no ARC op and no opaque
+op and (ii) cannot reach the frontier except forward — would take exactly this shape. It was left
+out of ADR-0066 to keep rule F's safety argument one paragraph long; it is the natural next unit,
+and `loaderNextBatch` (`blockLimited=1` under `--why`) is its acceptance test.
+
+Also left, already tracked elsewhere: every releaseLimited pair (GAP-0066, escalation 0011);
+`mapInsert`'s three value-store retains (opaque over `tinsert`, same as item 1).
+
+**Cost of the workaround:** hashmap's residual keeps ~20 executed pairs per round (insert+remove
+descents) of the ~30 it had; lookup's ~12 are gone. The gate number moves but does not reach 1.10×
+from elision alone until item 1 or GAP-0066 moves.
+
+---
+
+## GAP-0061 — DCDart cannot express an ARRAY of ARC-managed references, so O(1) indexed access to managed objects is inexpressible
+
+**Domain:** dcc-lower, spec §3 / §6 (M3). **Status:** OPEN — escalated (`docs/escalations/0010`),
+because the honest fix is a language change rather than a lowering
+
+Found writing M3's `hashmap` benchmark (ADR-0061, `dc-sys-21`'s work, integrated 2026-08-27).
+GAP-0035 and `bench/README.md` both listed `hashmap` as *writable*, unblocked by ADR-0054's generic
+classes plus ADR-0058's heap, with the remaining work described as "writing a `Map<K,V>` and a
+workload over it". **A hash map is writable. A hash map with a bucket ARRAY is not**, and that is
+not a detail of the data structure — it is the one operation a hash map is named for.
+
+Three routes exist to indexed storage and none of them can hold a managed reference:
+
+| route | why not |
+|---|---|
+| a field of a `HeapObject` | the only place a managed reference may live, and there is no array-typed field. `u64 a0; u64 a1; …` is the workaround, and it does not scale to a bucket table |
+| `Heap.allocate` raw bytes + `Pointer<T>` | raw memory. A store through it emits no `Retain` and a free emits no `Release`, so the reference is invisible to ARC — the object leaks or is freed under a live alias |
+| an address, kept in raw storage, converted back on read | **there is no conversion.** `Pointer<T>.fromAddress` exists and nothing turns an address into a managed reference. Every design that tries to keep ownership "somewhere else" and index by address dead-ends here |
+
+**Cost of the workaround, measured rather than estimated.** `hashmap` indexes its 1024 buckets with a
+**complete binary trie of depth 10**, and `kernel.c` walks the same trie so that neither side chases
+more pointers than the other. `bench/benchmarks/hashmap/index-tax/` runs the identical workload in C
+with a real bucket array — same keys, same values, same order, same checksum — and the trie costs the
+**C baseline 1.34×** (ADR-0061 §5).
+
+The DCDart side pays considerably more than 1.34×, and this is the part that matters for the gate:
+**reading a heap-typed field into a local is an alias retain (ADR-0017) with a matching release**, so
+each of the ten descent levels is a retain/release pair, none of which pass 3 elides — GAP-0062
+measured that independently (every pair straddles a block boundary at a null test). An array-indexed
+map would execute roughly 1–2 such pairs per operation; the trie executes ~10. `hashmap`'s ratio
+against trap-matched C is therefore **inflated by a missing language feature, not only by ARC**, and
+ADR-0061 §5 says so next to the number rather than in a footnote.
+
+Recursion does not avoid it and neither does a loop: a `HeapObject` parameter is borrowed (ADR-0019),
+so the recursive descent's *calls* are free, but the *field read* is the retain either way, and a loop
+reassigning a heap-typed local (ADR-0048) costs a pair per level as well.
+
+**What this does NOT block.** Trees, lists, chains and anything else navigated by named fields are
+fine and always were — `tree-traversal` needs nothing here. What it blocks is every structure whose
+defining property is indexed access: a hash table, a dynamic array, a ring buffer of objects, a page
+table of managed pages.
+
+---
+
 ## GAP-0054 — ADR-0025 can elide a retain/release pair across a `Release` of an ALIASING value
 
 **Domain:** dc-elide (M2). **Pre-existing — not introduced by ADR-0054, but found by it.**
@@ -124,6 +211,20 @@ which DCDart's ARC conventions do not express. That is spec §3 under rule 4: **
 "container method returns a node", which is most of a stdlib. Independent of GAP-0062's intra-block
 limit — the two have different causes and different fixes, and attempting them together makes a
 regression in either direction unattributable when one of them is a use-after-free.
+
+**Update (2026-08-27, ADR-0066):** unchanged in substance — the surviving-release rule is exactly
+as blunt as before and every ADR-0063 refusal still holds (`m3-elide-alias` 7 → 3 byte-for-byte;
+`boxNode`'s dangerous pair still `releaseLimited`). Two notes. (1) One of the three pairs ADR-0063's
+table lists as lost, `boxNode`'s OTHER pair, is recovered by rule T (its interval spans only the
+release-free `unwrap` call, no surviving release) — the count reads 2 → 1 now, and the 1 is this
+gap's pair. (2) A second live instance: NEON `tensor.dart`'s `epochReduce` — `Retain t;
+tensorDestroy(t) @owned; Release s2; Release s1; Release t`. The consumed pair would cancel under
+ADR-0031, but the two slice releases sit between the call and `Release t`, and each is a surviving
+release of a value nothing proves distinct. Fixes, still in preference order: escalation 0011
+(return-value uniqueness — `tensorSlice0`'s results are fresh `+1`s, the convention just cannot say
+so), or a `_releaseHeapLocals` emission-order study in dcc-lower (releasing `t` FIRST would let the
+pair cancel with no analysis at all) — the latter is a lowering-policy change, not an elide change,
+and belongs with GAP-0050's release-placement work.
 
 ---
 
@@ -2300,6 +2401,16 @@ must take heap arguments BORROWED (GAP-0057) — which is what `map`/`filter`/`f
 **Still zero of five written.** The row above changing from NO to yes is not progress toward the
 gate; it removes the last reason the gate cannot be attempted.
 
+**UPDATE 2026-08-27 — four of five now exist in this tree.** `json`, `string-pass` and
+`tree-traversal` were written on this side; `hashmap` was written by `dc-sys-21` on the
+`wt-hashmap` branch (ADR-0061, the two-phase pair with `hashmap-burst`) and is now integrated onto
+`main` — measured end-to-end by `bench/run-bench.sh hashmap` (identity check PASS, all five
+implementations at checksum parity, DCDart/nonatomic 2.385x trap-matched C on the integration
+host) and pinned by `tests/conformance/hashmap-bench/`. The "hashmap-heavy: writable — ADR-0054
+generic classes" row above was optimistic in exactly the way this entry warns about: a bucket
+ARRAY turned out to be inexpressible (GAP-0061, escalation 0010), so the benchmark carries a
+measured trie workaround. `closure-heavy` remains the missing fifth.
+
 ---
 
 ## GAP-0062 — elision removes 1 of 19 retains on the JSON parser, and nothing could measure that until now
@@ -2504,3 +2615,88 @@ for it.
 The conclusion still holds — a wrong answer is not a performance characteristic — but it must be
 argued as a trade rather than as costless. Recovering the 4% needs a way to express a return value's
 **uniqueness**, which DCDart's ARC conventions cannot say: escalation 0011.
+
+### RESOLUTION (2026-08-27, ADR-0066): the blockLimited and opaqueLimited walls are down; what is left is releaseLimited plus loops
+
+Three rules landed in `dc-elide` (ADR-0066: refcount-transparent callees, multi-exit frontier
+pairs, null-ARC-op removal). The prediction chain above resolved as follows, measured:
+
+- **"Interprocedural analysis is now the load-bearing one" — confirmed, and it was buildable
+  without an ownership convention.** The "borrows-only" summary (every release covered per-ValueId,
+  transitively, badness as call-graph reachability) proves `walk`/`tlookup`/`chainSum`/`valueSum`
+  transparent, including through their own recursion. No spec change, no annotation: computed from
+  the IR.
+- **"The blockLimited → opaqueLimited conversion" — it happened and then the second wall fell
+  too.** The frontier pass handles the multi-return shape that stopped the ADR-0025 cross-block
+  extension, and the transparency summary handles the call it then runs into. `walk` in both
+  benchmarks: 2 retains → 0.
+- **The retain population nobody had named: `Retain <NullRef>`.** `parseNumber`'s 6 retains and
+  `parseString`'s 4 are ALL null-field-initializer retains, defined no-ops under ADR-0049, now
+  deleted (rule N). 13 of `json`'s 19 lowered retains and 13 of `hashmap`'s 35 are this.
+
+New counts (`bench/elision-delta.sh`, lowered → surviving): `json` **19 → 4**, `tree-traversal`
+**6 → 0**, `hashmap` **35 → 13**, `m2-list` 12 → 6; whole tree 133 → 42 (68.4%). `hashmap`'s entire
+lookup path (~12 executed pairs per map operation) is retain-free; what survives is `tinsert`/
+`tremove`/`unlinkFrom` (GAP-0067: their callees genuinely release old field values) and
+`parseArray`'s tail-append (GAP-0066, releaseLimited, unchanged).
+
+**Still open, now precisely bounded:** loops (rule F refuses any back edge — NEON's
+`loaderNextBatch` is the live case, GAP-0067), and everything releaseLimited (GAP-0066 /
+escalation 0011). This entry stays OPEN for those two; the intra-block/cross-block/call-opacity
+walls it was opened for are closed.
+
+## GAP-0063 — floating point landed (ADR-0065) minus five things, each deliberate, one with a workaround already in use
+
+**Filed:** 2026-08-27, the same unit of work as ADR-0065 — recorded now so the next float user
+(NEON's kernels) finds the walls before hitting them.
+
+f32/f64 arithmetic, comparisons, conversions, literals and `Pointer<f32>`/`Pointer<f64>` buffers
+all work (`tests/conformance/float-arith/`, `float-pointer/`). What was left out, and what each
+costs:
+
+1. **Transcendentals: no `sqrt`/`exp`/`log`/`pow`.** Softmax and layernorm need `exp` and `sqrt`.
+   Deliberately not instructions and not prelude members: on many inputs LLVM's own intrinsics
+   lower to **libcalls**, which are undefined symbols in a `@bare` object — CLAUDE.md rule 1 by
+   accident. The intended routes are `@extern` C math (hosted targets) or polynomial/Newton kernels
+   in DCDart itself (bare targets). Cost: every ML kernel beyond dot/matmul writes or imports its
+   own approximation until someone designs the audited-intrinsic story.
+2. **No SIMD.** -O2 may auto-vectorize the accumulation loops (that is fine and free); there is no
+   vector *type* and no way to ask for one. Cost: kernels leave lane-level performance on the table
+   until a real design exists — do not fake it with `@extern` assembly in the meantime.
+3. **`Pointer<T>` is not lowerable in `@bare` function signatures** (pre-existing, but floats make
+   it visible: a kernel's natural signature is `dotF32(Pointer<f32> a, ...)`). Workaround, already
+   the repo idiom and used by `m4-float-dot`: pass `u64` addresses, wrap with
+   `Pointer<T>.fromAddress` at the use site. Cost: signatures lie slightly (an address is not a
+   typed pointer), and every caller restates the element stride by hand — GAP-0051's `.elementAt`
+   wart, now at two widths.
+4. **No float `@rodata` tables.** `_rodataElementType` still accepts `List<u8|u16|u32|u64|Ref>`
+   only, so constant weight tables cannot be emitted as f32 data yet. Workaround: emit the IEEE bit
+   patterns as `List<u32>` and read through `Pointer<f32>` at the same address. Cost: unreadable
+   initializers; closing it is a small, mechanical extension of ADR-0040's element-type switch.
+5. **f32/f64 literal ergonomics: constructor-wrapped only.** `f32(0.1)` / `f64(1.5)` work (one
+   rounding, exact bits — ADR-0065 §4); a bare `1.5` in float context does not, and float constant
+   expressions (`f64(0.5 * 3.0)`) are not folded — `_tryFoldConstDouble` handles literals and
+   CFE-evaluated constants only, because folding has a host-rounding-order question best decided
+   against a real case. Cost: noise at every constant, same as `u64(1)`'s — fixed by the same
+   future CFE fork, not separately.
+
+Also NOT done, recorded as fact rather than gap: `Result` payloads stay u64-only, and the signed
+paths (`sitofp`/`fptosi.sat`) are refused by name in the backend, GAP-0024-style, until signed
+sized ints exist.
+
+## GAP-0064 — only one DCDart object per link may allocate
+
+The backend emits the heap's symbols (`dc_heap_live`, the region, the free lists) as external
+definitions into every object whose code calls `Heap.allocate` or constructs a heap object.
+Because dcc compiles one library per object (GAP-0028), two DCDart objects that both allocate
+cannot be linked into the same binary: the heap symbols collide, and even if they were weakened
+the two objects would each believe they own the region. First hit by NEON's N0 kernels
+(2026-08-27), which were forced into a three-file split with a single designated allocating
+object (`neon/native/alloc.dart`) exposing alloc/free wrappers to the rest.
+
+Cost of the workaround: every multi-object program must nominate one heap-owner object and
+route all allocation through it by hand; nothing enforces the convention, and a second
+allocating object fails only at link time with raw duplicate-symbol errors that don't name the
+rule. Fix direction when multi-object programs become common: emit heap symbols in a separate
+runtime object linked exactly once, or mark them appropriately for the linker and make the
+region genuinely shared.

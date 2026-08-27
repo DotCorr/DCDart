@@ -5,33 +5,22 @@
  * that it isolates ARC rather than also charging DCDart for arithmetic
  * semantics C does not have.
  *
- * Identical to kernel.c in every other respect -- same malloc-per-node, same
- * recursive free, same checksum. The only difference is the arithmetic.
+ * Identical to kernel.c in every other respect -- same arena pool, same
+ * recursive build, same walk, same O(1) drop, same checksum. The only
+ * difference is the arithmetic. Read kernel.c's header for why the baseline
+ * is an arena and not malloc-per-node (rewritten 2026-08-27; the malloc
+ * baseline was 5x slower than natural C and made DCDart look 2.2x faster
+ * than C on a tree walk, which was the allocator, not ARC).
  *
- * (Original note, still true of both files: unlike `arc-churn`'s it required
- * no judgement call: a C programmer solving this problem allocates nodes and
- * frees them, so the baseline does exactly that. `malloc` per node, one
- * recursive `free` at the end.
- *
- * That makes this the FIRST benchmark in this tree whose C side and DCDart
- * side are doing the same job, which is why it is one of M3's five and
- * `arc-churn` is not. The gap it measures is DCDart's retain/release traffic
- * plus the difference between ADR-0058's segregated size-class heap and
- * glibc/macOS malloc -- exactly the quantity the gate is about.
- *
- * THE ALLOCATOR HALF OF THAT GAP IS NOT NEUTRAL AND CANNOT BE MADE SO. The
- * DCDart heap has no coalescing and no cross-class reuse; malloc has both and
- * pays for them. Every node here is the same size and every tree is freed
- * completely, which is the case DCDart's allocator handles best and malloc
- * gains least from. run-bench.sh prints this caveat next to the number.
- *
- * malloc is NOT checked for NULL, deliberately: DCDart traps on OOM, so a
- * baseline that branched on every allocation would carry a check DCDart's
- * side does not have, in the hot path, and flatter DCDart.
+ * The pool bump in node_alloc is NOT routed through trapping.h: allocation
+ * is runtime work, not user arithmetic. On the DCDart side the equivalent
+ * bump lives inside the ADR-0058 allocator the compiler emits, not in
+ * bench.dart's source, and trapck matches the semantics of the SOURCE
+ * program's arithmetic only.
  */
 
 #include <stdint.h>
-#include <stdlib.h>
+#include <stddef.h>
 #include "trapping.h"
 
 struct Node {
@@ -40,8 +29,20 @@ struct Node {
     struct Node *right;
 };
 
+/* A complete binary tree of depth 13: 2^14 - 1 nodes. benchKernel below
+ * builds exactly this depth every round; the pool is sized to it exactly. */
+#define TREE_DEPTH 13
+#define NODE_COUNT ((size_t)((1u << (TREE_DEPTH + 1)) - 1))
+
+static struct Node pool[NODE_COUNT];
+static size_t pool_next;
+
+static struct Node *node_alloc(void) {
+    return &pool[pool_next++];
+}
+
 static struct Node *build(uint64_t depth, uint64_t label) {
-    struct Node *n = malloc(sizeof(struct Node));
+    struct Node *n = node_alloc();
     n->value = label;
     if (depth == 0) {
         n->left = NULL;
@@ -60,19 +61,19 @@ static uint64_t walk(const struct Node *n) {
     return mod_ck(total, 1000000007);
 }
 
-/* DCDart's equivalent is the destructor cascade (ADR-0022) firing when the
- * last reference to the root goes away -- no explicit free exists in the
- * DCDart source at all. This is the C work that ARC is replacing. */
+/* Arena drop: reset the cursor. DCDart's equivalent is the destructor cascade
+ * (ADR-0022) releasing every node when the last reference to the root goes
+ * away -- the per-node work C's idiom does not have is the quantity the
+ * benchmark measures. */
 static void drop(struct Node *n) {
-    if (n->left) drop(n->left);
-    if (n->right) drop(n->right);
-    free(n);
+    (void)n;
+    pool_next = 0;
 }
 
 uint64_t benchKernel(uint64_t rounds) {
     uint64_t acc = 0;
     for (uint64_t i = 0; i < rounds; i++) {
-        struct Node *t = build(13, 1);
+        struct Node *t = build(TREE_DEPTH, 1);
         acc = mod_ck(add_ck(acc, walk(t)), 1000000007);
         drop(t);
     }

@@ -210,9 +210,12 @@ String cTypeOf(DCType type, {required String context}) {
           return signed ? 'ptrdiff_t' : 'size_t';
       }
     case DCFloat(width: final width):
-      // Unreachable today: the backend rejects float codegen outright
-      // (llvm_emit.dart). Mapped anyway so this switch stays exhaustive
-      // over the sealed DCType hierarchy without an unrelated throw.
+      // IEEE binary32/binary64 (ADR-0065) — C's `float`/`double` are the
+      // same formats on every registry target, and both pass/return in
+      // vector registers per the SysV and AAPCS64 ABIs, which is what the
+      // LLVM signature already says. This case predates float codegen (it
+      // was written for switch exhaustiveness) and became reachable when
+      // ADR-0065 landed.
       return width == FloatWidth.w32 ? 'float' : 'double';
     case DCPointer(pointee: final pointee):
       // `void*` for a pointer-to-void, otherwise a real pointee type, so

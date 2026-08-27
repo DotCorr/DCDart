@@ -101,7 +101,7 @@ END {
 
     print ""
     print "============================================================================="
-    print "RATIOS vs C   (geometric mean over these is the M3 gate quantity)"
+    print "RATIOS vs C   (informational -- the M3 gate quantity is vs trap-matched C)"
     print "============================================================================="
     printf "%-14s %-11s", "benchmark", "suite"
     for (mi = 1; mi <= nmode; mi++) printf " %-22s", "DCDart/" modelist[mi]
@@ -133,8 +133,10 @@ END {
     print "  x.xxx +- y%  is  median(DCDart) / median(C), with the propagated"
     print "  uncertainty of the two medians. A ratio is REFUSED when that"
     printf "  uncertainty exceeds %s%%, because a %s%%-uncertain measurement cannot\n", unc_max, unc_max
-    print "  decide a 10% gate. Stock Dart AOT is informational and is never part"
-    print "  of a gate number (ROADMAP.md M3 states the gate against C)."
+    print "  decide a 10% gate. These ratios are against PLAIN C and are published"
+    print "  alongside the gate number, per ADR-0059; the gate itself is stated"
+    print "  against trap-matched C (see GEOMETRIC MEANS). Stock Dart AOT is"
+    print "  informational and is never part of a gate number."
 
     # ---- attribution ----------------------------------------------------
     nattr = 0
@@ -186,14 +188,34 @@ END {
         if (su == "diagnostic") continue      # never enters a mean; see manifest
         if (!(su in seen_suite)) { seen_suite[su] = 1; suites[ns++] = su }
         if (b in failed) {
-            for (mi = 1; mi <= nmode; mi++) bad[su SUBSEP modelist[mi]] = 1
+            for (mi = 1; mi <= nmode; mi++) {
+                bad[su SUBSEP modelist[mi]] = 1
+                gbad[su SUBSEP modelist[mi]] = 1
+            }
+            tbad[su] = 1
             continue
         }
         ckey = b SUBSEP "c" SUBSEP "-"
+        tkey = b SUBSEP "ctrap" SUBSEP "-"
+        # traps-cost mean (Ctrap / C), once per benchmark -- the separately
+        # published number ADR-0059 requires alongside the gate.
+        if (!(tkey in have) || !(ckey in have)) tbad[su] = 1
+        else if (cfg_status(ckey) != "ok" || cfg_status(tkey) != "ok") tbad[su] = 1
+        else if (ratio_unc(ckey, tkey) > unc_max + 0) tbad[su] = 1
+        else { tsum[su] += log(med[tkey] / med[ckey]); tn[su]++ }
         for (mi = 1; mi <= nmode; mi++) {
             m = modelist[mi]
             dkey = b SUBSEP "dcdart" SUBSEP m
             gk = su SUBSEP m
+            # gate mean (DCDart / trap-matched C) -- the ADR-0059 gate quantity.
+            # A benchmark with no usable ctrap side refuses the WHOLE suite's
+            # gate mean: a mean over the benchmarks that happen to have a
+            # baseline is a different quantity from the one asked for.
+            if (!(dkey in have) || !(tkey in have)) gbad[gk] = 1
+            else if (cfg_status(tkey) != "ok" || cfg_status(dkey) != "ok") gbad[gk] = 1
+            else if (ratio_unc(tkey, dkey) > unc_max + 0) gbad[gk] = 1
+            else { gtsum[gk] += log(med[dkey] / med[tkey]); gtn[gk]++ }
+            # informational mean (DCDart / plain C), published alongside.
             if (!(dkey in have) || !(ckey in have)) { bad[gk] = 1; continue }
             if (cfg_status(ckey) != "ok" || cfg_status(dkey) != "ok") { bad[gk] = 1; continue }
             r = med[dkey] / med[ckey]
@@ -211,21 +233,30 @@ END {
     for (i = 0; i < ns; i++) {
         su = suites[i]
         printf "\n  suite: %s\n", su
+        print  "    gate quantity -- DCDart / trap-matched C (ADR-0059, bar <= 1.10x):"
         for (mi = 1; mi <= nmode; mi++) {
             m = modelist[mi]
             gk = su SUBSEP m
-            if ((gk in bad) || gn[gk] == 0) {
-                printf "    DCDart/%-10s : *** REFUSED *** (%d of %d benchmark ratios in this\n", \
-                    m, count_bad(su, m), count_all(su)
-                print  "                             suite were not measurable to the required"
-                print  "                             precision, or did not run. A geometric mean"
-                print  "                             over the survivors is a different quantity"
-                print  "                             from the one asked for, so it is not printed.)"
-            } else {
-                printf "    DCDart/%-10s : %.4fx   (geometric mean over %d benchmark%s)\n", \
-                    m, exp(gsum[gk] / gn[gk]), gn[gk], (gn[gk] == 1 ? "" : "s")
-            }
+            if ((gk in gbad) || gtn[gk] == 0)
+                refuse_mean("DCDart/" m, count_bad(su, m, "ctrap"), count_all(su))
+            else
+                mean_line("DCDart/" m, gtsum, gtn, gk)
         }
+        print  "    informational -- DCDart / plain C (includes trapping-arithmetic"
+        print  "    cost; published alongside the gate number, per ADR-0059):"
+        for (mi = 1; mi <= nmode; mi++) {
+            m = modelist[mi]
+            gk = su SUBSEP m
+            if ((gk in bad) || gn[gk] == 0)
+                refuse_mean("DCDart/" m, count_bad(su, m, "c"), count_all(su))
+            else
+                mean_line("DCDart/" m, gsum, gn, gk)
+        }
+        print  "    trapping-arithmetic cost -- trap-matched C / plain C:"
+        if ((su in tbad) || tn[su] == 0)
+            refuse_mean("Ctrap/C", count_bad_traps(su), count_all(su))
+        else
+            mean_line("Ctrap/C", tsum, tn, su)
     }
 
     # ---- harness self-test ---------------------------------------------
@@ -315,13 +346,31 @@ END {
         print "  *** NO GATE NUMBER IS PRODUCED BY THIS RUN. ***"
         print ""
         print "  ROADMAP.md M3's exit criterion is the geometric mean over THAT suite."
-        print "  The geometric means printed above are over the benchmarks that exist,"
-        print "  which are a harness self-test and a diagnostic. They measure the"
-        print "  harness and a microbenchmark. They are not evidence about the gate and"
-        print "  must not be quoted as if they were."
+        print "  The geometric means printed above are over the benchmarks that exist"
+        print "  and ran. Whatever they measure, they are not evidence about the gate"
+        print "  and must not be quoted as if they were."
     } else {
-        print "  Suite complete. The gate number is the geometric mean of the"
-        print "  RESIDUAL column (DCDart / trap-matched C) -- see THE BASELINE below."
+        print "  Suite complete. The gate number is the geometric mean of"
+        print "  DCDart / trap-matched C over this suite (ADR-0059) -- the gate"
+        print "  quantity under GEOMETRIC MEANS above, repeated here:"
+        for (mi = 1; mi <= nmode; mi++) {
+            m = modelist[mi]
+            gk = "m3" SUBSEP m
+            if ((gk in gbad) || gtn[gk] == 0) {
+                printf "    DCDart/%-10s : *** REFUSED *** -- a benchmark in the suite has no\n", m
+                print  "                             usable trap-matched C baseline or was not"
+                print  "                             measurable to the required precision (see"
+                print  "                             GEOMETRIC MEANS). No gate number is produced"
+                print  "                             for this mode."
+            } else {
+                g = exp(gtsum[gk] / gtn[gk])
+                printf "    DCDart/%-10s : %.4fx vs trap-matched C -- %s the <= 1.10x bar\n", \
+                    m, g, (g <= 1.10 ? "WITHIN" : "OVER")
+            }
+        }
+        print ""
+        print "  The DCDart / plain-C mean and the trapping-cost mean are published"
+        print "  alongside it above, per ADR-0059. Neither is the gate number."
     }
 
     print ""
@@ -427,18 +476,47 @@ function count_all(su,   i, c) {
     return c
 }
 
-function count_bad(su, m,   i, c, b, ckey, dkey, u) {
+function count_bad(su, m, base,   i, c, b, bkey, dkey, u) {
+    c = 0
+    for (i = 0; i < nb; i++) {
+        b = order[i]
+        if (suite[b] != su) continue
+        if (b in failed) { c++; continue }
+        bkey = b SUBSEP base SUBSEP "-"
+        dkey = b SUBSEP "dcdart" SUBSEP m
+        if (!(dkey in have) || !(bkey in have)) { c++; continue }
+        if (cfg_status(bkey) != "ok" || cfg_status(dkey) != "ok") { c++; continue }
+        u = ratio_unc(bkey, dkey)
+        if (u > unc_max + 0) c++
+    }
+    return c
+}
+
+function count_bad_traps(su,   i, c, b, ckey, tkey) {
     c = 0
     for (i = 0; i < nb; i++) {
         b = order[i]
         if (suite[b] != su) continue
         if (b in failed) { c++; continue }
         ckey = b SUBSEP "c" SUBSEP "-"
-        dkey = b SUBSEP "dcdart" SUBSEP m
-        if (!(dkey in have) || !(ckey in have)) { c++; continue }
-        if (cfg_status(ckey) != "ok" || cfg_status(dkey) != "ok") { c++; continue }
-        u = ratio_unc(ckey, dkey)
-        if (u > unc_max + 0) c++
+        tkey = b SUBSEP "ctrap" SUBSEP "-"
+        if (!(tkey in have) || !(ckey in have)) { c++; continue }
+        if (cfg_status(ckey) != "ok" || cfg_status(tkey) != "ok") { c++; continue }
+        if (ratio_unc(ckey, tkey) > unc_max + 0) c++
     }
     return c
+}
+
+function mean_line(label, sum, n, gk) {
+    printf "      %-16s : %.4fx   (geometric mean over %d benchmark%s)\n", \
+        label, exp(sum[gk] / n[gk]), n[gk], (n[gk] == 1 ? "" : "s")
+}
+
+function refuse_mean(label, nbad, nall) {
+    printf "      %-16s : *** REFUSED *** (%d of %d benchmark ratios in this\n", label, nbad, nall
+    print  "                         suite were not measurable to the required"
+    print  "                         precision, lacked a required baseline, or did"
+    print  "                         not run. A geometric mean over the survivors"
+    print  "                         is a different quantity from the one asked"
+    print  "                         for, so it is not printed.)"
 }

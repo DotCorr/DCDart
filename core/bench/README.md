@@ -22,8 +22,8 @@ table as a pointer to that one, not as a second source of truth.
 
 | M3 benchmark | id | Exists? | Status |
 |---|---|---|---|
-| hashmap-heavy workload | `hashmap` | **no** | **unblocked, unwritten.** Generic classes were the blocker (GAP-0040) and closed 2026-08-26 with ADR-0054. The remaining work is writing a `Map<K,V>` and a workload over it |
-| tree/graph traversal | `tree-traversal` | **no** | **unblocked, unwritten.** The fixed 64-slot arena was the blocker and has been replaced by a size-class heap. `weak`/`unowned` back-edges exist. This is the shortest path to the first real M3 data point |
+| hashmap-heavy workload | `hashmap` | **YES** | **written** (ADR-0061). Two phases: `hashmap` is phase B (churn) and is the gate input; `hashmap-burst` is phase A and is a `diagnostic` that enters no mean. It was NOT as unblocked as this table said: a bucket ARRAY is inexpressible (GAP-0061, escalation 0010), so both sides index 1024 buckets with a depth-10 binary trie and `index-tax/` prices that workaround on the C side |
+| tree/graph traversal | `tree-traversal` | **YES** | **written.** Builds, walks and drops a 16,383-node binary tree per round. **2026-08-27: C baseline rewritten from malloc-per-node to a static arena pool** — the malloc baseline was ~5× slower than natural C for this workload (burst-allocate, wholesale drop) and produced DCDart at **0.45× C** (2.2× *faster* than C), an allocator artifact, not an ARC result. Against the arena baseline the same DCDart binary measures **2.372× ±0.6% vs plain C, 2.34× vs trap-matched C** (gate quantity; atomic mode 3.06×/3.01×; traps cost ≈1.01× here — pointer-chasing hides the checks), so the ratio now prices ARC + the ADR-0058 heap, not macOS malloc's bookkeeping. `BENCH_ARG` raised 400→1200 to keep the 5×-faster C kernel well above the 25 ms floor. Details in the benchmark's `BENCH_NOTE` |
 | JSON parser | `json` | **no** | **blocked**: owning `String`/`StrBuf` (GAP-0045, itself blocked on spec §12 decision 2, the allocator). `Str` is a *borrowed* slice — you can read and slice text, not build it (ADR-0053) |
 | string-processing pass | `string-pass` | **no** | **blocked**: same as `json`. No concatenation, no formatting, no comparison beyond bytes |
 | closure-heavy functional workload | `closure-heavy` | **no** | **blocked**: non-capturing local functions hoist to static symbols (ADR-0057), but *capturing* closures and closures-as-values do not exist (GAP-0052, escalation 0008). A functional workload is made of closures that are passed, not named |
@@ -47,6 +47,7 @@ belief about where it stands.
 | `fib` | `selftest` | naive recursive fibonacci. Call-heavy, zero heap, zero ARC |
 | `collatz` | `selftest` | sum of Collatz step counts. Loop-heavy, zero heap, zero ARC |
 | `arc-churn` | `diagnostic` | one heap object allocated and released per iteration |
+| `hashmap-burst` | `diagnostic` | phase A of the `hashmap` pair: the same work, batched instead of interleaved. Excluded from every mean by design -- see ADR-0061 |
 
 The two `selftest` benchmarks exist to prove the **harness** works, not to
 prove anything about DCDart. `arc-churn` is a microbenchmark that exists to
@@ -167,7 +168,7 @@ Adding a benchmark means adding a directory under `benchmarks/` with:
 | `manifest.sh` | yes | `BENCH_ID`, `BENCH_DESC`, `BENCH_SUITE`, `BENCH_ARG`, `BENCH_NOTE` |
 | `bench.dart` | yes | DCDart, exporting `@bare u64 benchKernel(u64)` |
 | `kernel.c` | yes | idiomatic C, exporting `uint64_t benchKernel(uint64_t)` |
-| `kernel_trapck.c` | no | the same C with DCDart's trapping arithmetic (§4) |
+| `kernel_trapck.c` | no (but without it the suite's gate geomean is REFUSED — ADR-0059) | the same C with DCDart's trapping arithmetic (§4) |
 | `bench_aot.dart` | no | stock Dart, printing the same `SAMPLE_NS`/`CHECKSUM` protocol |
 
 Size `BENCH_ARG` so one iteration takes 50–200 ms.
@@ -386,12 +387,13 @@ to DCDart's, because a trapping add is not an accumulator it will hoist.
 Compiling the *same C source* with `__builtin_add_overflow`/`__builtin_trap`
 reproduces DCDart's machine code shape exactly — two `bl`s, no loop.
 
-So each benchmark may carry an optional second C baseline,
-`kernel_trapck.c`, built on `harness/trapping.h`. It is a **diagnostic
-baseline only**; the gate stays stated against idiomatic `kernel.c`, because
-"the same algorithm in C" does not hand-roll overflow checks. What it buys is
-that the report can **attribute** a gap instead of leaving the reader to
-guess:
+So each benchmark may carry a second C baseline, `kernel_trapck.c`, built on
+`harness/trapping.h`. Since ADR-0059 it is the **gate baseline**: the M3 gate
+number is the geometric mean of DCDart / trap-matched C, and the
+trapping-arithmetic cost (Ctrap/C) is published alongside it as its own
+separate number — plain `kernel.c` stays in the report as the informational
+baseline. The second baseline also lets the report **attribute** a gap
+instead of leaving the reader to guess:
 
 ```
 benchmark   traps cost (Ctrap/C)   residual (DCDart/Ctrap)   total (DCDart/C)
@@ -409,12 +411,15 @@ driver, one flag list and one link step, the checksums match, and DCDart is
 still slower than plain C, so there is no mechanism by which the harness could
 be flattering DCDart.
 
-**When the M3 suite becomes writable, this asymmetry does not go away.** The
-gate number will include the cost of trapping arithmetic. That is arguably
-correct — it is a real cost of the language as specified — but it should be a
-decision someone makes, not a surprise found while reading a failing gate.
-`spec §4.1` (the integer model) is on the same `CLAUDE.md` rule-4 freeze list
-as §3.
+**When the M3 suite becomes writable, this asymmetry does not go away — and
+the decision it called for has been made.** ADR-0059: the gate number is
+stated against trap-matched C, so it does **not** contain the cost of
+trapping arithmetic; that cost is measured and published alongside it as a
+separate deliverable. A benchmark without a usable `kernel_trapck.c` makes
+its suite's gate geometric mean `REFUSED` — no baseline, no gate number.
+Whether trapping arithmetic at 25–50% on integer-heavy code is a price the
+language keeps paying is a `spec §4.1` (integer model) question, on the same
+`CLAUDE.md` rule-4 freeze list as §3.
 
 ---
 

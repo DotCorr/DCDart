@@ -31,21 +31,25 @@
 // proof).
 //
 // Scope, deliberately conservative:
-//   1. Single basic block only. No cross-block tracking -- a block
-//      boundary means the value might flow into a path this pass can't
-//      see all of (DC-IR block params, ADR-0012), so a retain that
-//      hasn't been matched by the time a block ends is left alone.
-//   2. A `Call` instruction invalidates every pending retain, EXCEPT one
-//      matching an argument the call fully consumes (`Call.argOwnership`,
-//      docs/decisions/0031-move-semantics.md, spec §3.2 pass 4) -- see
-//      that ADR for why this specific case is provably safe and every
-//      other `Call` argument still isn't (the callee could retain,
-//      release, or store a BORROWED reference anywhere; nothing here does
-//      interprocedural analysis to rule that out -- ADR-0025's own worked
-//      example of exactly this ambiguity, m2-owned's makeAndDropViaCall,
-//      is what motivated adding the ownership tag rather than assuming).
-//      A pending retain that survives this way is tracked more strictly
-//      than an ordinary one, below.
+//   1. Per-block matching first; then ADR-0066 rule F's cross-block
+//      FRONTIER pass (`_elideCrossBlock`) extends it to a retain whose
+//      matching release sits on every path out of its block -- refusing
+//      on back edges, missing dominance, or anything opaque in between.
+//      A retain neither pass can match is left alone.
+//   2. A `Call` instruction invalidates every pending retain, EXCEPT (a)
+//      one matching an argument the call fully consumes
+//      (`Call.argOwnership`, docs/decisions/0031-move-semantics.md, spec
+//      §3.2 pass 4 -- see that ADR for why this specific case is provably
+//      safe; a pending retain that survives this way is tracked more
+//      strictly than an ordinary one, below), and (b) ALL ordinary
+//      pending retains when the callee is in the module's
+//      REFCOUNT-TRANSPARENT set (ADR-0066 rule T,
+//      `computeRefcountTransparentCallees`: proven, transitively, to
+//      contain only per-vid-covered releases -- so it can never decrement
+//      any object below its call-entry count). Every other call is as
+//      opaque as ever: the callee could release a borrowed reference's
+//      object, and m2-owned's makeAndDropViaCall is ADR-0025's own worked
+//      example of exactly that ambiguity.
 //   3. `MakeWeak`/`WeakLoad`/`DropWeak` ALSO invalidate every pending
 //      retain, even though they operate on a DIFFERENT DCValue (a
 //      DCWeakPointer, not the DCHeapPointer a pending retain tracks).
@@ -107,28 +111,301 @@ import 'package:dc_ir/dc_ir.dart';
 class ElisionStats {
   int elided = 0;
   int crossBlockElided = 0;
+  int nullElided = 0;
   int blockLimited = 0;
   int opaqueLimited = 0;
   int releaseLimited = 0;
 
   @override
   String toString() =>
-      'elided=$elided crossBlock=$crossBlockElided blockLimited=$blockLimited '
+      'elided=$elided crossBlock=$crossBlockElided nullOps=$nullElided '
+      'blockLimited=$blockLimited '
       'opaqueLimited=$opaqueLimited releaseLimited=$releaseLimited';
 }
 
 DCFunction elideRedundantRetainReleasePairs(
   DCFunction function, [
   ElisionStats? stats,
+  Set<String> transparentCallees = const <String>{},
 ]) {
+  final noNullOps = _elideNullArcOps(function, stats);
   final perBlock = DCFunction(
+    linkName: noNullOps.linkName,
+    paramTypes: noNullOps.paramTypes,
+    returnType: noNullOps.returnType,
+    mode: noNullOps.mode,
+    blocks:
+        noNullOps.blocks.map((b) => _elideBlock(b, stats, transparentCallees)).toList(),
+  );
+  return _elideCrossBlock(perBlock, stats, transparentCallees);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0066 rule N: ARC ops on a statically-null value are runtime no-ops.
+// ---------------------------------------------------------------------------
+
+/// Deletes every `Retain`/`Release` whose object is defined by a `NullRef`
+/// in the same function.
+///
+/// SAFETY ARGUMENT. A `NullRef` defines a constant null, and SSA means the
+/// value can never be anything else. `dc_retain(null)` and `dc_release(null)`
+/// are DEFINED no-ops (ADR-0049: the backend emits an explicit null test
+/// before touching the header, precisely so nullable references are legal to
+/// retain/release). Removing an instruction that provably does nothing at
+/// runtime changes no refcount, ever. The rule matches on the DEFINITION, not
+/// on the type or a dataflow guess: a block PARAMETER that happens to be null
+/// on one path (`Branch b1(vNull)`) is NOT matched -- its retain is dynamic
+/// and must survive. That refusal is the negative test.
+///
+/// Why it is worth having: dcc-lower stores `null` into every reference field
+/// a constructor initializes to null, and each such store emits a
+/// `Retain <NullRef>`. On linked-structure code that is a large share of all
+/// lowered retains (json's parseNumber: 6 of 6), and each one costs a real
+/// call-shaped null-check-and-branch at runtime.
+DCFunction _elideNullArcOps(DCFunction function, ElisionStats? stats) {
+  final nullVids = <int>{};
+  for (final block in function.blocks) {
+    for (final instruction in block.body) {
+      if (instruction is NullRef) nullVids.add(instruction.dest.id.index);
+    }
+  }
+  if (nullVids.isEmpty) return function;
+
+  var dropped = 0;
+  final blocks = <DCBasicBlock>[];
+  for (final block in function.blocks) {
+    final body = <DCInstruction>[];
+    for (final instruction in block.body) {
+      final isNullArcOp = (instruction is Retain &&
+              nullVids.contains(instruction.object.id.index)) ||
+          (instruction is Release &&
+              nullVids.contains(instruction.object.id.index));
+      if (isNullArcOp) {
+        dropped++;
+        continue;
+      }
+      body.add(instruction);
+    }
+    blocks.add(DCBasicBlock(id: block.id, params: block.params, body: body));
+  }
+  if (dropped == 0) return function;
+  stats?.nullElided += dropped;
+  return DCFunction(
     linkName: function.linkName,
     paramTypes: function.paramTypes,
     returnType: function.returnType,
     mode: function.mode,
-    blocks: function.blocks.map((b) => _elideBlock(b, stats)).toList(),
+    blocks: blocks,
   );
-  return _elideCrossBlock(perBlock, stats);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0066 rule T: refcount-transparent callees ("borrows-only" summary).
+// ---------------------------------------------------------------------------
+
+/// Computes the set of functions in [functions] that are REFCOUNT-
+/// TRANSPARENT: calling one can never decrement any object's strong count
+/// below its value at the moment of the call. A pending retain may be
+/// carried across a `Call` to a member of this set (per-block AND
+/// cross-block), because the whole safety argument of this pass -- "inside
+/// an elided pair's interval, the transformed program decrements nothing"
+/// (ADR-0063) -- survives such a call unchanged.
+///
+/// A function qualifies iff ALL of:
+///
+///   1. Its body has no weak op (`MakeWeak`/`WeakLoad`/`DropWeak`) and no
+///      `IndirectCall` (no summary exists for a value-typed callee).
+///   2. Every `Release` in it is COVERED: for every ValueId, along every
+///      path, the running (#Retain - #Release) balance for that exact vid
+///      never goes negative. A covered release only ever undoes an increment
+///      the function itself performed on the SAME SSA value -- so per object,
+///      the count never dips below its call-entry value, and (since a live
+///      object enters at >= 1 and a covering retain precedes each release)
+///      never reaches zero inside the callee. No destructor can therefore
+///      fire from inside a qualifying function, which closes the "release
+///      triggers a hidden destructor cascade" hole without a call edge to
+///      the destructor existing anywhere in DC-IR.
+///   3. Every direct `Call` targets a function in the module that itself
+///      qualifies (transitively). A call to a symbol with no body here (an
+///      extern) disqualifies.
+///
+/// Condition 2 is checked per-vid, NOT per-object: two vids can alias the
+/// same object (ADR-0017), but a cover on the SAME vid is a fortiori the same
+/// object, so per-vid coverage is strictly conservative. The field-overwrite
+/// shape (`Store p <- new; Release old`) releases a vid with no prior retain
+/// of that vid and correctly disqualifies -- `tinsert`/`unlinkFrom` in the
+/// hashmap benchmark genuinely CAN free an object a caller is holding, and
+/// they must stay opaque (that is this rule's own GAP-0054 test).
+///
+/// Recursion is handled as bad-REACHABILITY, not as an inductive proof
+/// obligation: a function is disqualified iff a disqualifying instruction is
+/// reachable from it in the module call graph. A self-recursive function with
+/// only covered releases (json's `walk`, hashmap's `tlookup`) qualifies,
+/// which is exactly the case the M3 gate needs.
+///
+/// The summary is computed on PRE-elision IR and remains valid for the
+/// POST-elision module: elision deletes only (a) provably-paired
+/// retain/release intervals -- inside which the transformed count sits
+/// exactly one below the original, which condition 2 already keeps at or
+/// above entry+1 -- and (b) null no-ops. See ADR-0066 for the full argument.
+Set<String> computeRefcountTransparentCallees(List<DCFunction> functions) {
+  final byName = <String, DCFunction>{
+    for (final f in functions) f.linkName: f,
+  };
+
+  // Pass 1: local verdicts + call edges.
+  final locallyBad = <String>{};
+  final callees = <String, Set<String>>{};
+  for (final f in functions) {
+    final targets = <String>{};
+    var bad = false;
+    for (final block in f.blocks) {
+      for (final instruction in block.body) {
+        if (instruction is MakeWeak ||
+            instruction is WeakLoad ||
+            instruction is DropWeak ||
+            instruction is IndirectCall) {
+          bad = true;
+        } else if (instruction is Call) {
+          targets.add(instruction.targetName);
+        }
+      }
+    }
+    if (!bad && !_allReleasesCovered(f)) bad = true;
+    if (bad) locallyBad.add(f.linkName);
+    callees[f.linkName] = targets;
+  }
+
+  // Pass 2: propagate badness backwards over the call graph to a fixpoint.
+  final callers = <String, Set<String>>{};
+  for (final entry in callees.entries) {
+    for (final t in entry.value) {
+      (callers[t] ??= <String>{}).add(entry.key);
+      if (!byName.containsKey(t)) locallyBad.add(entry.key); // extern callee
+    }
+  }
+  final worklist = List<String>.of(locallyBad);
+  final bad = Set<String>.of(locallyBad);
+  while (worklist.isNotEmpty) {
+    final b = worklist.removeLast();
+    for (final caller in callers[b] ?? const <String>{}) {
+      if (bad.add(caller)) worklist.add(caller);
+    }
+  }
+
+  return {
+    for (final f in functions)
+      if (!bad.contains(f.linkName)) f.linkName,
+  };
+}
+
+/// Condition 2 of [computeRefcountTransparentCallees]: for every ValueId,
+/// along every path, the running per-vid (#Retain - #Release) balance never
+/// goes negative.
+///
+/// A forward dataflow over blocks. Per block and vid: the net `delta` and the
+/// lowest prefix value `minPrefix` inside the block. The lower bound of the
+/// balance at block entry is the min over predecessors of (their entry bound
+/// + their delta), starting from 0 at function entry (meet = min is exact for
+/// "can any path make it negative"). The check is
+/// `entryBound + minPrefix >= 0` everywhere. A back-edge cycle with net
+/// negative delta drives the bound down forever; the iteration cap converts
+/// that into a refusal rather than a spin.
+bool _allReleasesCovered(DCFunction function) {
+  final blocks = function.blocks;
+  final indexOfBlock = <int, int>{};
+  for (var i = 0; i < blocks.length; i++) {
+    indexOfBlock[blocks[i].id.index] = i;
+  }
+
+  // Which vids have ARC traffic at all -- everything else can be ignored.
+  final delta = List<Map<int, int>>.generate(blocks.length, (_) => <int, int>{});
+  final minPrefix =
+      List<Map<int, int>>.generate(blocks.length, (_) => <int, int>{});
+  final arcVids = <int>{};
+  for (var i = 0; i < blocks.length; i++) {
+    final running = <int, int>{};
+    for (final instruction in blocks[i].body) {
+      int? vid;
+      int step = 0;
+      if (instruction is Retain) {
+        vid = instruction.object.id.index;
+        step = 1;
+      } else if (instruction is Release) {
+        vid = instruction.object.id.index;
+        step = -1;
+      }
+      if (vid == null) continue;
+      arcVids.add(vid);
+      final now = (running[vid] ?? 0) + step;
+      running[vid] = now;
+      final low = minPrefix[i][vid];
+      if (low == null || now < low) minPrefix[i][vid] = now;
+    }
+    delta[i] = running;
+  }
+  if (arcVids.isEmpty) return true;
+
+  final successors = List<List<int>>.generate(blocks.length, (_) => <int>[]);
+  for (var i = 0; i < blocks.length; i++) {
+    final body = blocks[i].body;
+    if (body.isEmpty) continue;
+    final term = body.last;
+    final targets = <int>[];
+    if (term is Branch) {
+      targets.add(term.target.index);
+    } else if (term is CondBranch) {
+      targets..add(term.trueTarget.index)..add(term.falseTarget.index);
+    }
+    for (final t in targets) {
+      final ti = indexOfBlock[t];
+      if (ti == null) return false; // malformed; refuse
+      successors[i].add(ti);
+    }
+  }
+
+  // entryBound[b][vid], missing = "not yet reached" (top). Entry block: 0.
+  final entryBound = List<Map<int, int>?>.generate(blocks.length, (_) => null);
+  entryBound[0] = {for (final v in arcVids) v: 0};
+  var changed = true;
+  var rounds = 0;
+  final maxRounds = blocks.length * 4 + 16;
+  while (changed) {
+    if (++rounds > maxRounds) return false; // net-negative cycle: refuse
+    changed = false;
+    for (var i = 0; i < blocks.length; i++) {
+      final inBound = entryBound[i];
+      if (inBound == null) continue;
+      for (final s in successors[i]) {
+        final out = <int, int>{
+          for (final v in arcVids) v: (inBound[v] ?? 0) + (delta[i][v] ?? 0),
+        };
+        final existing = entryBound[s];
+        if (existing == null) {
+          entryBound[s] = out;
+          changed = true;
+        } else {
+          for (final v in arcVids) {
+            final candidate = out[v] ?? 0;
+            final current = existing[v] ?? 0;
+            if (candidate < current) {
+              existing[v] = candidate;
+              changed = true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for (var i = 0; i < blocks.length; i++) {
+    final inBound = entryBound[i];
+    if (inBound == null) continue; // unreachable block: nothing executes
+    for (final entry in minPrefix[i].entries) {
+      if ((inBound[entry.key] ?? 0) + entry.value < 0) return false;
+    }
+  }
+  return true;
 }
 
 /// Does [instruction] make it unsafe to carry a pending retain past it?
@@ -136,14 +413,25 @@ DCFunction elideRedundantRetainReleasePairs(
 /// Exactly the file header's rules 2-4, in one place so the cross-block pass
 /// and the per-block pass cannot drift apart on what "opaque" means. The ONLY
 /// three ways a refcount can go down are an executed `Release`, an opaque
-/// callee, and a weak op.
-bool _isOpaqueForPendingRetain(DCInstruction instruction) =>
-    instruction is Call ||
-    instruction is IndirectCall ||
-    instruction is MakeWeak ||
-    instruction is WeakLoad ||
-    instruction is DropWeak ||
-    instruction is Release;
+/// callee, and a weak op. A direct `Call` to a refcount-transparent callee
+/// (ADR-0066 rule T) is proven to be none of the three, so it does not
+/// count -- UNLESS it consumes an `@owned` argument, in which case the
+/// cross-block walk refuses (the per-block pass has its own, stricter
+/// `callConsumed` machinery for that case; the walk does not).
+bool _isOpaqueForPendingRetain(
+  DCInstruction instruction,
+  Set<String> transparentCallees,
+) {
+  if (instruction is Call) {
+    return !transparentCallees.contains(instruction.targetName) ||
+        instruction.argOwnership.contains(true);
+  }
+  return instruction is IndirectCall ||
+      instruction is MakeWeak ||
+      instruction is WeakLoad ||
+      instruction is DropWeak ||
+      instruction is Release;
+}
 
 /// Cross-block redundant-pair removal, restricted to a shape that can be
 /// checked without a full dataflow framework (GAP-0062).
@@ -155,30 +443,56 @@ bool _isOpaqueForPendingRetain(DCInstruction instruction) =>
 /// smaller than the pairs it is matching. Measured before this pass:
 /// `json` 19 retains lowered, 19 survive.
 ///
-/// THE SAFETY ARGUMENT, which is the whole of this function. A `Retain` in
-/// block A and a `Release` in block Z may be cancelled only if BOTH execute
-/// exactly once per call and nothing between them can decrement the count.
-/// That is established here by four conditions, each cheap to check and each
-/// refusing rather than approximating:
+/// THE SAFETY ARGUMENT (ADR-0066 rule F, superseding ADR-0025's single-exit
+/// form). A `Retain` of `v` in block A is cancelled against a FRONTIER of
+/// `Release v` instructions -- one release on every path leaving the retain
+/// -- when all of the following hold, each refusing rather than
+/// approximating:
 ///
-///   1. NO BACK EDGES. Every branch target has a strictly greater index than
-///      its source, so no instruction executes twice. Without this a retain
-///      inside a loop pairs with one release outside it -- N retains, one
-///      release -- and cancelling them would under-release.
-///   2. EXACTLY ONE `Return` BLOCK, called Z. All paths therefore end at Z,
-///      so a `Release` in Z executes on every path.
-///   3. A DOMINATES Z. The retain's block is on every path to Z, so the
-///      retain also executes on every path. Condition 2 alone is NOT enough:
-///      a retain in a conditional arm with a release in the merge block would
-///      execute zero-or-one times against a release that always executes, and
-///      cancelling that pair deletes a release the other path needed.
-///   4. NOTHING OPAQUE IN BETWEEN, over a deliberate SUPERSET of the blocks
-///      on any A->Z path: every block whose index lies between them, plus the
-///      tail of A after the retain and the head of Z before the release. A
-///      superset can only refuse a safe elision, never permit an unsafe one.
+///   1. NO BACK EDGES anywhere in the function: every branch target has a
+///      strictly greater index than its source, so every block executes at
+///      most once per call. Without this a retain inside a loop pairs with
+///      one release outside it -- N retains, one release -- and cancelling
+///      them would under-release.
+///   2. EVERY PATH from the retain reaches exactly one frontier member
+///      before anything that could decrement a refcount. Established by a
+///      forward walk from the instruction after the retain: the walk STOPS
+///      a path at the first unclaimed `Release v` (that release joins the
+///      frontier) and FAILS the whole candidate on any of -- a `Retain v`
+///      (ambiguous pairing), anything opaque (`_isOpaqueForPendingRetain`:
+///      a surviving `Release` of ANY other value per ADR-0063, a
+///      non-transparent or owned-consuming `Call`, any `IndirectCall` or
+///      weak op), or a `Return` reached with no release (a path that would
+///      leak). Instructions already CLAIMED by a previously-accepted pair
+///      are skipped: they are deleted, so they never execute (same
+///      reasoning as the per-block pass's deleted-release rule).
+///   3. A DOMINATES every frontier block. Every execution of a frontier
+///      release was therefore preceded by this retain -- no path can lose a
+///      release without also having lost the retain. (The retain's own
+///      block executing implies the retain executed: blocks are
+///      straight-line.)
+///   4. NO FRONTIER MEMBER REACHES ANOTHER. If one frontier block could
+///      flow into a second, a single execution would shed one retain and
+///      TWO releases -- an over-release avoided by refusing outright. (In
+///      the shapes this pass exists for, frontier blocks end in `Return`,
+///      so the check is trivially met; it is still checked.)
 ///
-/// A function failing any of 1-3 is left entirely to the per-block pass.
-DCFunction _elideCrossBlock(DCFunction function, ElisionStats? stats) {
+/// With 1-4, each execution through the retain deletes exactly one retain
+/// and exactly one release, and inside the deleted interval the transformed
+/// program performs no decrement of anything -- so ADR-0063's gap invariant
+/// (counts agree at boundaries, only rise inside, boundary >= 1) holds
+/// verbatim, per path.
+///
+/// Compared to the ADR-0025 version this replaces: multiple `Return` blocks
+/// are handled (the frontier), opacity is checked over exactly the blocks
+/// REACHABLE from the retain rather than an index-range superset, and a
+/// direct call to a refcount-transparent callee (rule T) is not opaque.
+/// Everything the old form accepted, this form accepts.
+DCFunction _elideCrossBlock(
+  DCFunction function,
+  ElisionStats? stats,
+  Set<String> transparentCallees,
+) {
   final blocks = function.blocks;
   if (blocks.length < 2) return function;
 
@@ -206,18 +520,8 @@ DCFunction _elideCrossBlock(DCFunction function, ElisionStats? stats) {
     }
   }
 
-  // Condition 2: exactly one block containing a Return.
-  var exitIndex = -1;
-  for (var i = 0; i < blocks.length; i++) {
-    if (blocks[i].body.any((x) => x is Return)) {
-      if (exitIndex != -1) return function; // more than one exit
-      exitIndex = i;
-    }
-  }
-  if (exitIndex < 0) return function;
-
-  // Condition 3: dominators, over a DAG already in topological order, so one
-  // forward sweep suffices -- no fixpoint iteration needed.
+  // Dominators, over a DAG already in topological order, so one forward
+  // sweep suffices -- no fixpoint iteration needed.
   final preds = List<List<int>>.generate(blocks.length, (_) => <int>[]);
   for (var i = 0; i < blocks.length; i++) {
     for (final sIdx in successors[i]) {
@@ -237,71 +541,110 @@ DCFunction _elideCrossBlock(DCFunction function, ElisionStats? stats) {
     }
     dom[i] = (acc ?? <int>{})..add(i);
   }
-  final domOfExit = dom[exitIndex];
 
-  // Collect candidate pairs: a Retain in a block dominating the exit, and a
-  // Release of the same value in the exit block.
   final removeFrom = <int, Set<int>>{}; // block index -> instruction indices
-  final exitBody = blocks[exitIndex].body;
+  bool isClaimed(int b, int k) => removeFrom[b]?.contains(k) ?? false;
 
-  for (var a = 0; a < blocks.length; a++) {
-    if (a == exitIndex) continue; // same-block case is the per-block pass's
-    if (!domOfExit.contains(a)) continue;
-    final aBody = blocks[a].body;
-    for (var ai = 0; ai < aBody.length; ai++) {
-      final r = aBody[ai];
-      if (r is! Retain) continue;
-      final vid = r.object.id.index;
+  // Scan one block for the walk of condition 2, starting at [from].
+  // Returns null on failure; otherwise the frontier release's index in this
+  // block (or -1, meaning "clean through -- continue into successors").
+  int? scanBlock(int b, int from, int vid) {
+    final body = blocks[b].body;
+    for (var k = from; k < body.length; k++) {
+      final x = body[k];
+      if (isClaimed(b, k)) continue; // deleted: never executes
+      if (x is Release && x.object.id.index == vid) return k;
+      if (x is Retain && x.object.id.index == vid) return null;
+      if (x is Return) return null; // path ends with no release: refuse
+      if (_isOpaqueForPendingRetain(x, transparentCallees)) return null;
+    }
+    return -1;
+  }
 
-      // The matching Release in the exit block: the FIRST one on this value.
-      var zi = -1;
-      for (var k = 0; k < exitBody.length; k++) {
-        final x = exitBody[k];
-        if (x is Release && x.object.id.index == vid) {
-          zi = k;
-          break;
+  // Process retains in block order, restarting after every accepted pair so
+  // later walks see the newly-claimed (hence non-executing) instructions.
+  // Terminates: each acceptance strictly grows the claimed set.
+  var changedAny = true;
+  while (changedAny) {
+    changedAny = false;
+    for (var a = 0; a < blocks.length && !changedAny; a++) {
+      final aBody = blocks[a].body;
+      for (var ai = 0; ai < aBody.length && !changedAny; ai++) {
+        final r = aBody[ai];
+        if (r is! Retain || isClaimed(a, ai)) continue;
+        final vid = r.object.id.index;
+
+        // Condition 2: the forward walk. `frontier` maps block index ->
+        // release instruction index; `visited` memoizes full-block scans
+        // (every continuation enters a block at index 0, so one scan per
+        // block is exact, not an approximation).
+        final frontier = <int, int>{};
+        final visited = <int>{};
+        var ok = true;
+        final first = scanBlock(a, ai + 1, vid);
+        if (first == null) continue; // failed in A itself
+        final work = <int>[];
+        if (first >= 0) {
+          frontier[a] = first;
+        } else {
+          work.addAll(successors[a]);
+          if (successors[a].isEmpty) continue; // fell off A with no release
         }
-      }
-      if (zi < 0) continue;
+        while (ok && work.isNotEmpty) {
+          final b = work.removeLast();
+          if (!visited.add(b)) continue;
+          final hit = scanBlock(b, 0, vid);
+          if (hit == null) {
+            ok = false;
+          } else if (hit >= 0) {
+            frontier[b] = hit;
+          } else {
+            if (successors[b].isEmpty) {
+              ok = false; // no terminator successor and no release: refuse
+            } else {
+              work.addAll(successors[b]);
+            }
+          }
+        }
+        if (!ok || frontier.isEmpty) continue;
 
-      // Condition 4, over the superset.
-      var safe = true;
-      for (var k = ai + 1; k < aBody.length && safe; k++) {
-        if (_isOpaqueForPendingRetain(aBody[k])) safe = false;
-      }
-      for (var b = a + 1; b < exitIndex && safe; b++) {
-        for (final x in blocks[b].body) {
-          if (_isOpaqueForPendingRetain(x)) {
-            safe = false;
+        // Condition 3: A dominates every frontier block.
+        var dominated = true;
+        for (final z in frontier.keys) {
+          if (z != a && !dom[z].contains(a)) {
+            dominated = false;
             break;
           }
         }
-      }
-      for (var k = 0; k < zi && safe; k++) {
-        if (_isOpaqueForPendingRetain(exitBody[k])) safe = false;
-      }
-      // A second Retain on the same value anywhere between would make the
-      // pairing ambiguous; refuse rather than guess which release matches.
-      if (safe) {
-        for (var b = a; b <= exitIndex && safe; b++) {
-          final body = blocks[b].body;
-          for (var k = 0; k < body.length; k++) {
-            if (b == a && k <= ai) continue;
-            final x = body[k];
-            if (x is Retain && x.object.id.index == vid) safe = false;
+        if (!dominated) continue;
+
+        // Condition 4: no frontier block reaches another frontier block.
+        var disjoint = true;
+        for (final z in frontier.keys) {
+          final reach = <int>{};
+          final stack = [...successors[z]];
+          while (stack.isNotEmpty) {
+            final n = stack.removeLast();
+            if (reach.add(n)) stack.addAll(successors[n]);
           }
+          for (final other in frontier.keys) {
+            if (other != z && reach.contains(other)) {
+              disjoint = false;
+              break;
+            }
+          }
+          if (!disjoint) break;
         }
+        if (!disjoint) continue;
+
+        // Accept: claim the retain and every frontier release.
+        (removeFrom[a] ??= <int>{}).add(ai);
+        for (final entry in frontier.entries) {
+          (removeFrom[entry.key] ??= <int>{}).add(entry.value);
+        }
+        stats?.crossBlockElided += 1;
+        changedAny = true;
       }
-      if (!safe) continue;
-
-      // Do not double-claim a Release already matched by an earlier retain.
-      final exitClaimed = removeFrom[exitIndex] ?? <int>{};
-      if (exitClaimed.contains(zi)) continue;
-
-      (removeFrom[a] ??= <int>{}).add(ai);
-      (removeFrom[exitIndex] ??= <int>{}).add(zi);
-      stats?.crossBlockElided += 1;
-      break; // one pair per retain
     }
   }
 
@@ -325,7 +668,11 @@ DCFunction _elideCrossBlock(DCFunction function, ElisionStats? stats) {
   );
 }
 
-DCBasicBlock _elideBlock(DCBasicBlock block, [ElisionStats? stats]) {
+DCBasicBlock _elideBlock(
+  DCBasicBlock block, [
+  ElisionStats? stats,
+  Set<String> transparentCallees = const <String>{},
+]) {
   // pendingRetain[valueId] = index into `kept` of an as-yet-unmatched
   // Retain on that value (or absent if none is currently pending).
   final pendingRetain = <int, int>{};
@@ -455,13 +802,25 @@ DCBasicBlock _elideBlock(DCBasicBlock block, [ElisionStats? stats]) {
           kept.add(instruction);
         }
       case Call():
-        stats?.opaqueLimited += pendingRetain.length;
-        _invalidateAcrossCall(
+        // (ADR-0066 rule T) A direct call to a refcount-transparent callee
+        // is proven unable to decrement ANY object's count below its value
+        // at the call -- so, uniquely among calls, it is safe to carry every
+        // ORDINARY pending retain across it. Arguments passed to an @owned
+        // parameter still get the strict `callConsumed` treatment (the
+        // consuming-transfer reasoning of ADR-0031 is orthogonal to whether
+        // the callee ever decrements), and `callConsumed` candidates were
+        // already invalidated by the reference sweep at the top of this
+        // loop if the call mentions them.
+        final transparent =
+            transparentCallees.contains(instruction.targetName);
+        final invalidated = _invalidateAcrossCall(
           args: instruction.args,
           argOwnership: instruction.argOwnership,
           pendingRetain: pendingRetain,
           callConsumed: callConsumed,
+          transparent: transparent,
         );
+        stats?.opaqueLimited += invalidated;
         kept.add(instruction);
       case IndirectCall():
         // (ADR-0060) IDENTICAL treatment to a direct `Call` -- and that
@@ -487,13 +846,16 @@ DCBasicBlock _elideBlock(DCBasicBlock block, [ElisionStats? stats]) {
         // never be the object of a pending retain. `referencedValueIds`
         // still reports it, which is where it matters (the `callConsumed`
         // sweep at the top of this loop).
-        stats?.opaqueLimited += pendingRetain.length;
-        _invalidateAcrossCall(
+        // Rule T never applies here: transparency is a fact about a NAMED
+        // function's body, and an indirect callee has no name to look up.
+        final invalidatedIndirect = _invalidateAcrossCall(
           args: instruction.args,
           argOwnership: instruction.argOwnership,
           pendingRetain: pendingRetain,
           callConsumed: callConsumed,
+          transparent: false,
         );
+        stats?.opaqueLimited += invalidatedIndirect;
         kept.add(instruction);
       case MakeWeak():
       case WeakLoad():
@@ -537,23 +899,38 @@ DCBasicBlock _elideBlock(DCBasicBlock block, [ElisionStats? stats]) {
 /// Duplicating it would make it possible for the direct and indirect cases to
 /// drift apart under a later edit -- in a pass where a divergence is a
 /// double-free, not a missed optimization.
-void _invalidateAcrossCall({
+///
+/// With `transparent: true` (ADR-0066 rule T -- direct calls only) ordinary
+/// pending retains are NOT invalidated: the callee is proven unable to
+/// decrement anything. Owned-argument matches are still promoted to
+/// [callConsumed] exactly as before -- consumption is a transfer-of-ownership
+/// fact (ADR-0031), independent of whether the callee decrements.
+///
+/// Returns how many pending retains this call actually invalidated, which is
+/// what `--why` reports as opaqueLimited (an owned-argument PROMOTION is not
+/// an invalidation and is no longer counted as one).
+int _invalidateAcrossCall({
   required List<DCValue> args,
   required List<bool> argOwnership,
   required Map<int, int> pendingRetain,
   required Set<int> callConsumed,
+  required bool transparent,
 }) {
   final ownedIds = <int>{
     for (var i = 0; i < args.length; i++)
       if (argOwnership[i]) args[i].id.index,
   };
+  var invalidated = 0;
   pendingRetain.removeWhere((id, _) {
     if (ownedIds.contains(id)) {
       callConsumed.add(id); // survives THIS call, now under the strict rule above
       return false;
     }
+    if (transparent) return false; // proven non-decrementing callee
+    invalidated++;
     return true; // ordinary conservative invalidation, unchanged from before
   });
+  return invalidated;
 }
 
 /// Every `ValueId.index` [instruction] reads as an operand -- everything
@@ -585,12 +962,23 @@ Set<int> referencedValueIds(DCInstruction instruction) {
     case IShl(:final lhs, :final rhs):
     case IShr(:final lhs, :final rhs):
     case ICmp(:final lhs, :final rhs):
+    case FAdd(:final lhs, :final rhs):
+    case FSub(:final lhs, :final rhs):
+    case FMul(:final lhs, :final rhs):
+    case FDiv(:final lhs, :final rhs):
+    case FCmp(:final lhs, :final rhs):
       ref(lhs);
       ref(rhs);
     case MakeStruct(:final fields):
       fields.forEach(ref);
     case IConvert(:final source):
       ref(source);
+    case FConvert(:final source):
+      ref(source);
+    case FNeg(:final operand):
+      ref(operand);
+    case ConstFloat():
+      break; // no operands, only a dest (cf. ConstInt)
     case ExtractField(:final struct):
       ref(struct);
     case Load(:final pointer):

@@ -206,7 +206,25 @@ arc_is 'boxBoth'     'alloc=2 retain=0 release=2 makeweak=0 weakload=0 dropweak=
 # merely larger: the Node carries +3 (its Alloc, the field-store retain, and
 # the alias retain) against -3 (the local release, Box\$Node_dtor's release of
 # the field, and the alias release), and the Box carries +1/-1.
-arc_is 'boxNode'     'alloc=2 retain=2 release=3 makeweak=0 weakload=0 dropweak=0'
+# CHANGED AGAIN BY ADR-0066 (rule T) to 1/2, and the distinction between the
+# two pairs is the whole point of the assertion now:
+#
+#   - The pair rule T recovers is the STORE-retain (`Retain b_value` around
+#     `box.value = ...` / the unwrap call): its interval spans ONLY the call
+#     to `Box$Node_unwrap`, which is proven refcount-transparent (its body is
+#     PtrOffset/Load/Return -- no release, no weak op, no call), and contains
+#     NO surviving Release. ADR-0063's invariant holds verbatim across it.
+#   - The pair ADR-0063 refused -- `Retain got` straddling `Release b`, where
+#     Box$Node_dtor releases b.value, THE VERY OBJECT `got` aliases -- is
+#     STILL REFUSED (`--why`: releaseLimited=1). If this line ever reads
+#     retain=0, that refusal has been lost and GAP-0054's use-after-free is
+#     back: treat it as a stop-the-line failure, not a count to re-pin.
+#
+# Balance after the change: the Node carries +2 (Alloc, alias retain) against
+# -2 (Box$Node_dtor's release of the field, the alias release); the Box +1/-1.
+# Heap returns to baseline either way -- the behavior checks above, not this
+# count, are what prove liveness; this count proves WHICH pair was elided.
+arc_is 'boxNode'     'alloc=2 retain=1 release=2 makeweak=0 weakload=0 dropweak=0'
 
 # The synthesized per-instantiation destructor: exactly one Release, for the
 # one heap-typed field the instantiation has.

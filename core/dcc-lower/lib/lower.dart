@@ -372,16 +372,27 @@ Future<DCModule> lowerToDCModule(
     if (!elide) {
       elidedFunctions = functions;
     } else {
+      // (ADR-0066 rule T) The refcount-transparency summary is computed ONCE,
+      // over the PRE-elision module -- every function including synthesized
+      // destructors -- and handed to every per-function elision run. The
+      // summary's validity for the POST-elision code the backend actually
+      // emits is argued in the ADR (elision only deletes provably-paired
+      // intervals and null no-ops, neither of which can create a decrement).
+      final transparentCallees = computeRefcountTransparentCallees(functions);
       // The stats map is bound to a non-nullable local before the closure so
       // the closure never has to re-prove it is non-null -- no `!`, per
       // CLAUDE.md rule 3.
       final statsSink = elisionStats;
       if (statsSink == null) {
-        elidedFunctions = functions.map(elideRedundantRetainReleasePairs).toList();
+        elidedFunctions = functions
+            .map((f) =>
+                elideRedundantRetainReleasePairs(f, null, transparentCallees))
+            .toList();
       } else {
         elidedFunctions = functions.map((f) {
           final stats = ElisionStats();
-          final out = elideRedundantRetainReleasePairs(f, stats);
+          final out =
+              elideRedundantRetainReleasePairs(f, stats, transparentCallees);
           statsSink[f.linkName] = stats;
           return out;
         }).toList();
@@ -1215,6 +1226,15 @@ class _BareFunctionLowerer {
             'a front_end error',
           );
         }
+        // This implicit return is a scope exit exactly like an explicit
+        // `return;` and must release everything `_lowerReturn` would:
+        // tracked heap/weak locals AND `@owned` parameters. Skipping this
+        // leaked 3 objects per call in tests/conformance/void-release/'s
+        // churn (found by NEON N1's `tensorRelease(@owned Tensor t) {}`,
+        // 2026-08-27 — a consuming release whose empty body IS the
+        // operation, so the entire function was the missing release).
+        _releaseHeapLocals(exceptDecl: null);
+        _releaseWeakLocals(exceptDecl: null);
         _addInstr(const Return());
       }
       _finishBlock();
@@ -1380,11 +1400,15 @@ class _BareFunctionLowerer {
           _values[variable] = newValue;
           return;
         }
-        if (oldValue.type is! DCInt) {
+        // (ADR-0065) DCFloat joins DCInt here: a float is a plain scalar
+        // with no ownership questions, so reassignment is the same
+        // rebinding it has always been for ints — `acc = acc + x` in an ML
+        // kernel's accumulation loop is this exact shape.
+        if (oldValue.type is! DCInt && oldValue.type is! DCFloat) {
           throw DccLowerError(
             '"$context": reassigning "${variable.name}" (type ${oldValue.type}) '
-            'is not supported -- only scalar (u8/u32/u64) locals can be '
-            'reassigned; heap- and weak-typed reassignment needs a real '
+            'is not supported -- only scalar (u8/u32/u64/f32/f64) locals can '
+            'be reassigned; heap- and weak-typed reassignment needs a real '
             'ownership policy this project has not designed yet, see '
             'docs/known-gaps.md',
           );
@@ -1722,12 +1746,15 @@ class _BareFunctionLowerer {
         if (valuesBeforeIf.containsKey(v)) v,
     ];
     for (final v in mergeVars) {
-      if (valuesBeforeIf[v]!.type is! DCInt) {
+      final mergeType = valuesBeforeIf[v]!.type;
+      // DCFloat allowed alongside DCInt (ADR-0065): same scalar-merge
+      // mechanics, the block param just carries a float type.
+      if (mergeType is! DCInt && mergeType is! DCFloat) {
         throw DccLowerError(
-          '"$context": "${v.name}" (type ${valuesBeforeIf[v]!.type}) is reassigned in a '
+          '"$context": "${v.name}" (type $mergeType) is reassigned in a '
           'branch of this if/else that falls through -- only scalar '
-          '(u8/u16/u32/u64) locals can be reassigned this way, same rule '
-          'as ADR-0027\'s straight-line reassignment',
+          '(u8/u16/u32/u64/f32/f64) locals can be reassigned this way, same '
+          'rule as ADR-0027\'s straight-line reassignment',
         );
       }
     }
@@ -1958,10 +1985,15 @@ class _BareFunctionLowerer {
       // old one, so the count stays balanced across every iteration, and the
       // header's phi carries whichever reference is live. That is what makes
       // `head = Node(i, head)` — building a list in a loop — expressible.
-      if (current.type is! DCInt && current.type is! DCHeapPointer) {
+      // DCFloat allowed alongside DCInt (ADR-0065): a float accumulator
+      // (`sum = sum + a[i] * b[i]`) is the defining loop-carried value of
+      // every ML kernel this feature exists for.
+      if (current.type is! DCInt &&
+          current.type is! DCFloat &&
+          current.type is! DCHeapPointer) {
         throw DccLowerError(
           '"$context": loop-carried variable "${v.name}" has type '
-          '${current.type} — only scalar (u8/u16/u32/u64) and heap-typed '
+          '${current.type} — only scalar (u8/u32/u64/f32/f64) and heap-typed '
           'locals can be reassigned inside a loop body',
         );
       }
@@ -2561,6 +2593,106 @@ class _BareFunctionLowerer {
             _addInstr(IConvert(dest: dest, source: source));
             return dest;
           }
+
+          // Int -> float (ADR-0065): `u32.toF32()` / `u64.toF64()`. Unary
+          // like the width conversions above, but lowers to `FConvert`
+          // (`uitofp`, round to nearest even) rather than `IConvert` —
+          // zext/trunc have no meaning against a float destination.
+          final intToFloat = switch (op) {
+            'toF32' => DCFloat.f32,
+            'toF64' => DCFloat.f64,
+            _ => null,
+          };
+          if (widthType != null && intToFloat != null) {
+            final args = expr.arguments.positional;
+            if (args.length != 1) {
+              throw DccLowerError(
+                '"$context": ${target.name.text} with ${args.length} '
+                'arguments, expected 1 (the receiver)',
+              );
+            }
+            final source = _lowerExpression(args.single);
+            final dest = DCValue(_allocId(), intToFloat);
+            _addInstr(FConvert(dest: dest, source: source));
+            return dest;
+          }
+
+          // Float operators and conversions (ADR-0065) — the same
+          // "<width>|<op>" member-name shape the sized ints use above,
+          // dispatched on an 'f'-prefixed width. A separate block rather
+          // than extra rows in the integer tables, because the instruction
+          // family genuinely differs (no Overflow field, ordered FCmp
+          // predicates, FConvert vs IConvert) — merging them would undo
+          // the DCInt/DCFloat split (types.dart) at exactly the call site
+          // it exists to protect.
+          final floatType = switch (target.name.text.substring(0, sep)) {
+            'f32' => DCFloat.f32,
+            'f64' => DCFloat.f64,
+            _ => null,
+          };
+          if (floatType != null) {
+            // Same per-op dest-type rule as the integer table above: a
+            // comparison consumes two floats and produces a DCBool.
+            final floatDestType = switch (op) {
+              '+' || '-' || '*' || '/' => floatType as DCType,
+              '<' || '<=' || '>' || '>=' => const DCBool(),
+              _ => null,
+            };
+            // ORDERED predicates (`o`-prefixed): any comparison against
+            // NaN is false — IEEE-754's rule and upstream Dart's own
+            // `double` semantics. `==`/`!=` are NOT here: extension types
+            // cannot declare `operator ==` (same restriction the sized
+            // ints hit, ADR-0035), so they arrive as `EqualsCall` and are
+            // handled in `_lowerIntEquality`'s float branch.
+            final emitFloat = switch (op) {
+              '+' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(FAdd(dest: dest, lhs: lhs, rhs: rhs)),
+              '-' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(FSub(dest: dest, lhs: lhs, rhs: rhs)),
+              '*' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(FMul(dest: dest, lhs: lhs, rhs: rhs)),
+              // `/` on floats only — never a zero-divisor trap (x/0.0 is a
+              // defined IEEE result), and integers keep `~/` (ADR-0036,
+              // superseded only in its float half by ADR-0065).
+              '/' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(FDiv(dest: dest, lhs: lhs, rhs: rhs)),
+              '<' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(FCmp(dest: dest, predicate: FCmpPredicate.olt, lhs: lhs, rhs: rhs)),
+              '<=' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(FCmp(dest: dest, predicate: FCmpPredicate.ole, lhs: lhs, rhs: rhs)),
+              '>' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(FCmp(dest: dest, predicate: FCmpPredicate.ogt, lhs: lhs, rhs: rhs)),
+              '>=' => (DCValue dest, DCValue lhs, DCValue rhs) => _addInstr(FCmp(dest: dest, predicate: FCmpPredicate.oge, lhs: lhs, rhs: rhs)),
+              _ => null,
+            };
+            if (emitFloat != null && floatDestType != null) {
+              return _lowerU64Binary(expr, emitFloat, floatDestType);
+            }
+
+            // Unary members — `-x` and the explicit conversions. An
+            // extension-type method/operator call passes only the receiver
+            // positionally, same shape as `.toU8()` above.
+            final unaryDest = switch (op) {
+              'unary-' => floatType as DCType,
+              'toF32' => DCFloat.f32, // f64 -> f32: fptrunc, round to nearest even
+              'toF64' => DCFloat.f64, // f32 -> f64: fpext, exact
+              // Truncate toward zero, saturating (llvm.fptoui.sat) — see
+              // the prelude's toU64trunc doc for the exact contract.
+              'toU32trunc' => DCInt.u32,
+              'toU64trunc' => DCInt.u64,
+              _ => null,
+            };
+            if (unaryDest != null) {
+              final args = expr.arguments.positional;
+              if (args.length != 1) {
+                throw DccLowerError(
+                  '"$context": ${target.name.text} with ${args.length} '
+                  'arguments, expected 1 (the receiver)',
+                );
+              }
+              final source = _lowerExpression(args.single);
+              final dest = DCValue(_allocId(), unaryDest);
+              if (op == 'unary-') {
+                _addInstr(FNeg(dest: dest, operand: source));
+              } else {
+                _addInstr(FConvert(dest: dest, source: source));
+              }
+              return dest;
+            }
+          }
         }
       }
 
@@ -2735,6 +2867,38 @@ class _BareFunctionLowerer {
           }
           final dest = DCValue(_allocId(), sizedIntType);
           _addInstr(ConstInt(dest: dest, bits: bits));
+          return dest;
+        }
+
+        // `f64(1.5)` / `f32(0.5)` -- constructing a float literal
+        // (ADR-0065), the same implicit-constructor shape as the sized
+        // ints ("<width>|constructor#"). Only compile-time-constant
+        // arguments are handled, same rule as the sized ints -- and
+        // `f64(2)` works too: an INTEGER literal in a double-typed
+        // parameter position is turned into a DoubleLiteral by the CFE
+        // before lowering ever sees it (verified empirically, like every
+        // other Kernel-shape claim in this file).
+        final floatLitType = switch (target.name.text) {
+          'f32|constructor#' => DCFloat.f32,
+          'f64|constructor#' => DCFloat.f64,
+          _ => null,
+        };
+        if (floatLitType != null) {
+          final arg = expr.arguments.positional.single;
+          final folded = _tryFoldConstDouble(arg);
+          if (folded == null) {
+            throw DccLowerError(
+              '"$context": a $floatLitType literal constructed from a '
+              'non-constant expression $arg (${arg.runtimeType}) — the '
+              'argument must be a double literal or a compile-time double '
+              'constant',
+            );
+          }
+          // An f32 dest stores the full double here; the single
+          // round-to-nearest-even to binary32 happens once, at emission
+          // (ConstFloat's doc comment).
+          final dest = DCValue(_allocId(), floatLitType);
+          _addInstr(ConstFloat(dest: dest, value: folded));
           return dest;
         }
       }
@@ -3296,10 +3460,33 @@ class _BareFunctionLowerer {
     final rhs = _lowerExpression(expr.right);
     final lhsType = lhs.type;
     final rhsType = rhs.type;
+    // (ADR-0065) Floats take the same EqualsCall route as the sized ints —
+    // an extension type cannot declare `operator ==` (this method's own
+    // header comment) — but lower to FCmp: `==` is IEEE's ordered-equal
+    // (`oeq`, false for NaN on either side) and `!=` its complement
+    // (`une`, TRUE when unordered — `NaN != NaN` is true), matching
+    // upstream Dart's `double` exactly.
+    if (lhsType is DCFloat && rhsType is DCFloat) {
+      if (lhsType.width != rhsType.width) {
+        throw DccLowerError(
+          '"$context": ${negated ? '!=' : '=='} between different float '
+          'types ($lhsType vs $rhsType). DCDart has no implicit float '
+          'conversions — convert one side explicitly (.toF64()/.toF32()).',
+        );
+      }
+      final dest = DCValue(_allocId(), const DCBool());
+      _addInstr(FCmp(
+        dest: dest,
+        predicate: negated ? FCmpPredicate.une : FCmpPredicate.oeq,
+        lhs: lhs,
+        rhs: rhs,
+      ));
+      return dest;
+    }
     if (lhsType is! DCInt || rhsType is! DCInt) {
       throw DccLowerError(
         '"$context": ${negated ? '!=' : '=='} is only supported between two '
-        'sized integers, got $lhsType and $rhsType',
+        'sized integers or two floats, got $lhsType and $rhsType',
       );
     }
     if (lhsType.width != rhsType.width || lhsType.signed != rhsType.signed) {
@@ -4501,6 +4688,15 @@ DCType _lowerSignatureType(
             return DCInt.u16;
           case 'u8':
             return DCInt.u8;
+          // (ADR-0065) The float pair, same extension-type mechanism as the
+          // sized ints. This one mapping is what makes `f32`/`f64`
+          // parameters, returns AND `Pointer<f32>`/`Pointer<f64>` work —
+          // the pointee type routes through here too
+          // (_pointeeTypeFromTypeArgs -> _lowerType).
+          case 'f32':
+            return DCFloat.f32;
+          case 'f64':
+            return DCFloat.f64;
         }
       }
     }
@@ -4603,8 +4799,8 @@ DCType _lowerSignatureType(
     }
     throw DccLowerError(
       '"$context": unsupported type $type (${type.runtimeType}) — dcc-lower '
-      'only understands u8/u32/u64/Result/HeapObject subclasses/Weak<T> '
-      'from the DCDart prelude so far, see core/dcc-lower/README.md',
+      'only understands u8/u32/u64/f32/f64/Result/HeapObject subclasses/'
+      'Weak<T> from the DCDart prelude so far, see core/dcc-lower/README.md',
     );
   }
 }
@@ -4890,6 +5086,24 @@ void _checkRelocationTargets(
 /// returns null (treated as non-constant) rather than throwing -- a
 /// compile-time division by zero deserves a diagnostic of its own, not a
 /// crash inside the folder.
+/// Evaluates a compile-time double expression, or returns null if it is not
+/// one (ADR-0065). The float counterpart of [_tryFoldConstInt], and
+/// deliberately narrower: literals and CFE-evaluated constants only, no
+/// arithmetic folding — nothing has needed `f64(HALF * 3.0)` yet, and float
+/// constant folding has a rounding-order question (fold in the host, or
+/// emit the ops?) that deserves deciding against a real case, not in
+/// passing. An integer literal in a double context never reaches here as an
+/// IntLiteral: the CFE has already converted it (`f64(2)` arrives as
+/// DoubleLiteral(2.0)).
+double? _tryFoldConstDouble(Expression expr) {
+  if (expr is DoubleLiteral) return expr.value;
+  if (expr is ConstantExpression) {
+    final constant = expr.constant;
+    return constant is DoubleConstant ? constant.value : null;
+  }
+  return null;
+}
+
 int? _tryFoldConstInt(Expression expr) {
   if (expr is IntLiteral) return expr.value;
   if (expr is ConstantExpression) {

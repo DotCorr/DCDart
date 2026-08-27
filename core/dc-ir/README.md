@@ -144,9 +144,13 @@ placeholder shape), `Call` (`docs/decisions/0018-function-calls.md`), and
 absent, on purpose: no generics, no vtables/interfaces, no full class/
 `ClassInfo` layout for genuine dynamic dispatch (`types.dart`'s header
 note, `docs/known-gaps.md` GAP-0003 — a direct-call destructor cascade
-exists, ADR-0022, which is not the same thing), `unowned` reads, no casts,
-no bit ops, no float instructions, no indirect/virtual calls (`Call` is
-direct-only, ADR-0018). Every instruction that does exist was added
+exists, ADR-0022, which is not the same thing), `unowned` reads, no
+virtual calls (indirect calls through a `DCFuncPtr` value DO exist,
+ADR-0060; runtime-dispatched ones do not). Since this list was written,
+casts (`IConvert`, ADR-0037), bit ops (`IAnd`..`IShr`, ADR-0030) and
+float instructions (`ConstFloat`/`FAdd`/`FSub`/`FMul`/`FDiv`/`FNeg`/
+`FCmp`/`FConvert`, ADR-0065) have all landed — each against a real
+conformance target, the same rule. Every instruction that does exist was added
 against a real conformance target's actual pressure, not speculatively —
 see each instruction's own doc comment in `instructions.dart` for which
 target and ADR motivated it.

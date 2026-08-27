@@ -28,6 +28,16 @@
 # nothing means the hypothesis was wrong, which is worth knowing before
 # general cross-block dataflow gets built on top of it.
 #
+# 2026-08-27, ADR-0066 (transparent callees + frontier pairs + null ARC ops):
+#
+#     hashmap          35 retains -> 13    (lookup path fully retain-free)
+#     json             19 retains ->  4
+#     tree-traversal    6 retains ->  0
+#     whole tree      133 retains -> 42
+#
+# What survives is attributed in GAP-0066 (releaseLimited) and GAP-0067
+# (mutating callees, loops) -- not unmeasured.
+#
 # It is NOT sufficient on its own. Seeing the pairs and removing them is one
 # thing; that removal paying for itself is another. Pair this with
 # `closure-heavy`'s ratio, which is the allocator-honest benchmark closest to

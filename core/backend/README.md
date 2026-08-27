@@ -118,7 +118,12 @@ relied on, not a fallback.
 - **`MakeWeak`/`WeakLoad`/`DropWeak`** (ADR-0023, M2) — weak references with zombie-slot semantics;
   see the M2 section above.
 
-Not implemented: float types, cycle-aware release (ORC, GAP-0017 item 4), elision (GAP-0017 item 2),
+Float types are implemented (ADR-0065): `DCFloat` → `float`/`double`, `ConstFloat` as exact bit
+patterns (`bitcast iN`), `FAdd`/`FSub`/`FMul`/`FDiv`/`FNeg`/`FCmp` as single hardware instructions
+(no soft-float libcalls, no fast-math flags), `FConvert` as `fpext`/`fptrunc`/`uitofp`/
+`llvm.fptoui.sat.*` (saturating truncation — inline codegen, no libcall).
+
+Not implemented: cycle-aware release (ORC, GAP-0017 item 4), elision (GAP-0017 item 2),
 `unowned` (spec §3.3's other layer-1 variant), a real `ClassInfo` vtable for genuine runtime dispatch
 (M5+, GAP-0003 retitled). Every unsupported case throws a specific `BackendError` naming what it hit.
 

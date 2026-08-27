@@ -289,7 +289,14 @@ re-derivable by rerunning it):
   call), a function expression anywhere but a local's initializer, a local function called as a bare
   statement, and generic/named-parameter/`async` local functions.
 
-Anything else — a different operator, a non-`u8`/`u32`/`u64`/`Result` type, a second `Pointer<T>`
+(ADR-0065) `f32`/`f64` follow the sized-int recognition mechanics exactly: `f64|+`-shaped
+`StaticInvocation`s (plus `f64|unary-` and the conversion members) dispatch to
+`FAdd`/`FSub`/`FMul`/`FDiv`/`FNeg`/`FCmp`/`FConvert`, `f64|constructor#` folds a compile-time
+double into `ConstFloat`, `==`/`!=` ride the same `EqualsCall` route as the ints (lowered to
+`fcmp oeq`/`une`), float locals are reassignable/loop-carried scalars alongside `DCInt`, and
+`Pointer<f32>`/`Pointer<f64>` fall out of the pointee-type mapping with no new code.
+
+Anything else — a different operator, a non-`u8`/`u32`/`u64`/`f32`/`f64`/`Result` type, a second `Pointer<T>`
 instantiation, natural-alignment (non-packed) struct layout, merging control flow back together after
 an `if`, a CAPTURING closure or a function value — throws `DccLowerError` naming exactly what it hit and why it's unsupported, rather than
 silently mishandling it. Extend this file when a real conformance target actually needs more, per

@@ -6,7 +6,7 @@
 // many objects ALIVE AT ONCE -- that is what distinguishes it from
 // `arc-churn`, where one object is allocated and released per iteration and
 // the heap never holds more than one. Under ADR-0015's 64-slot arena the
-// deepest tree expressible had 63 nodes; this builds 2^18.
+// deepest tree expressible had 63 nodes; this builds 2^14-1 = 16,383.
 //
 // WHY THIS SHAPE, since a benchmark's shape decides what it measures:
 //
@@ -41,11 +41,14 @@
 // That is a number anyone sizing a workload needs, and it is exactly the kind
 // of thing that was invisible while the arena capped everything at 64.
 //
-// The C side does the natural C thing: `malloc` per node, one recursive
-// `free` at the end. That is what "overhead vs C" means -- a C programmer
-// solving this does not refcount, and the gap is DCDart's retain/release
-// traffic plus the allocator difference, which is exactly what M3 is asking
-// about.
+// The C side does the natural C thing for this workload: a static arena
+// pool, bump-allocated per node, dropped by resetting the cursor (rewritten
+// 2026-08-27 -- the first baseline was malloc-per-node, which was 5x slower
+// than natural C and made DCDart read as 2.2x faster than C; see kernel.c).
+// That is what "overhead vs C" means -- a C programmer solving this does not
+// refcount and does not free node-by-node, and the gap is DCDart's
+// retain/release traffic plus the destructor cascade's per-node work, which
+// is exactly what M3 is asking about.
 import '../../../runtime/dc-core-bare/prelude.dart';
 
 class Node extends HeapObject {

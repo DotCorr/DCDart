@@ -169,14 +169,23 @@ arc_is 'withContinue' 'alloc=1 retain=0 release=2 makeweak=0 weakload=0 dropweak
 arc_is 'withBreak'    'alloc=1 retain=0 release=2 makeweak=0 weakload=0 dropweak=0'
 arc_is 'withReturn'   'alloc=1 retain=0 release=2 makeweak=0 weakload=0 dropweak=0'
 arc_is 'nested'       'alloc=2 retain=0 release=2 makeweak=0 weakload=0 dropweak=0'
-arc_is 'lastKept'     'alloc=1 retain=2 release=4 makeweak=0 weakload=0 dropweak=0'
+# CHANGED BY ADR-0066 (rule N) from retain=2: `Node? keep = null` emits a
+# `Retain <NullRef>` for the null initializer, and dc_retain(null) is a
+# DEFINED no-op (ADR-0049), so the instruction is now deleted outright. The
+# remaining retain is STILL the ADR-0063/GAP-0054 pair -- the reassignment's
+# release of the previous keep sits between retain and release, the pass
+# cannot tell the two objects apart, and the pair correctly survives
+# (`--why` reports it releaseLimited). The release count does NOT drop: all
+# four releases are of dynamically-loaded values, not of the static null.
+arc_is 'lastKept'     'alloc=1 retain=1 release=4 makeweak=0 weakload=0 dropweak=0'
 
 # VACUOUS-PASS GUARD. Every assertion above is an equality against a string,
 # so a `dc-objdump` that printed nothing at all would have been caught by the
 # per-function "printed no counts" check -- but a `dc-objdump` that printed
 # the seven lines and nothing else would not prove the loop bodies were even
 # reached. The TOTAL is asserted separately for that reason.
-arc_is 'TOTAL' 'alloc=8 retain=2 release=14 makeweak=0 weakload=0 dropweak=0'
+# TOTAL retain follows lastKept's ADR-0066 change (2 -> 1); releases unmoved.
+arc_is 'TOTAL' 'alloc=8 retain=1 release=14 makeweak=0 weakload=0 dropweak=0'
 
 echo "  ARC ok: every path out of every loop body carries its own release"
 

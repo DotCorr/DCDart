@@ -14,10 +14,12 @@
 // (handled entirely in dcc-lower via existing instructions, see
 // docs/decisions/0011), calls, allocation, `weak`/`unowned` reads, casts
 // (`.toU32()`), bit ops (`& | ^ ~ << >> >>>`), `@volatile` semantics,
-// pointer arithmetic (`.elementAt`), float comparisons. Add each when a
-// real conformance target needs it, not speculatively; this file's
-// existing shapes (dest/lhs/rhs typed via DCValue, sealed hierarchy,
-// Overflow as its own enum rather than a bool) are the pattern to repeat.
+// pointer arithmetic (`.elementAt`). Add each when a real conformance
+// target needs it, not speculatively; this file's existing shapes
+// (dest/lhs/rhs typed via DCValue, sealed hierarchy, Overflow as its own
+// enum rather than a bool) are the pattern to repeat. Float arithmetic
+// and comparisons (FAdd..FCmp below) were on this list until NEON's ML
+// kernels became the real consumer (ADR-0065).
 
 import 'ssa.dart';
 import 'types.dart';
@@ -366,6 +368,168 @@ final class ICmp extends DCInstruction {
     required this.lhs,
     required this.rhs,
   });
+
+  @override
+  DCValue? get result => dest;
+}
+
+// ---------------------------------------------------------------------
+// Floating point — spec §4.1 (`f32 f64`), ADR-0065. IEEE-754 binary32/
+// binary64, and deliberately a SEPARATE instruction family rather than a
+// float mode on IAdd/ICmp: float arithmetic has NO overflow-trap semantics
+// and NO wrapping variants (overflow rounds to ±inf, which is a defined
+// IEEE result, not an error), so an `Overflow` field would be a value
+// nobody could ever set meaningfully — the exact reason `DCFloat` itself
+// was split from `DCInt` (types.dart). Transcendentals (exp/log/sqrt) are
+// NOT instructions here and must not become ones casually: each is a
+// potential libcall, which is an undefined runtime symbol in a `@bare`
+// object and a CLAUDE.md rule 1 violation (see the ADR).
+// ---------------------------------------------------------------------
+
+/// Materializes a float literal into `dest`. `value` is a host `double`
+/// (IEEE binary64, which is exactly DCDart's f64); an f32-typed `dest`
+/// takes the binary32 value nearest to `value` (round-to-nearest-even),
+/// computed at EMISSION, not here — the backend emits the exact bit
+/// pattern (`bitcast iN`), so the rounding happens exactly once and never
+/// drifts through decimal re-printing. Mirrors `ConstInt`'s "dest.type
+/// decides the interpretation" contract.
+final class ConstFloat extends DCInstruction {
+  final DCValue dest; // dest.type must be a DCFloat
+  final double value;
+  const ConstFloat({required this.dest, required this.value});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Float add. `lhs`, `rhs`, and `dest` must all carry the same `DCFloat`
+/// type — no implicit f32/f64 mixing, the same "no implicit widening"
+/// rule as `IAdd` (spec §4.1). No `Overflow` field, see the section
+/// comment: overflow to ±inf and NaN propagation are the defined IEEE
+/// results, not trappable errors. One LLVM `fadd`, never a libcall —
+/// every target in the registry has hardware float (SSE2 / NEON), which
+/// is what keeps this legal in `@bare` code.
+final class FAdd extends DCInstruction {
+  final DCValue dest;
+  final DCValue lhs;
+  final DCValue rhs;
+  const FAdd({required this.dest, required this.lhs, required this.rhs});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Float subtract. Identical shape and contract to `FAdd`.
+final class FSub extends DCInstruction {
+  final DCValue dest;
+  final DCValue lhs;
+  final DCValue rhs;
+  const FSub({required this.dest, required this.lhs, required this.rhs});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Float multiply. Identical shape and contract to `FAdd`.
+final class FMul extends DCInstruction {
+  final DCValue dest;
+  final DCValue lhs;
+  final DCValue rhs;
+  const FMul({required this.dest, required this.lhs, required this.rhs});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Float divide — and unlike `IDiv`, NO zero-divisor trap, deliberately:
+/// `x / 0.0` is not UB in IEEE-754 or in LLVM's `fdiv`, it is a defined
+/// result (±inf, or NaN for 0/0), so the compare-and-trap `IDiv` needs to
+/// avoid poison has nothing to guard against here. This is also why `/`
+/// exists as a source operator on floats while integers keep `~/` only
+/// (ADR-0036's "no `/`" was about not lying to Dart readers for whom `/`
+/// means float division — on an actual float it means exactly that).
+final class FDiv extends DCInstruction {
+  final DCValue dest;
+  final DCValue lhs;
+  final DCValue rhs;
+  const FDiv({required this.dest, required this.lhs, required this.rhs});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Float negate (`-x`, LLVM `fneg`). A real instruction rather than
+/// `FSub(0.0, x)` because the two differ on IEEE edge cases: `0.0 - 0.0`
+/// is `+0.0` while `fneg 0.0` is `-0.0`, and `fneg` flips a NaN's sign
+/// bit where a subtraction may not preserve its payload.
+final class FNeg extends DCInstruction {
+  final DCValue dest;
+  final DCValue operand;
+  const FNeg({required this.dest, required this.operand});
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Which comparison `FCmp` performs. Named after LLVM's own `fcmp`
+/// condition codes, the same choice `ICmpPredicate` made and for the same
+/// reason — there is no DCDart-level distinction to invent beyond LLVM's.
+/// ORDERED predicates (`o`-prefixed: false when either operand is NaN)
+/// for everything except `une`, which is what both IEEE-754 and Dart mean
+/// by `!=` (true when unordered — `NaN != NaN` is true). The remaining
+/// LLVM codes (`ord`/`uno`, the other `u`-forms, `one`) are deliberately
+/// absent: nothing lowers to them, same discipline as `AtomicOp` omitting
+/// `nand`.
+enum FCmpPredicate { oeq, une, olt, ole, ogt, oge }
+
+/// Float comparison, producing a `DCBool`. `lhs`/`rhs` must carry the
+/// same `DCFloat` type (no implicit f32/f64 mixing); `dest.type` must be
+/// `DCBool`. NaN makes every ordered predicate false — `NaN < x`,
+/// `NaN >= x` and `NaN == NaN` are all false, and `NaN != NaN` is true —
+/// which is both the IEEE-754 rule and what upstream Dart's `double`
+/// already does, so porting keeps its comparison semantics unchanged.
+final class FCmp extends DCInstruction {
+  final DCValue dest;
+  final FCmpPredicate predicate;
+  final DCValue lhs;
+  final DCValue rhs;
+  const FCmp({
+    required this.dest,
+    required this.predicate,
+    required this.lhs,
+    required this.rhs,
+  });
+
+  @override
+  DCValue? get result => dest;
+}
+
+/// Explicit float conversion (`.toF32()`, `.toF64()`, `.toU32trunc()`,
+/// `.toU64trunc()`, and the int side's `.toF32()`/`.toF64()`).
+///
+/// ONE instruction covering float<->float, int->float and float->int,
+/// because — exactly as `IConvert` argues for zext/sext/trunc — the
+/// operation is fully determined by the two types already on `source` and
+/// `dest`: f32->f64 extends (`fpext`, exact), f64->f32 rounds to nearest
+/// even (`fptrunc`), unsigned-int->float rounds to nearest even
+/// (`uitofp`), and float->unsigned-int truncates toward zero WITH
+/// SATURATION (`llvm.fptoui.sat.*`): out-of-range values clamp to the
+/// integer type's min/max and NaN becomes 0. Saturation is deliberate and
+/// load-bearing — a plain `fptoui` on an out-of-range value is poison,
+/// i.e. silent UB the optimizer may exploit, which is a worse failure
+/// mode than either trapping or clamping, and trapping would make every
+/// conversion cost a branch the way `IDiv`'s guard does. `IConvert`'s
+/// "the explicit call IS the safety mechanism" reasoning covers discarded
+/// fraction bits, not poison. See ADR-0065.
+///
+/// Signed integer endpoints (`sitofp`/`fptosi.sat`) are rejected at
+/// emission rather than emitted unguarded — no signed sized-int type has
+/// prelude support (same forward-looking refusal as `_emitDivRem`'s
+/// signed case, GAP-0024).
+final class FConvert extends DCInstruction {
+  final DCValue dest;
+  final DCValue source;
+  const FConvert({required this.dest, required this.source});
 
   @override
   DCValue? get result => dest;

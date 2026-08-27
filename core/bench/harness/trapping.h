@@ -67,4 +67,13 @@ static inline uint64_t mod_ck(uint64_t a, uint64_t b) {
     return a % b;
 }
 
+/* Added for `hashmap` (ADR-0061), whose era selector divides. DCDart's `~/`
+ * traps on divide-by-zero (ADR-0036) and has no other failure mode for
+ * unsigned operands -- there is no INT_MIN/-1 case to guard, since signed
+ * division is refused outright (GAP-0024). */
+static inline uint64_t div_ck(uint64_t a, uint64_t b) {
+    if (b == 0) __builtin_trap();
+    return a / b;
+}
+
 #endif /* DCBENCH_TRAPPING_H */

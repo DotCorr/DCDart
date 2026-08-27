@@ -68,7 +68,9 @@ const bare = _Bare();
 /// against a real case, not speculatively.
 ///
 /// SCOPE, deliberately narrow: parameter and return types may be
-/// `u8`/`u16`/`u32`/`u64`/`Result`/`void` only. An ARC-managed `HeapObject`
+/// `u8`/`u16`/`u32`/`u64`/`f32`/`f64`/`Result`/`void` only (floats since
+/// ADR-0065 — they lower and cross the C ABI as `float`/`double`; the
+/// consuming case is extern C math, GAP-0063). An ARC-managed `HeapObject`
 /// or `Weak<T>` in an extern signature is REJECTED — handing a refcounted
 /// pointer to a C function raises an ownership-convention question (does the
 /// callee consume it? borrow it? retain it?) that nothing has decided, and
@@ -176,6 +178,15 @@ extension type const u64(int _value) {
   u16 toU16() => u16(_value);
   u32 toU32() => u32(_value);
   u64 toU64() => u64(_value);
+
+  /// Explicit int -> float conversion (ADR-0065). Lowers to `FConvert`
+  /// (`uitofp`): rounds to nearest even, which is only observable above
+  /// 2^53 where u64 outgrows f64's 53-bit significand. u64 gets `toF64`
+  /// and u32 gets `toF32` — the pairing each width can carry with at most
+  /// that one documented rounding step; the full 4x2 conversion matrix is
+  /// deliberately absent until something needs it (same discipline as
+  /// every other prelude member).
+  f64 toF64() => f64(_value.toDouble());
 }
 
 /// u32 (DCDART_SPEC.md §4.1). Added for M1's `Pointer<u32>` exit criterion
@@ -237,6 +248,13 @@ extension type const u32(int _value) {
   u16 toU16() => u16(_value);
   u32 toU32() => u32(_value);
   u64 toU64() => u64(_value);
+
+  /// Explicit int -> float conversion (ADR-0065). Lowers to `FConvert`
+  /// (`uitofp`). NOT exact for every u32: f32's 24-bit significand cannot
+  /// hold all 32 bits, so values above 2^24 round to nearest even — stated
+  /// here rather than discovered. See u64.toF64 for why only this one
+  /// pairing exists per width.
+  f32 toF32() => f32(_value.toDouble());
 }
 
 /// u8 (DCDART_SPEC.md §4.1). Added for M1's `@packed` struct exit criterion
@@ -363,6 +381,103 @@ extension type const u16(int _value) {
   u16 toU16() => u16(_value);
   u32 toU32() => u32(_value);
   u64 toU64() => u64(_value);
+}
+
+/// f64 (DCDART_SPEC.md §4.1, ADR-0065): IEEE-754 binary64. Added for
+/// NEON's ML kernels (matmul/softmax/layernorm over float buffers) — the
+/// first real workload that needs a number that isn't an integer.
+///
+/// Backed by Dart's `double`, which IS binary64, the same way u64 is
+/// backed by `int` — and, as everywhere in this file, these bodies are
+/// never executed: dcc-lower recognizes the `f64|+`-shaped call and emits
+/// its own `FAdd`/`FCmp`/`FConvert` (core/dc-ir/instructions.dart).
+///
+/// SEMANTICS, deliberately different from the sized ints and stated up
+/// front: float arithmetic NEVER TRAPS. There are no wrapping variants
+/// (`&+`) either, because there is nothing for them to be a variant OF —
+/// IEEE-754 defines a result for every input (overflow rounds to ±inf,
+/// 0.0/0.0 is NaN, NaN propagates through arithmetic), so `+ - * /` are
+/// each exactly one hardware instruction. This is why `/` exists here
+/// while integers keep `~/` only: ADR-0036 refused `/` because to a Dart
+/// reader it means float division — on an f64 it means exactly that, so
+/// the objection dissolves rather than being overridden.
+///
+/// Comparisons use the ORDERED predicates: any comparison involving NaN
+/// is false (and `!=` is true), matching both IEEE-754 and upstream
+/// Dart's `double`.
+///
+/// `f64(1.5)` constructs a literal — dcc-lower folds the (compile-time
+/// constant) double argument into a `ConstFloat`, the same way `u64(1)`
+/// folds to `ConstInt`. `f64(2)` also works: the CFE turns an integer
+/// literal in a double context into a DoubleLiteral before lowering ever
+/// sees it.
+extension type const f64(double _value) {
+  f64 operator +(f64 other) => f64(_value + other._value);
+  f64 operator -(f64 other) => f64(_value - other._value);
+  f64 operator *(f64 other) => f64(_value * other._value);
+  f64 operator /(f64 other) => f64(_value / other._value);
+
+  /// Unary minus (`fneg`), a real instruction rather than `f64(0) - x`:
+  /// the two differ on IEEE zeros (`0.0 - 0.0` is `+0.0`; `-x` of `+0.0`
+  /// is `-0.0`).
+  f64 operator -() => f64(-_value);
+
+  bool operator <(f64 other) => _value < other._value;
+  bool operator <=(f64 other) => _value <= other._value;
+  bool operator >(f64 other) => _value > other._value;
+  bool operator >=(f64 other) => _value >= other._value;
+
+  /// Explicit narrowing (ADR-0065): `fptrunc`, round to nearest even.
+  /// Never traps — same "the explicit call is the statement of intent"
+  /// contract as `.toU8()`'s truncation.
+  f32 toF32() => f32(_value);
+
+  /// Float -> integer, truncating toward zero, SATURATING at the ends
+  /// (ADR-0065): the fraction is discarded; a value above u64's max (or
+  /// +inf) yields u64's max, a negative value (or -inf) yields 0, and NaN
+  /// yields 0. Saturation rather than UB or a trap: plain `fptoui` on an
+  /// out-of-range value is LLVM poison — silent UB — and a trap would put
+  /// a branch on every conversion. Deterministic clamping is the honest
+  /// middle. Spelled `trunc` so the rounding mode is visible at the call
+  /// site; a future `.toU64round()` would be a different operation, not a
+  /// replacement.
+  u64 toU64trunc() => u64(_value.truncate());
+}
+
+/// f32 (DCDART_SPEC.md §4.1, ADR-0065): IEEE-754 binary32 — the type ML
+/// weight/activation buffers actually use. Same operator surface and
+/// no-trap semantics as f64 (see its doc comment; everything there applies
+/// at this width).
+///
+/// Backed by `double` because Dart has no 32-bit float type at all. That
+/// costs nothing at runtime (the body is never executed) but it means an
+/// f32 LITERAL is written `f32(1.5)` and takes the double value 1.5,
+/// rounded once to binary32 (round-to-nearest-even) when the backend emits
+/// the constant's exact bit pattern. One rounding step, at one site, in
+/// one direction — the same guarantee C's `1.5f` gives.
+extension type const f32(double _value) {
+  f32 operator +(f32 other) => f32(_value + other._value);
+  f32 operator -(f32 other) => f32(_value - other._value);
+  f32 operator *(f32 other) => f32(_value * other._value);
+  f32 operator /(f32 other) => f32(_value / other._value);
+
+  /// Unary minus (`fneg`). See f64's note on IEEE zeros.
+  f32 operator -() => f32(-_value);
+
+  bool operator <(f32 other) => _value < other._value;
+  bool operator <=(f32 other) => _value <= other._value;
+  bool operator >(f32 other) => _value > other._value;
+  bool operator >=(f32 other) => _value >= other._value;
+
+  /// Explicit widening (ADR-0065): `fpext`. EXACT — every binary32 value
+  /// is representable in binary64, so this is the one conversion in the
+  /// float family with no rounding step at all.
+  f64 toF64() => f64(_value);
+
+  /// Float -> integer, truncating toward zero, saturating. See
+  /// f64.toU64trunc — identical contract at u32's range (above u32's max
+  /// yields u32's max, negative/NaN yield 0).
+  u32 toU32trunc() => u32(_value.truncate());
 }
 
 /// Marks a top-level `final` field for emission into read-only static data
